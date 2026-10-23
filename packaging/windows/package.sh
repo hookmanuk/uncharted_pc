@@ -61,6 +61,8 @@ cp run.py LICENSE "$dest/"
 cp packaging/windows/README-Uncharted.txt "$dest/README.txt"
 mkdir -p "$dest/licenses"
 cp packaging/windows/licenses/*.txt "$dest/licenses/" 2>/dev/null || true
+# VR fork: the OpenXR loader beside bb-probe.exe (renderer_vulkan/vr/vr_openxr.cpp loads it; Apache-2.0, licences/).
+cp "${OPENXR_LOADER:-/f/rpsc3/source/rpcs3/bin/openxr_loader.dll}" "$dest/bin/openxr_loader.dll"
 # FSR 4 (the v07 INT8 model) when its assets are in fsr4_shaders/ (tools/fetch_fsr4_assets.sh).
 if [[ -d fsr4_shaders ]]; then cp -r fsr4_shaders "$dest/"; fi
 # DLSS and DLSS Frame Generation (NVIDIA RTX): the MSVC-built bridge and NVIDIA's runtimes, next

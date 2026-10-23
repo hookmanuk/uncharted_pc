@@ -37,9 +37,10 @@ CONFIG_FILE = CONFIG_DIR / 'settings.json'
 NAME = 'Uncharted'
 AUTHOR = 'SuperMedo'
 # This build; GitHub release tags are v<VERSION> (their digits are compared).
-VERSION = '0.3.6'
-RELEASES_API = 'https://api.github.com/repos/Supermedo/uncharted_pc/releases/latest'
-RELEASES_PAGE = 'https://github.com/Supermedo/uncharted_pc/releases/latest'
+VERSION = '0.3.6-vr0.1'  # VR fork: <base version>-vr<VR version>
+# VR fork: updates come from the VR fork's releases, tags v<base>-vr<n> only (a flat release would replace VR).
+RELEASES_API = 'https://api.github.com/repos/hookmanuk/uncharted_pc/releases'
+RELEASES_PAGE = 'https://github.com/hookmanuk/uncharted_pc/releases'
 UPDATE_DIR = Path(tempfile.gettempdir()) / 'uncharted-update'
 # Never copied over an installation by an update (the package does not hold them either).
 USER_FILES = ('user', 'out', 'art', 'bbport.ini', 'input.ini', 'last_run.log')
@@ -139,7 +140,8 @@ APP_DEFAULTS = {'game_dir': '', 'game_dir_u1': '', 'game_dir_u2': '', 'game_dir_
                 'anti_aliasing': 'off', 'aa_sharpness': '0.2', 'frame_generation': 'off',
                 'frame_gen_multiplier': '2', 'extra_env': '', 'close_on_play': False,
                 'mouse_look': True, 'mouse_sensitivity': '1.0', 'mouse_invert_y': False,
-                'pad_invert_y': False, 'key_bindings': {}, 'pad_bindings': {}, 'check_updates': True}
+                'pad_invert_y': False, 'key_bindings': {}, 'pad_bindings': {}, 'check_updates': True,
+                'vr': False}  # VR fork: the VR card (Display page)
 
 
 def _(text):
@@ -319,6 +321,14 @@ def write_input_ini(s):
     return path
 
 
+def vr_environment(s, env):
+    """VR fork: the VR card. BB_VR=1 starts the OpenXR runtime (SteamVR, or XR_RUNTIME_JSON's); the headset paces the
+    game, so no generated frames."""
+    if s.get('vr'):
+        env['BB_VR'] = '1'
+        env['BB_FRAME_GEN'] = 'off'
+
+
 def game_environment(s, start=None):
     env = dict(os.environ)
     try:
@@ -351,6 +361,7 @@ def game_environment(s, start=None):
     env['BB_FSR_SHARPNESS'] = str(s.get('aa_sharpness') or '0')
     env['BB_FRAME_GEN'] = str(s.get('frame_generation') or 'off')
     env['BB_FRAME_GEN_MULTIPLIER'] = str(s.get('frame_gen_multiplier') or '2')
+    vr_environment(s, env)  # VR fork
     for item in str(s['extra_env']).split():
         if '=' in item:
             key, value = item.split('=', 1)
@@ -1003,6 +1014,7 @@ class Launcher:
 
     def build_display(self):
         f = self.page('display', _('Display'), _('How the game window is shown.'))
+        self.build_vr(f)  # VR fork
         self.check(f, 'fullscreen', _('Fullscreen'))
         self.row(f, _('Presentation'), self.choice(f, 'present_mode', PRESENT_MODES, 34),
                  _('Mailbox shows each frame as soon as it is ready without tearing; FIFO waits for the display.'))
@@ -1039,6 +1051,15 @@ class Launcher:
                  _('FSR 3 makes one frame (2×). DLSS makes up to three on a GeForce RTX 50 (4×), '
                    'one on an RTX 40.'))
         self.check(f, 'show_fps', _('Show the FPS counter'))
+
+    def build_vr(self, f):
+        """VR fork: the VR card, first on the Display page."""
+        self.section(f, _('VR'), top=6)
+        self.check(f, 'vr', _('Play in a VR headset (OpenXR)'),
+                   _('Starts your OpenXR runtime (SteamVR, Virtual Desktop, ...) with the game. For now the game '
+                     'shows on a large screen in front of you; head tracking and 3D come in later versions. '
+                     'Frame generation stays off in VR. F8 recentres the screen.'))
+        self.new_card(f, None)
 
     def build_controls(self):
         f = self.page('controls', _('Controls'),
@@ -1607,12 +1628,20 @@ def version_tuple(text):
     return tuple(int(number) for number in re.findall(r'\d+', text or ''))
 
 
+def vr_release(releases):
+    """VR fork: the newest published VR release (tag v<base>-vr<n>) of the fork's release list."""
+    for release in releases:
+        if not release.get('draft') and not release.get('prerelease') and '-vr' in release.get('tag_name', ''):
+            return release
+    raise ValueError('no VR release yet')
+
+
 def latest_release():
     """(version, zip URL, page URL) of the newest GitHub release."""
     request = urllib.request.Request(RELEASES_API, headers={'Accept': 'application/vnd.github+json',
                                                             'User-Agent': 'uncharted-launcher'})
     with urllib.request.urlopen(request, timeout=15) as response:
-        release = json.load(response)
+        release = vr_release(json.load(response))  # VR fork
     version = '.'.join(re.findall(r'\d+', release['tag_name']))
     url = next((asset['browser_download_url'] for asset in release.get('assets', [])
                 if asset.get('name', '').lower().endswith('.zip')), None)
