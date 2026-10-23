@@ -1056,14 +1056,6 @@ bool TakeFrame(Frame& frame) {
 // it, with an empty HUD.
 bool CaptureAtFlip(Runtime& runtime, vk::CommandBuffer command_buffer, VideoCore::Image& display) {
     const bool pending = g_display_draws > 0 && !g_scene_taken;
-    static int told = 0; // development: why the first flips were not captured
-    if (told < 6 && g.ready && Camera::Near() > 0.f && !g_scene_taken) {
-        ++told;
-        std::printf("VR stereo: flip with %d display draws, display %ux%u %s format %d%c", g_display_draws,
-                    display.info.size.width, display.info.size.height, Multiview::Stereo(display) ? "stereo" : "mono",
-                    int(display.info.pixel_format), 10);
-        std::fflush(stdout);
-    }
     g_display_draws = 0;
     g_scene_taken = false;
     if (!pending || !g.ready || Camera::Near() <= 0.f || !Multiview::Stereo(display)) {
