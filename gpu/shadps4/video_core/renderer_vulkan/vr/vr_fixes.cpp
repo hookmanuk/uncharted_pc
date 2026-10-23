@@ -3,6 +3,7 @@
 
 #include <cstdio>
 #include <cstdlib>
+#include <utility>
 
 #include "video_core/renderer_vulkan/vr/vr_fixes.h"
 
@@ -29,16 +30,23 @@ int ReplaceConstant(std::vector<u32>& spirv, u32 from, u32 to) {
 
 } // namespace
 
-// Uncharted fork: the games' render and output sizes are not known yet (stage 2 finds them); until then no image
-// is a main-view image (multiview stays mono) and no shader is patched. Driveclub read them from its eboot.
-bool OutputSize(u32& width, u32& height) {
-    width = height = 0;
-    return false;
+// Uncharted fork: the collection renders at 1920x1080 and shows that (BB_RENDER_RES: the size the port patches in at
+// start). Driveclub read its sizes from its eboot.
+bool RenderSize(u32& width, u32& height) {
+    static const std::pair<u32, u32> size = [] {
+        u32 w = 1920, h = 1080;
+        if (const char* res = std::getenv("BB_RENDER_RES"); res && std::sscanf(res, "%ux%u", &w, &h) != 2) {
+            w = 1920, h = 1080;
+        }
+        return std::pair{w, h};
+    }();
+    width = size.first;
+    height = size.second;
+    return true;
 }
 
-bool RenderSize(u32& width, u32& height) {
-    width = height = 0;
-    return false;
+bool OutputSize(u32& width, u32& height) {
+    return RenderSize(width, height);
 }
 
 void PatchShader(u64 hash, std::vector<u32>& spirv) {

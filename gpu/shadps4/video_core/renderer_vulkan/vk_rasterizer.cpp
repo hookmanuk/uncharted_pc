@@ -1478,7 +1478,8 @@ void Rasterizer::DrawRecord(const GraphicsPipeline* pipeline, const PreparedDraw
 
     PrepareRenderState(pipeline);
     Vr::Stereo::OnDraw(scheduler, runtime, texture_cache, pipeline->GetStage(Shader::SwStage::Vertex), // VR
-                       pipeline->GetGraphicsKey(), cb_descs[0].first, cb_descs[2].first, db_desc.first);
+                       pipeline->GetStages()[u32(Shader::SwStage::Fragment)], pipeline->GetGraphicsKey(),
+                       cb_descs[0].first, cb_descs[2].first, db_desc.first);
     if (upscaler->Enabled() && std::popcount(pipeline->GetGraphicsKey().mrt_mask) == 1) {
         const auto& viewport = Regs().viewports[0];
         upscaler->OnDraw(pipeline->GetStage(Shader::SwStage::Vertex).pgm_hash,
@@ -1864,7 +1865,8 @@ void Rasterizer::DrawIndirectRecord(const GraphicsPipeline* pipeline, bool is_in
     motion_geometry = 0;
     PrepareRenderState(pipeline);
     Vr::Stereo::OnDraw(scheduler, runtime, texture_cache, pipeline->GetStage(Shader::SwStage::Vertex), // VR
-                       pipeline->GetGraphicsKey(), cb_descs[0].first, cb_descs[2].first, db_desc.first);
+                       pipeline->GetStages()[u32(Shader::SwStage::Fragment)], pipeline->GetGraphicsKey(),
+                       cb_descs[0].first, cb_descs[2].first, db_desc.first);
     if (upscaler->Enabled() && std::popcount(pipeline->GetGraphicsKey().mrt_mask) == 1) {
         const auto& viewport = Regs().viewports[0];
         upscaler->OnDraw(pipeline->GetStage(Shader::SwStage::Vertex).pgm_hash,

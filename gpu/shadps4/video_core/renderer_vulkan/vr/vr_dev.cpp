@@ -71,6 +71,13 @@ std::atomic<int> g_watch_hits{0};
 std::atomic<bool> g_watch_exec{false}; // an execution breakpoint ("x"): logged with its caller, resumed past
 PVOID g_handler = nullptr;
 
+// The allocation (the game image) holding an address.
+u64 ImageOf(u64 address) {
+    MEMORY_BASIC_INFORMATION owner{};
+    VirtualQuery(reinterpret_cast<void*>(address), &owner, sizeof(owner));
+    return u64(owner.AllocationBase);
+}
+
 LONG CALLBACK WatchHandler(EXCEPTION_POINTERS* info) {
     if (info->ExceptionRecord->ExceptionCode != EXCEPTION_SINGLE_STEP || !(info->ContextRecord->Dr6 & 1)) {
         return EXCEPTION_CONTINUE_SEARCH;
@@ -85,7 +92,7 @@ LONG CALLBACK WatchHandler(EXCEPTION_POINTERS* info) {
             ReadProcessMemory(GetCurrentProcess(), reinterpret_cast<const void*>(info->ContextRecord->Rsp), &ret, 8,
                               &got);
             std::printf("VR watch: exec hit %d thread %lu returns to %#llx (image +%#llx) rdi %#llx rsi %#llx\n", hit,
-                        GetCurrentThreadId(), (unsigned long long)ret, (unsigned long long)(ret - 0x800000000ull),
+                        GetCurrentThreadId(), (unsigned long long)ret, (unsigned long long)(ret - ImageOf(ret)),
                         (unsigned long long)info->ContextRecord->Rdi, (unsigned long long)info->ContextRecord->Rsi);
             std::fflush(stdout);
         }
@@ -107,12 +114,12 @@ LONG CALLBACK WatchHandler(EXCEPTION_POINTERS* info) {
         std::printf("VR watch: hit %d at rip %#llx (%s + %#llx) thread %lu value %#llx; callers in the game:", hit,
                     (unsigned long long)rip, name, (unsigned long long)(rip - base), GetCurrentThreadId(),
                     (unsigned long long)value);
-        // Return addresses into the main executable among the first 96 stack slots.
-        const u64 exe = u64(GetModuleHandleA(nullptr));
-        MEMORY_BASIC_INFORMATION exe_info{};
-        VirtualQuery(reinterpret_cast<void*>(exe + 0x1000), &exe_info, sizeof(exe_info));
-        static u64 exe_end = 0;
-        if (!exe_end) {
+        // Return addresses into the game among the first 96 stack slots: the allocation of the instruction (Uncharted:
+        // the mapped guest image), or the main executable (Driveclub's recomp).
+        const u64 exe = name[0] == '?' ? base : u64(GetModuleHandleA(nullptr));
+        static u64 exe_base = 0, exe_end = 0;
+        if (exe != exe_base) {
+            exe_base = exe;
             u64 at = exe;
             MEMORY_BASIC_INFORMATION m{};
             while (VirtualQuery(reinterpret_cast<void*>(at), &m, sizeof(m)) && u64(m.AllocationBase) == exe) {

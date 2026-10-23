@@ -1,8 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
-// VR (dcport-vr): Driveclub's camera. The game's view setters (image +0x736650 and +0x7376e0, SysV: rdi = the view,
-// rsi = the camera's world matrix, rdx = its projection) are hooked; for the player's view the world matrix gets the
-// head pose and the projection the headset's field of view, so every pass the engine derives (culling, lighting,
-// motion vectors) follows the head.
+// VR (dcport-vr): the game's camera, hooked where the engine sets it up so every pass it derives (culling, lighting,
+// motion vectors) follows the head: the player's view gets the head pose and the headset's field of view. Uncharted 1:
+// the views' projection update (vr_camera.cpp Sites); Driveclub's view setters are in the Driveclub recomp's vr branch.
 
 #pragma once
 

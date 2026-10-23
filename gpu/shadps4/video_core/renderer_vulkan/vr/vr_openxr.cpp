@@ -106,6 +106,7 @@ struct State {
     XrSwapchain swapchain{XR_NULL_HANDLE};
     u32 width = 0, height = 0;
     VkFormat format = VK_FORMAT_UNDEFINED;
+    bool rgba_offered = false; // R8G8B8A8_SRGB swapchains (stereo frames whose bytes are RGBA: Uncharted)
     std::vector<XrSwapchainImageVulkanKHR> images;
     VkImage screen_images[3]{};
     VkDeviceMemory screen_memory[3]{};
@@ -164,6 +165,7 @@ struct State {
         std::vector<XrSwapchainImageVulkanKHR> images;
         u32 width = 0, height = 0;
         u32 index = 0;
+        VkFormat format = VK_FORMAT_UNDEFINED;
     };
     Chain eye_chains[2], hud_chain;
     int frames_since_stereo = 1000; // the presenter: frames since the last stereo frame
@@ -330,6 +332,7 @@ bool PickFormat() {
             if (g.format == VK_FORMAT_UNDEFINED && VkFormat(f) == wanted) {
                 g.format = wanted;
             }
+            g.rgba_offered |= VkFormat(f) == VK_FORMAT_R8G8B8A8_SRGB;
         }
     }
     if (g.format == VK_FORMAT_UNDEFINED) {
@@ -424,8 +427,11 @@ bool MakeScreens(u32 width, u32 height) {
     return true;
 }
 
-bool MakeChain(State::Chain& chain, u32 width, u32 height) {
-    if (chain.swapchain && chain.width == width && chain.height == height) {
+bool MakeChain(State::Chain& chain, u32 width, u32 height, bool rgba = false) {
+    const VkFormat format = rgba && g.rgba_offered ? VK_FORMAT_R8G8B8A8_SRGB
+                            : g.format != VK_FORMAT_UNDEFINED ? g.format
+                                                              : VK_FORMAT_R8G8B8A8_SRGB;
+    if (chain.swapchain && chain.width == width && chain.height == height && chain.format == format) {
         return true;
     }
     if (chain.swapchain) {
@@ -436,7 +442,8 @@ bool MakeChain(State::Chain& chain, u32 width, u32 height) {
     }
     XrSwapchainCreateInfo info{XR_TYPE_SWAPCHAIN_CREATE_INFO};
     info.usageFlags = XR_SWAPCHAIN_USAGE_TRANSFER_DST_BIT | XR_SWAPCHAIN_USAGE_COLOR_ATTACHMENT_BIT;
-    info.format = g.format != VK_FORMAT_UNDEFINED ? g.format : VK_FORMAT_R8G8B8A8_SRGB;
+    info.format = format;
+    chain.format = format;
     info.sampleCount = 1;
     info.width = width;
     info.height = height;
@@ -692,9 +699,9 @@ bool Show(const State::Published& p) {
             g.part_max[i] = std::max(g.part_max[i], ms);
             since = now;
         };
-        if (!MakeChain(g.eye_chains[0], stereo.width, stereo.height) ||
-            !MakeChain(g.eye_chains[1], stereo.width, stereo.height) ||
-            !MakeChain(g.hud_chain, stereo.width, stereo.height) || !AcquireChain(g.eye_chains[0]) ||
+        if (!MakeChain(g.eye_chains[0], stereo.width, stereo.height, stereo.rgba) ||
+            !MakeChain(g.eye_chains[1], stereo.width, stereo.height, stereo.rgba) ||
+            !MakeChain(g.hud_chain, stereo.width, stereo.height, stereo.rgba) || !AcquireChain(g.eye_chains[0]) ||
             !AcquireChain(g.eye_chains[1]) || !AcquireChain(g.hud_chain)) {
             return false;
         }
