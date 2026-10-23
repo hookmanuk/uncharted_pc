@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 #include "video_core/renderer_vulkan/vk_temporal_upscaler.h"
+#include "video_core/renderer_vulkan/vr/vr_upscale.h" // VR
 #include "video_core/renderer_vulkan/vk_gpu_profiler.h"
 #include "video_core/renderer_vulkan/motion_history.h"
 #include "video_core/renderer_vulkan/vk_scene_resolution.h"
@@ -489,7 +490,7 @@ void TemporalUpscaler::OnDispatch(u64 cs_hash) {
         reset = true;
         return;
     }
-    Run();
+    Vr::Upscale::ForEachEye(UseDlss(), [this] { Run(); }); // VR: each eye's layer and DLSS feature
 }
 
 bool TemporalUpscaler::EnsureResources(u32 w, u32 h, u32 ow, u32 oh, bool hdr) {
@@ -1232,8 +1233,10 @@ void TemporalUpscaler::Run() {
     } else if (UseDlss()) {
         dispatched = RecordDlss(
             cmdbuf,
-            {input_color, input_color_view, color.info.pixel_format, vk::ImageAspectFlagBits::eColor, w, h},
-            {input_depth, input_depth_view, depth_format, vk::ImageAspectFlagBits::eDepth, w, h}, w, h,
+            {input_color, input_color_view, color.info.pixel_format, vk::ImageAspectFlagBits::eColor, w, h,
+             Vr::Upscale::Layer()}, // VR: the eye's layer
+            {input_depth, input_depth_view, depth_format, vk::ImageAspectFlagBits::eDepth, w, h, Vr::Upscale::Layer()},
+            w, h,
             ow, oh, frame_ms, true);
     } else if (UseXess()) {
         dispatched = RecordXess(
@@ -1419,7 +1422,7 @@ vk::ImageView TemporalUpscaler::CachedView(const VideoCore::Image& image, vk::Fo
     ViewEntry* oldest = &view_cache[0];
     for (auto& entry : view_cache) {
         if (entry.view && entry.image == handle && entry.uid == image.image_uid &&
-            entry.format == format && entry.aspect == aspect) {
+            entry.format == format && entry.aspect == aspect && entry.layer == Vr::Upscale::Layer()) { // VR
             entry.last_use = ++view_uses;
             return entry.view;
         }
@@ -1440,9 +1443,10 @@ vk::ImageView TemporalUpscaler::CachedView(const VideoCore::Image& image, vk::Fo
             .image = handle,
             .viewType = vk::ImageViewType::e2D,
             .format = format,
-            .subresourceRange = {aspect, 0, 1, 0, 1},
+            .subresourceRange = {aspect, 0, 1, Vr::Upscale::Layer(), 1}, // VR: the eye's layer
         })),
         .last_use = ++view_uses,
+        .layer = Vr::Upscale::Layer(), // VR
     };
     return oldest->view;
 }

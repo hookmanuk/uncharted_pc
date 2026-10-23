@@ -73,7 +73,8 @@ struct Dlss::Impl {
     HMODULE module{};
     const BbDlssApi* api{};
     std::vector<std::string> instance_extensions, device_extensions;
-    std::optional<FeatureDesc> feature;
+    std::array<std::optional<FeatureDesc>, 2> features; // VR: one per eye
+    u32 slot{};
     std::optional<FrameGenDesc> frame_gen;
     int frame_gen_max{};
     std::string problem;
@@ -205,30 +206,41 @@ std::string Dlss::Problem() const {
 }
 
 bool Dlss::HasFeature(const FeatureDesc& desc) const {
-    return impl->feature && *impl->feature == desc;
+    return impl->features[impl->slot] && *impl->features[impl->slot] == desc;
+}
+
+bool Dlss::SelectFeature(u32 slot) { // VR fork: one feature per eye (bridge ABI 3)
+    if (slot >= impl->features.size() || !impl->api || (slot > 0 && (impl->api->abi < 3 || !impl->api->SelectFeature))) {
+        return false;
+    }
+    if (impl->api->abi >= 3 && !impl->api->SelectFeature(slot)) {
+        return false;
+    }
+    impl->slot = slot;
+    return true;
 }
 
 bool Dlss::CreateFeature(vk::CommandBuffer command, const FeatureDesc& desc) {
     if (!impl->available) {
         return false;
     }
-    impl->feature.reset();
+    impl->features[impl->slot].reset();
     const BbDlssFeature feature{desc.input_width,  desc.input_height, desc.output_width,
                                 desc.output_height, desc.quality,      0,
                                 0,                  desc.hdr ? 1 : 0};
     if (!impl->api->CreateFeature(command, &feature)) {
         return false;
     }
-    impl->feature = desc;
+    impl->features[impl->slot] = desc;
     return true;
 }
 
 bool Dlss::Evaluate(vk::CommandBuffer command, const Frame& frame) {
-    if (!impl->available || !impl->feature) {
+    if (!impl->available || !impl->features[impl->slot]) {
         return false;
     }
     const auto image = [](const Resource& r) {
-        const vk::ImageSubresourceRange range{r.aspect, 0, 1, 0, 1};
+        const vk::ImageSubresourceRange range{r.aspect, 0, 1, r.layer, 1}; // VR fork: the eye's layer
         return BbDlssImage{r.image,
                            r.view,
                            static_cast<VkImageSubresourceRange>(range),
@@ -243,7 +255,7 @@ bool Dlss::Evaluate(vk::CommandBuffer command, const Frame& frame) {
 }
 
 void Dlss::ReleaseFeature() {
-    impl->feature.reset();
+    impl->features[impl->slot].reset();
     if (impl->api) {
         impl->api->ReleaseFeature();
     }
@@ -302,7 +314,9 @@ void Dlss::ReleaseFrameGen() {
 
 void Dlss::Shutdown() {
     impl->available = false;
-    impl->feature.reset();
+    for (auto& feature : impl->features) {
+        feature.reset();
+    }
     impl->frame_gen.reset();
     if (impl->api && impl->initialized) {
         impl->api->Shutdown();
@@ -338,6 +352,9 @@ bool Dlss::Evaluate(vk::CommandBuffer, const Frame&) {
     return false;
 }
 void Dlss::ReleaseFeature() {}
+bool Dlss::SelectFeature(u32) {
+    return false;
+}
 int Dlss::FrameGenMaxCount() const {
     return 0;
 }

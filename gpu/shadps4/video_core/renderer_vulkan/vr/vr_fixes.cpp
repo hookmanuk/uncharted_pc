@@ -30,15 +30,20 @@ int ReplaceConstant(std::vector<u32>& spirv, u32 from, u32 to) {
 
 } // namespace
 
-// Uncharted fork: the collection renders at 1920x1080, or at the eye size run.py patched in (BB_VR_RENDER_SIZE,
-// scripts/vr_resolution.py). Driveclub read its sizes from its eboot.
+// Uncharted fork: the collection renders at 1920x1080, at the eye size run.py patched in (BB_VR_RENDER_SIZE,
+// scripts/vr_resolution.py), or flat at the community build's BB_GAME_RES (src/runtime_display.c; even sizes from
+// 640x360 as it reads them). Driveclub read its sizes from its eboot.
 bool RenderSize(u32& width, u32& height) {
     static const std::pair<u32, u32> size = [] {
-        u32 w = 1920, h = 1080;
-        if (const char* res = std::getenv("BB_VR_RENDER_SIZE"); res && std::sscanf(res, "%ux%u", &w, &h) != 2) {
-            w = 1920, h = 1080;
+        u32 w = 0, h = 0;
+        if (const char* res = std::getenv("BB_VR_RENDER_SIZE"); res && std::sscanf(res, "%ux%u", &w, &h) == 2) {
+            return std::pair{w, h};
         }
-        return std::pair{w, h};
+        if (const char* res = std::getenv("BB_GAME_RES");
+            res && std::sscanf(res, "%ux%u", &w, &h) == 2 && w >= 640 && h >= 360) {
+            return std::pair{w & ~1u, h & ~1u};
+        }
+        return std::pair{1920u, 1080u};
     }();
     width = size.first;
     height = size.second;

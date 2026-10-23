@@ -218,7 +218,7 @@ APP_DEFAULTS = {'game_dir': '', 'game_dir_u1': '', 'game_dir_u2': '', 'game_dir_
                 'pad_invert_y': False, 'art_banner': '', 'art_u1': '', 'art_u2': '', 'art_u3': '', 'steam_art': '', 'art_crops': {},
                 'shortcut_name': 'Uncharted: The Nathan Drake Collection', 'shortcut_icon': '', 'trophy_game': 'u1',
                 'pad_vibration': True, 'pad_vibration_strength': '100', 'button_prompts': 'auto', 'key_bindings': {}, 'pad_bindings': {}, 'check_updates': True,
-                'vr': False, 'vr_eye_size': '2160',  # VR fork: the VR card (Display page)
+                'vr': False, 'vr_eye_size': '2160', 'vr_dlss': True,  # VR fork: the VR card (Display page)
                 **{key: 'auto' for key in FIXES},
                 **{f'{game}_infinite_{cheat}': False for game, _t, _s, _e in GAMES for cheat in ('health', 'ammo')}}
 
@@ -520,7 +520,9 @@ def vr_environment(s, env):
         env['BB_VR_STEREO'] = 'mv'
         env['BB_VR_EYE_RES'] = str(s.get('vr_eye_size') or '2160')
         env['BB_FRAME_GEN'] = 'off'
-        env['BB_UPSCALER'] = 'off'
+        # DLSS (DLAA: each eye at its own size, its own history) or the game's own anti-aliasing; nothing else in stereo.
+        env['BB_UPSCALER'] = 'dlss' if s.get('vr_dlss', True) else 'off'
+        env['BB_UPSCALE_PRESET'] = '0'
         # The headset paces the game: the game runs unpaced and each flip waits for the headset's next frame once it
         # keeps up (vr_openxr.cpp FramePeriod): the game's frame rate is the headset's refresh rate.
         env['BB_VBLANK_HZ'] = '240'
@@ -1487,7 +1489,10 @@ class Launcher:
         self.check(f, 'vr', _('Play in a VR headset (OpenXR)'),
                    _('Starts your OpenXR runtime (SteamVR, Virtual Desktop, ...) with the game. Uncharted 1 plays in 3D '
                      'with head tracking; Uncharted 2 and 3 show on a large screen in front of you for now, as do '
-                     'menus and cutscene videos. Anti-aliasing and frame generation stay off in VR. F8 recentres.'))
+                     'menus and cutscene videos. Frame generation stays off in VR. F8 recentres.'))
+        self.check(f, 'vr_dlss', _('NVIDIA DLSS in VR (DLAA, GeForce RTX)'),
+                   _("Smooths edges with DLSS in each eye at the size below. Off, or on a GPU without DLSS: the game's "
+                     'own anti-aliasing.'))
         self.row(f, _('Resolution per eye'), self.choice(f, 'vr_eye_size', VR_EYE_SIZES, 34),
                  _('The size each eye is drawn at: lower is faster, higher is sharper. Uncharted 1 renders at it; '
                    'its menus and HUD lay themselves out for the square picture.'))

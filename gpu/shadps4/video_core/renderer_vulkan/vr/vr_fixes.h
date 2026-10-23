@@ -18,6 +18,12 @@ void PatchShader(u64 hash, std::vector<u32>& spirv);
 /// The game's render size; false while unknown.
 bool RenderSize(u32& width, u32& height);
 
+/// The game's render size is `width` x `height` (1920x1080 outside VR): the port's scene detection (VR: square sizes).
+inline bool NativeSize(u32 width, u32 height) {
+    u32 w = 0, h = 0;
+    return RenderSize(w, h) ? width == w && height == h : width == 1920 && height == 1080;
+}
+
 /// The game's output size (the display buffer; above the render size when an upscaler runs); false while unknown.
 bool OutputSize(u32& width, u32& height);
 

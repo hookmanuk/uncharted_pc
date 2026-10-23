@@ -33,6 +33,7 @@
 #include "video_core/texture_cache/image_view.h"
 #include "video_core/texture_cache/texture_cache.h"
 #include "video_core/renderer_vulkan/vr/vr_dev.h" // VR
+#include "video_core/renderer_vulkan/vr/vr_fixes.h" // VR
 #include "video_core/renderer_vulkan/vr/vr_multiview.h" // VR
 #include "video_core/renderer_vulkan/vr/vr_stereo.h" // VR
 
@@ -417,6 +418,7 @@ void Rasterizer::PrepareRenderState(const GraphicsPipeline* pipeline) {
         const auto& depth = texture_cache.GetImage(db_desc.first);
         // The game's render size: 1920x1080, or BB_GAME_RES (src/runtime_display.c).
         static const auto game_size = [] {
+            if (u32 vw = 0, vh = 0; Vr::Fixes::RenderSize(vw, vh)) return std::pair<u32, u32>{vw, vh}; // VR: eye size
             unsigned w = 1920, h = 1080;
             if (const char* res = std::getenv("BB_GAME_RES")) {
                 unsigned pw = 0, ph = 0;
