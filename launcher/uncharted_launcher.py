@@ -41,9 +41,10 @@ NAME = 'Uncharted'
 AUTHOR = 'SuperMedo'
 COMMUNITY_AUTHOR = 'drakolord'
 # This build; GitHub release tags are v<VERSION> (their digits are compared).
-VERSION = '0.3.8'
-RELEASES_API = 'https://api.github.com/repos/drakolordx7/uncharted_pc/releases/latest'
-RELEASES_PAGE = 'https://github.com/drakolordx7/uncharted_pc/releases/latest'
+VERSION = '0.3.8-vr0.1'  # VR fork: <base version>-vr<VR version> (base: drakolordx7/uncharted_pc community)
+# VR fork: updates come from the VR fork's releases, tags v<base>-vr<n> only (a flat release would replace VR).
+RELEASES_API = 'https://api.github.com/repos/hookmanuk/uncharted_pc/releases'
+RELEASES_PAGE = 'https://github.com/hookmanuk/uncharted_pc/releases'
 UPDATE_DIR = Path(tempfile.gettempdir()) / 'uncharted-update'
 # Never copied over an installation by an update (the package does not hold them either).
 USER_FILES = ('user', 'out', 'art', 'bbport.ini', 'input.ini', 'last_run.log')
@@ -212,6 +213,7 @@ APP_DEFAULTS = {'game_dir': '', 'game_dir_u1': '', 'game_dir_u2': '', 'game_dir_
                 'pad_invert_y': False, 'art_banner': '', 'art_u1': '', 'art_u2': '', 'art_u3': '', 'steam_art': '', 'art_crops': {},
                 'shortcut_name': 'Uncharted: The Nathan Drake Collection', 'shortcut_icon': '', 'trophy_game': 'u1',
                 'pad_vibration': True, 'pad_vibration_strength': '100', 'button_prompts': 'auto', 'key_bindings': {}, 'pad_bindings': {}, 'check_updates': True,
+                'vr': False,  # VR fork: the VR card (Display page)
                 **{key: 'auto' for key in FIXES},
                 **{f'{game}_infinite_{cheat}': False for game, _t, _s, _e in GAMES for cheat in ('health', 'ammo')}}
 
@@ -504,6 +506,12 @@ def game_resolution(s, screen=None):
         if width * height <= MAX_RENDER_PIXELS:   # the next smaller height of the same shape
             break
     return '' if (width, height) == (1920, 1080) else f'{width}x{height}'
+def vr_environment(s, env):
+    """VR fork: the VR card. BB_VR=1 starts the OpenXR runtime (SteamVR, or XR_RUNTIME_JSON's); the headset paces the
+    game, so no generated frames."""
+    if s.get('vr'):
+        env['BB_VR'] = '1'
+        env['BB_FRAME_GEN'] = 'off'
 
 
 def game_environment(s, start=None):
@@ -552,6 +560,7 @@ def game_environment(s, start=None):
     env['BB_BUTTON_PROMPTS'] = str(s.get('button_prompts') or 'auto')
     env['BB_CHEATS'] = ','.join(f'{game}:{cheat}' for game, _t, _s, _e in GAMES for cheat in ('health', 'ammo')
                                 if s.get(f'{game}_infinite_{cheat}'))
+    vr_environment(s, env)  # VR fork
     for item in str(s['extra_env']).split():
         if '=' in item:
             key, value = item.split('=', 1)
@@ -1424,6 +1433,7 @@ class Launcher:
 
     def build_display(self):
         f = self.page('display', _('Display'), '')
+        self.build_vr(f)  # VR fork
         self.check(f, 'fullscreen', _('Fullscreen'))
         self.row(f, _('Presentation'), self.choice(f, 'present_mode', PRESENT_MODES, 34),
                  _('Mailbox or Immediate for high frame rates.'))
@@ -1458,6 +1468,15 @@ class Launcher:
         self.section(f, _('Audio'))
         self.row(f, _('Speakers'), self.choice(f, 'speakers', SPEAKERS, 34),
                  _('Pick 5.1 or 7.1 if you only get stereo.'))
+
+    def build_vr(self, f):
+        """VR fork: the VR card, first on the Display page."""
+        self.section(f, _('VR'), top=6)
+        self.check(f, 'vr', _('Play in a VR headset (OpenXR)'),
+                   _('Starts your OpenXR runtime (SteamVR, Virtual Desktop, ...) with the game. For now the game '
+                     'shows on a large screen in front of you; head tracking and 3D come in later versions. '
+                     'Frame generation stays off in VR. F8 recentres the screen.'))
+        self.new_card(f, None)
 
     def build_controls(self):
         f = self.page('controls', _('Controls'), _('Changes apply when the game starts.'))
@@ -2540,12 +2559,20 @@ def version_tuple(text):
     return tuple(int(number) for number in re.findall(r'\d+', text or ''))
 
 
+def vr_release(releases):
+    """VR fork: the newest published VR release (tag v<base>-vr<n>) of the fork's release list."""
+    for release in releases:
+        if not release.get('draft') and not release.get('prerelease') and '-vr' in release.get('tag_name', ''):
+            return release
+    raise ValueError('no VR release yet')
+
+
 def latest_release():
     """(version, zip URL, page URL) of the newest GitHub release."""
     request = urllib.request.Request(RELEASES_API, headers={'Accept': 'application/vnd.github+json',
                                                             'User-Agent': 'uncharted-launcher'})
     with urllib.request.urlopen(request, timeout=15) as response:
-        release = json.load(response)
+        release = vr_release(json.load(response))  # VR fork
     version = '.'.join(re.findall(r'\d+', release['tag_name']))
     url = next((asset['browser_download_url'] for asset in release.get('assets', [])
                 if asset.get('name', '').lower().endswith('.zip')), None)
