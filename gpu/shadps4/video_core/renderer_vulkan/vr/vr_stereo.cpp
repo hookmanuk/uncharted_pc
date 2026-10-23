@@ -1051,8 +1051,81 @@ bool TakeFrame(Frame& frame) {
     return slot.has_depth || slot.has_right;
 }
 
+// Uncharted fork: a frame without a HUD (one draw into the display buffer: U2's train, cutscenes) never reached the
+// capture at its second display draw. At the flip its finished display buffer is the scene: both eyes are taken from
+// it, with an empty HUD.
+bool CaptureAtFlip(Runtime& runtime, vk::CommandBuffer command_buffer, VideoCore::Image& display) {
+    const bool pending = g_display_draws > 0 && !g_scene_taken;
+    static int told = 0; // development: why the first flips were not captured
+    if (told < 6 && g.ready && Camera::Near() > 0.f && !g_scene_taken) {
+        ++told;
+        std::printf("VR stereo: flip with %d display draws, display %ux%u %s format %d%c", g_display_draws,
+                    display.info.size.width, display.info.size.height, Multiview::Stereo(display) ? "stereo" : "mono",
+                    int(display.info.pixel_format), 10);
+        std::fflush(stdout);
+    }
+    g_display_draws = 0;
+    g_scene_taken = false;
+    if (!pending || !g.ready || Camera::Near() <= 0.f || !Multiview::Stereo(display)) {
+        return false;
+    }
+    const vk::Format format = display.info.pixel_format;
+    if (format != vk::Format::eR8G8B8A8Unorm && format != vk::Format::eR8G8B8A8Srgb &&
+        format != vk::Format::eB8G8R8A8Unorm && format != vk::Format::eB8G8R8A8Srgb) {
+        return false;
+    }
+    const u32 width = display.info.size.width, height = display.info.size.height;
+    const u32 index = g.next_slot;
+    Slot& slot = g.slots[index];
+    const VkImageUsageFlags color_usage =
+        VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_STORAGE_BIT;
+    if (!Make(slot.scene, VK_FORMAT_R8G8B8A8_UNORM, width, height, color_usage) ||
+        !Make(slot.hud, VK_FORMAT_R8G8B8A8_UNORM, width, height, color_usage) ||
+        !Make(slot.scene_right, VK_FORMAT_R8G8B8A8_UNORM, width, height, color_usage)) {
+        return false;
+    }
+    g_frame_depth = {};
+    g_frame_depth_area = 0;
+    const bool frame_pose = std::exchange(g_frame_pose_valid, false);
+    runtime.Transit(&display, vk::ImageLayout::eTransferSrcOptimal, vk::PipelineStageFlagBits2::eTransfer,
+                    vk::AccessFlagBits2::eTransferRead);
+    runtime.FlushBarriers();
+    const VkCommandBuffer cmd = VkCommandBuffer(command_buffer);
+    Barrier(cmd, slot.scene.image, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+    Copy(cmd, VkImage(display.GetImage()), VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, slot.scene.image,
+         VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, width, height);
+    Barrier(cmd, slot.scene.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_GENERAL);
+    Barrier(cmd, slot.scene_right.image, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+    Copy(cmd, VkImage(display.GetImage()), VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, slot.scene_right.image,
+         VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, width, height, VK_IMAGE_ASPECT_COLOR_BIT, 1);
+    Barrier(cmd, slot.scene_right.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
+    Barrier(cmd, slot.hud.image, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+    const VkClearColorValue clear{};
+    const VkImageSubresourceRange range{VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+    VKD.vkCmdClearColorImage(cmd, slot.hud.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &clear, 1, &range);
+    Barrier(cmd, slot.hud.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_GENERAL);
+    slot.width = width;
+    slot.height = height;
+    slot.has_depth = false;
+    slot.has_right = true;
+    slot.has_hud = true;
+    slot.rgba = format == vk::Format::eR8G8B8A8Unorm || format == vk::Format::eR8G8B8A8Srgb;
+    slot.has_pose = frame_pose;
+    std::memcpy(slot.layer_pose, g_frame_layer_pose, sizeof(slot.layer_pose));
+    std::memcpy(slot.tangents, g_frame_tangents, sizeof(slot.tangents));
+    g.next_slot = (index + 1) % SlotCount;
+    g.complete.push_back(index);
+    while (g.complete.size() > SlotCount - 1) {
+        g.complete.pop_front();
+    }
+    return true;
+}
+
 void OnDisplayBuffer(Runtime& runtime, vk::CommandBuffer command_buffer, VideoCore::Image& display) {
     std::scoped_lock lock{g.mutex};
+    if (CaptureAtFlip(runtime, command_buffer, display)) {
+        return; // its HUD is empty
+    }
     if (!g.ready || g.complete.empty()) {
         return;
     }
