@@ -28,6 +28,7 @@
 #include "video_core/texture_cache/image_view.h"
 #include "video_core/texture_cache/texture_cache.h"
 #include "video_core/renderer_vulkan/vr/vr_dev.h" // VR
+#include "video_core/renderer_vulkan/vr/vr_fixes.h" // VR
 #include "video_core/renderer_vulkan/vr/vr_multiview.h" // VR
 #include "video_core/renderer_vulkan/vr/vr_stereo.h" // VR
 
@@ -411,9 +412,9 @@ void Rasterizer::PrepareRenderState(const GraphicsPipeline* pipeline) {
         if (cb_descs[0].first) {
             const auto& color = texture_cache.GetImage(cb_descs[0].first);
             scene_pass = color.info.pixel_format == vk::Format::eR16G16B16A16Sfloat &&
-                         color.info.size.width == 1920 && color.info.size.height == 1080;
+                         Vr::Fixes::NativeSize(color.info.size.width, color.info.size.height); // VR: square
         }
-        if (scene_pass && depth.info.size.width == 1920 && depth.info.size.height == 1080 &&
+        if (scene_pass && Vr::Fixes::NativeSize(depth.info.size.width, depth.info.size.height) && // VR: square
             (depth.info.pixel_format == vk::Format::eD32SfloatS8Uint ||
              depth.info.pixel_format == vk::Format::eD32Sfloat)) {
             camera_motion->OnGBufferPass(db_desc.first);

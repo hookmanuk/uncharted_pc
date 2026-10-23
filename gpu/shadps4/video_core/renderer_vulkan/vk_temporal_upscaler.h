@@ -144,8 +144,9 @@ private:
         vk::ImageAspectFlags aspect{};
         vk::ImageView view;
         u64 last_use = 0;
+        u32 layer = 0; ///< VR: the eye's layer (vr_upscale.h)
     };
-    std::array<ViewEntry, 6> view_cache{};
+    std::array<ViewEntry, 8> view_cache{}; // VR: two eyes' views
     u64 view_uses = 0;
 
     void Run();
