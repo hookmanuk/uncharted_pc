@@ -92,6 +92,10 @@ void FrameLog(VkCommandBuffer cmd, VkImage image, VkImageLayout layout, u32 widt
 /// renders this frame with. Picks the head pose that view was made with (Camera::RenderedAt) for the frame's layer.
 void OnFrameCamera(const float* position);
 
+/// Uncharted: the motion blur velocity pass's constants as its draw reads them (CameraMotion::OnVelocityConstants:
+/// float 9 is -(near / 2) * far / (far - near / 2): z = c9 / (depth - c8), the near plane tagged per frame by the camera hook): the head
+/// pose this frame was rendered with (Camera::TaggedRendered).
+void OnVelocityConstants(const float* constants, u32 dwords);
 /// Presenter, PrepareFrame: the display buffer as the game finished it (the HUD over transparent black, with its alpha)
 /// into the newest complete frame's HUD.
 void OnDisplayBuffer(Runtime& runtime, vk::CommandBuffer cmd, VideoCore::Image& display);
