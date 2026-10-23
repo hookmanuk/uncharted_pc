@@ -264,8 +264,8 @@ void Init() {
     LoadFunctions(XR_NULL_HANDLE); // xrCreateInstance and friends work without an instance
     const char* extensions[] = {XR_KHR_VULKAN_ENABLE_EXTENSION_NAME};
     XrInstanceCreateInfo info{XR_TYPE_INSTANCE_CREATE_INFO};
-    std::strcpy(info.applicationInfo.applicationName, "DRIVECLUB VR");
-    std::strcpy(info.applicationInfo.engineName, "DCport");
+    std::strcpy(info.applicationInfo.applicationName, "Uncharted VR");
+    std::strcpy(info.applicationInfo.engineName, "Uncharted PC port");
     info.applicationInfo.apiVersion = XR_MAKE_VERSION(1, 0, 0);
     info.enabledExtensionCount = 1;
     info.enabledExtensionNames = extensions;
@@ -1163,10 +1163,10 @@ void NoteFlip() {
     }
     const double rate = g.flips / seconds, hz = 1e9 / double(period);
     const bool capped = g.capped.load(std::memory_order_relaxed);
-    if (!capped && rate >= 1.12 * hz) {
+    if (!capped && rate >= 1.03 * hz) { // Uncharted fork: 1.12 left 100 FPS on a 90 Hz headset uncapped (judder)
         g.capped = true;
         Log("the game holds %.0f FPS: capped at the headset's %.0f Hz", rate, hz);
-    } else if (capped && rate < 0.95 * hz) {
+    } else if (capped && rate < 0.93 * hz) {
         g.capped = false;
         Log("the game makes %.0f FPS of the headset's %.0f Hz: uncapped", rate, hz);
     }

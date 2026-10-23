@@ -82,7 +82,7 @@ void Recenter();
 /// The present thread, each flip: its frame limit's period (`limit`, the launcher's: unpaced). While capped it is
 /// the headset that paces the game: one flip per headset frame (FlipAllowed), so the game makes no frames the headset
 /// never shows and the GPU keeps time for the headset's own work (2880 per eye: frames over a 90 Hz period 3.6% ->
-/// 0.2%). Adaptive: capped once the game flips >= 112% of the headset's rate for 2 s, released below 95% (BB_VR_CAP=0
+/// 0.2%). Adaptive: capped once the game flips >= 103% of the headset's rate for 2 s, released below 93% (BB_VR_CAP=0
 /// never caps). This flip takes the headset frame's token.
 std::chrono::nanoseconds FramePeriod(std::chrono::nanoseconds limit);
 

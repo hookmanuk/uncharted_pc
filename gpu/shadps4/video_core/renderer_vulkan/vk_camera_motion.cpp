@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 #include <algorithm>
 #include "video_core/renderer_vulkan/vk_camera_motion.h"
+#include "video_core/renderer_vulkan/vr/vr_stereo.h" // VR
 
 #include <atomic>
 #include <chrono>
@@ -268,6 +269,7 @@ void CameraMotion::OnVelocityConstants(const float* c, u32 dwords) {
     //   p = M view + t (M, t: rows c12..c23; pixels with stencil bits 0xc0 add c56..c58)
     //   previous clip x, y, w = rows c40..c43, c44..c47, c52..c55 applied to (p, 1)
     //   previous uv = (0.5 x / w + 0.5, 0.5 - 0.5 y / w)
+    Vr::Stereo::OnVelocityConstants(c, dwords); // VR: the frame's head pose (its tagged near plane)
     if (dwords < 60) {
         return;
     }

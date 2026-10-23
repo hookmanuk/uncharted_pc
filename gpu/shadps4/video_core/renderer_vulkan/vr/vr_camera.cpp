@@ -84,6 +84,7 @@ bool g_rendered_valid = false;
 struct Rendered {
     float position[3];
     Head head;
+    float depth_term; // Uncharted: -(near / 2) * far / (far - near / 2), the frame's tagged near (TaggedRendered)
 };
 constexpr u32 HistorySize = 32;
 Rendered g_history[HistorySize];
@@ -292,6 +293,12 @@ extern "C" void SceneHandler(u64* regs) {
 alignas(16) float g_input_original[16];
 alignas(16) float g_input_written[16];
 bool g_input_written_valid = false;
+// Frame tags: each frame's near plane is the game's plus k * NearStep (k = 1..63, cycling), so the frame's projection
+// says which head pose it was rendered with (the GPU renders a frame or two behind this hook): the stereo capture reads
+// it back from the motion blur's velocity pass (TaggedRendered). 63 steps are 1.3 mm at most.
+constexpr float NearStep = 2e-5f;
+u32 g_tag = 0;
+float g_near_written = 0.f, g_near_original = 0.f;
 
 extern "C" void ProjectionHandler(u64* regs) {
     auto* view = reinterpret_cast<u8*>(regs[RDI]);
@@ -300,6 +307,9 @@ extern "C" void ProjectionHandler(u64* regs) {
     }
     auto* input = reinterpret_cast<float*>(view + 0x250);  // rows x, y, z, position (w unused)
     auto* params = reinterpret_cast<float*>(view + 0x290); // aspect, x scale, near, far
+    if (g_near_written != 0.f && params[2] == g_near_written) {
+        params[2] = g_near_original; // the game did not set it again this frame
+    }
     g_near = params[2];
     if (g_log_next.load(std::memory_order_relaxed) > 0 && g_log_next.fetch_sub(1) > 0) {
         std::printf("VR camera: view %#llx pos %.3f %.3f %.3f fwd %.3f %.3f %.3f aspect %.4f xscale %.4f near %.4f "
@@ -361,11 +371,23 @@ extern "C" void ProjectionHandler(u64* regs) {
     const float tx = std::max(-l, r), ty = std::max(u, -d);
     params[0] = ty / tx;
     params[1] = 1.f / tx;
+    g_near_original = params[2];
+    g_tag = g_tag % 63 + 1;
+    params[2] = g_near_original + float(g_tag) * NearStep;
+    g_near_written = params[2];
+    const float n = params[2], f = params[3];
     std::scoped_lock lock{g_head_mutex};
     g_rendered.tan[0] = -tx, g_rendered.tan[1] = tx, g_rendered.tan[2] = ty, g_rendered.tan[3] = -ty;
     Rendered& entry = g_history[g_history_count++ % HistorySize];
     std::memcpy(entry.position, out + 12, sizeof(entry.position));
     entry.head = g_rendered;
+    // The shaders get half the view's near plane (0.48 in the view, 0.24 in the velocity pass's constants).
+    entry.depth_term = f > n ? -(n * 0.5f) * f / (f - n * 0.5f) : 0.f;
+    static int told = 0; // development: the first tags written
+    if (told < 12 && std::getenv("BB_VR_TAGLOG")) {
+        ++told;
+        std::printf("VR tag: frame tag %u near %.7f far %.3f term %.7f%c", g_tag, n, f, entry.depth_term, 10);
+    }
 }
 
 struct Stub : Xbyak::CodeGenerator {
@@ -545,6 +567,27 @@ u32 RecentPositions(float (*positions)[3], u32 max) {
         std::memcpy(positions[i], g_history[(g_history_count - count + i) % HistorySize].position, sizeof(positions[i]));
     }
     return count;
+}
+
+bool TaggedRendered(float depth_term, float (&layer_pose)[7], float (&tangents)[4]) {
+    std::scoped_lock lock{g_head_mutex};
+    const u32 count = std::min(g_history_count, HistorySize);
+    const Rendered* best = nullptr;
+    float best_error = 0.f;
+    for (u32 n = 0; n < count; ++n) { // oldest to newest: the newest of equal matches wins
+        const Rendered& e = g_history[(g_history_count - count + n) % HistorySize];
+        const float error = std::abs(e.depth_term - depth_term);
+        if (e.depth_term != 0.f && (!best || error <= best_error)) {
+            best = &e;
+            best_error = error;
+        }
+    }
+    if (!best || best_error > NearStep * 0.5f * 0.4f) { // the tags are NearStep / 2 apart in the shaders' term
+        return false;
+    }
+    std::memcpy(layer_pose, best->head.layer, sizeof(layer_pose));
+    std::memcpy(tangents, best->head.tan, sizeof(tangents));
+    return true;
 }
 
 bool RenderedAt(const float* position, float (&layer_pose)[7], float (&tangents)[4], float& distance) {

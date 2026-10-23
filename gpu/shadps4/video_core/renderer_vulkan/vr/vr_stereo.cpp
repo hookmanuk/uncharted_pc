@@ -535,6 +535,19 @@ void LogDraws() {
     g_log_draws = 5000;
 }
 
+void OnVelocityConstants(const float* c, u32 dwords) {
+    if (!g.ready || g_frame_pose_valid || dwords < 10) {
+        return;
+    }
+    g_frame_pose_valid = Camera::TaggedRendered(c[9], g_frame_layer_pose, g_frame_tangents);
+    static int told = 0; // development (BB_VR_TAGLOG): the first tags read
+    if (told < 12 && std::getenv("BB_VR_TAGLOG")) {
+        ++told;
+        std::printf("VR tag: read %.7f -> %d%c", c[9], int(g_frame_pose_valid), 10);
+        std::fflush(stdout);
+    }
+}
+
 void OnFrameCamera(const float* position) {
     if (!g.ready) {
         return;
@@ -788,6 +801,7 @@ void OnDraw(Scheduler& scheduler, Runtime& runtime, VideoCore::TextureCache& tex
             LogSceneConstants(*fs);
         }
     }
+
     const int targets = std::popcount(key.mrt_mask);
     // DRAWLOG: multi-target draws too (the G-buffer passes), marked "mrt N".
     if (targets >= 2 && g_log_draws.load(std::memory_order_relaxed) > 0 && g_log_draws.fetch_sub(1) > 0 && color_id) {
