@@ -15,6 +15,7 @@
 #endif
 #include "common/assert.h"
 #include "bbport_toggles.h"
+#include "video_core/renderer_vulkan/vr/vr_openxr.h" // VR
 #include "video_core/renderer_vulkan/vk_frame_capture.h"
 #include "common/debug.h"
 #include "common/thread.h"
@@ -725,11 +726,11 @@ void VideoOutDriver::PresentThread(std::stop_token token) {
             }
             next_movie_vblank = std::max(next_movie_vblank + movie_period, now - movie_period);
         }
-        const bool flip_slot = movie || !frame_limit || now >= next_flip;
+        const bool flip_slot = (movie || !frame_limit || now >= next_flip) && Vulkan::Vr::FlipAllowed(); // VR
         if (flip_slot && vblank_status.count % (main_port.flip_rate + 1) == 0) {
             const auto request = receive_request();
             if (request && frame_limit) {
-                next_flip = std::max(next_flip + frame_period, now - frame_period);
+                next_flip = std::max(next_flip + Vulkan::Vr::FramePeriod(frame_period), now - frame_period); // VR
             }
             if (!request) {
                 if (timer.GetTotalWait().count() < 0) { // Dont draw too fast
@@ -787,10 +788,13 @@ void VideoOutDriver::PresentThread(std::stop_token token) {
                 }
                 std::this_thread::sleep_until(next_flip);
             }
+            if (!Vulkan::Vr::FlipAllowed()) {
+                break; // VR: the headset's next frame (the next vblank tick looks again)
+            }
             const auto now = std::chrono::steady_clock::now();
             const auto request = receive_request();
             if (request) {
-                next_flip = std::max(next_flip + frame_period, now - frame_period);
+                next_flip = std::max(next_flip + Vulkan::Vr::FramePeriod(frame_period), now - frame_period); // VR
                 Flip(request);
                 FRAME_END;
             }

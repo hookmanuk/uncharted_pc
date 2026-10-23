@@ -10,6 +10,7 @@
 #include "shader_recompiler/backend/spirv/emit_spirv_quad_rect.h"
 #include "video_core/renderer_vulkan/liverpool_to_vk.h"
 #include "video_core/renderer_vulkan/vk_graphics_pipeline.h"
+#include "video_core/renderer_vulkan/vr/vr_multiview.h" // VR
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
 #include "video_core/renderer_vulkan/vk_shader_util.h"
@@ -425,6 +426,7 @@ GraphicsPipeline::GraphicsPipeline(
     ASSERT_MSG(pipeline_result == vk::Result::eSuccess, "Failed to create graphics pipeline: {}",
                vk::to_string(pipeline_result));
     pipeline = std::move(pipe);
+    Vr::Multiview::OnPipelineCreated(device, pipeline_cache, pipeline_info, pipeline_rendering_ci, *pipeline); // VR
     SetObjectName(device, *pipeline, "Graphics Pipeline {}", debug_str);
 }
 
@@ -498,7 +500,7 @@ void GraphicsPipeline::BuildDescSetLayout(bool preloading) {
             bindings.push_back({
                 .binding = binding++,
                 .descriptorType = vk::DescriptorType::eStorageBuffer,
-                .descriptorCount = 1,
+                .descriptorCount = Vr::Multiview::BufferDescriptors(buffer.IsSpecial()), // VR: per eye
                 .stageFlags = stage_bit,
             });
         }
@@ -522,7 +524,7 @@ void GraphicsPipeline::BuildDescSetLayout(bool preloading) {
             });
         }
     }
-    uses_push_descriptors = binding < instance.MaxPushDescriptors();
+    uses_push_descriptors = binding + Vr::Multiview::ExtraDescriptors(bindings) < instance.MaxPushDescriptors(); // VR
     const auto flags = uses_push_descriptors
                            ? vk::DescriptorSetLayoutCreateFlagBits::ePushDescriptorKHR
                            : vk::DescriptorSetLayoutCreateFlagBits{};

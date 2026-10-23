@@ -15,6 +15,7 @@
 #include "video_core/renderer_vulkan/vk_dlss.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_platform.h"
+#include "video_core/renderer_vulkan/vr/vr_openxr.h" // VR
 
 #include <vk_mem_alloc.h>
 
@@ -419,7 +420,7 @@ bool Instance::CreateDevice() {
     // bbport: a side queue (BufferCache reads GPU data back there, past the work queued for
     // graphics): a transfer-only family, a copy engine that runs beside graphics work; else a
     // second queue of the graphics family.
-    static constexpr std::array queue_priorities = {1.0f, 1.0f};
+    static constexpr std::array queue_priorities = {1.0f, 1.0f, 1.0f}; // VR: + the headset's queue
     side_queue_family_index = queue_family_index;
     for (u32 i = 0; i < family_properties.size(); ++i) {
         const auto flags =
@@ -435,7 +436,7 @@ bool Instance::CreateDevice() {
     const std::array queue_infos = {
         vk::DeviceQueueCreateInfo{
             .queueFamilyIndex = queue_family_index,
-            .queueCount = graphics_queues,
+            .queueCount = Vr::QueueCount(physical_device, queue_family_index, graphics_queues), // VR
             .pQueuePriorities = queue_priorities.data(),
         },
         vk::DeviceQueueCreateInfo{
@@ -460,6 +461,7 @@ bool Instance::CreateDevice() {
             }
         }
     }
+    Vr::AppendDeviceExtensions(*instance, physical_device, enabled_extensions); // VR: OpenXR's device extensions
     vk::StructureChain device_chain = {
         vk::DeviceCreateInfo{
             .queueCreateInfoCount = side_family ? 2u : 1u,
@@ -503,6 +505,9 @@ bool Instance::CreateDevice() {
         },
         vk::PhysicalDeviceVulkan11Features{
             .storageBuffer16BitAccess = vk11_features.storageBuffer16BitAccess,
+            .multiview = vk11_features.multiview, // VR: stereo (vr_multiview.h)
+            .multiviewGeometryShader = vk11_features.multiviewGeometryShader,         // VR
+            .multiviewTessellationShader = vk11_features.multiviewTessellationShader, // VR
             .shaderDrawParameters = vk11_features.shaderDrawParameters,
         },
         vk::PhysicalDeviceVulkan12Features{
@@ -696,6 +701,7 @@ bool Instance::CreateDevice() {
     }
 
     graphics_queue = device->getQueue(queue_family_index, 0);
+    Vr::OnDeviceCreated(*instance, physical_device, *device, queue_family_index); // VR: the OpenXR session
     present_queue = device->getQueue(queue_family_index, 0);
     g_crash_queue = graphics_queue;
     if (side_queue_family_index != queue_family_index) {

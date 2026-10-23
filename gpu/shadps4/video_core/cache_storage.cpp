@@ -19,6 +19,7 @@
 #include <future>
 #include <mutex>
 #include <queue>
+#include "video_core/renderer_vulkan/vr/vr_multiview.h" // VR
 
 namespace {
 
@@ -112,7 +113,8 @@ void DataBase::Open() {
         }
     } else {
         cache_path = GetUserPath(PathType::CacheDir) /
-                     (std::string{game_info.GameSerial()} + BbNanGuard::ShaderCacheSuffix());
+                     (std::string{game_info.GameSerial()} + BbNanGuard::ShaderCacheSuffix() +
+                      Vulkan::Vr::Multiview::CacheSuffix()); // VR
         if (!std::filesystem::exists(cache_path)) {
             std::filesystem::create_directories(cache_path);
         }

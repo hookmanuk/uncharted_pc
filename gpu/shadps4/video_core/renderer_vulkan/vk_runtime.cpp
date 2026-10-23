@@ -12,6 +12,7 @@
 #include "video_core/renderer_vulkan/vk_scheduler.h"
 #include "video_core/texture_cache/blit_helper.h"
 #include "video_core/texture_cache/image.h"
+#include "video_core/renderer_vulkan/vr/vr_multiview.h" // VR
 
 #include <vulkan/vulkan_format_traits.hpp>
 
@@ -228,6 +229,7 @@ Runtime::TransferMark::~TransferMark() {
 
 void Runtime::UploadImage(VideoCore::Image* dst, const VideoCore::Buffer* src,
                           std::span<const vk::BufferImageCopy> upload_copies) {
+    upload_copies = Vr::Multiview::StereoUploads(*dst, upload_copies); // VR: both eyes
     SetBackingSamples(dst, dst->info.num_samples, false);
     scheduler.EndRendering();
     const TransferMark mark{*this, "image upload", *dst};
@@ -289,6 +291,7 @@ void Runtime::DownloadImage(VideoCore::Image* src, const VideoCore::Buffer* dst,
 }
 
 void Runtime::CopyImage(VideoCore::Image* src, VideoCore::Image* dst) {
+    Vr::Multiview::AuditCopy("CopyImage", *src, *dst); // VR: development audit
     const u32 num_mips = std::min(src->info.resources.levels, dst->info.resources.levels);
 
     // Format mismatch warning (safe but useful)
@@ -378,6 +381,7 @@ void Runtime::CopyImage(VideoCore::Image* src, VideoCore::Image* dst) {
         FlushBarriers();
     }
 
+    Vr::Multiview::StereoCopies(*src, *dst, regions); // VR: the right eye's layer
     scheduler.Record([src_image = src->GetImage(), dst_image = dst->GetImage(),
                       regions](vk::CommandBuffer cmdbuf) {
         cmdbuf.copyImage(src_image, vk::ImageLayout::eTransferSrcOptimal, dst_image,
@@ -390,6 +394,7 @@ void Runtime::CopyImage(VideoCore::Image* src, VideoCore::Image* dst) {
 
 void Runtime::CopyImageWithBuffer(VideoCore::Image* src, VideoCore::Image* dst,
                                   const VideoCore::Buffer* buffer, u64 offset) {
+    Vr::Multiview::AuditCopy("CopyImageWithBuffer (layer 0 only)", *src, *dst); // VR: development audit
     const u32 num_mips = std::min(src->info.resources.levels, dst->info.resources.levels);
     const u32 num_layers = std::min(src->info.resources.layers, dst->info.resources.layers);
     ASSERT(src->info.resources.layers == dst->info.resources.layers && num_mips == 1);
@@ -451,6 +456,7 @@ void Runtime::CopyImageWithBuffer(VideoCore::Image* src, VideoCore::Image* dst,
 }
 
 void Runtime::CopyMip(VideoCore::Image* src, VideoCore::Image* dst, u32 mip, u32 slice) {
+    Vr::Multiview::AuditCopy("CopyMip", *src, *dst); // VR: development audit
     const auto dst_dim = dst->info.props.is_block ? 2 : 0;
     const auto mip_block_w = std::max(dst->info.size.width >> (mip + dst_dim), 1u);
     const auto mip_block_h = std::max(dst->info.size.height >> (mip + dst_dim), 1u);
@@ -494,10 +500,12 @@ void Runtime::CopyMip(VideoCore::Image* src, VideoCore::Image* dst, u32 mip, u32
         FlushBarriers();
     }
 
+    boost::container::small_vector<vk::ImageCopy, 2> copies{image_copy}; // VR: the right eye's layer
+    Vr::Multiview::StereoCopies(*src, *dst, copies);
     scheduler.Record([src_image = src->GetImage(), dst_image = dst->GetImage(),
-                      image_copy](vk::CommandBuffer cmdbuf) {
+                      copies](vk::CommandBuffer cmdbuf) {
         cmdbuf.copyImage(src_image, vk::ImageLayout::eTransferSrcOptimal, dst_image,
-                         vk::ImageLayout::eTransferDstOptimal, image_copy);
+                         vk::ImageLayout::eTransferDstOptimal, copies);
     });
 
     dst->flags |= (src->flags & VideoCore::ImageFlagBits::GpuModified);
@@ -505,6 +513,7 @@ void Runtime::CopyMip(VideoCore::Image* src, VideoCore::Image* dst, u32 mip, u32
 }
 
 void Runtime::CopyColorAndDepth(VideoCore::Image* src, VideoCore::Image* dst) {
+    Vr::Multiview::AuditCopy("CopyColorAndDepth", *src, *dst); // VR: development audit
     if (src->info.num_samples == 1 && dst->info.num_samples == 1) {
         if (instance.IsMaintenance8Supported() ||
             src->info.props.is_depth == dst->info.props.is_depth) {
@@ -533,6 +542,11 @@ void Runtime::CopyColorAndDepth(VideoCore::Image* src, VideoCore::Image* dst) {
         blit_helper->ReinterpretColorAsMsDepth(
             dst->info.size.width, dst->info.size.height, dst->info.num_samples,
             src->info.pixel_format, dst->info.pixel_format, src->GetImage(), dst->GetImage());
+        if (Vr::Multiview::Stereo(*dst)) { // VR: the right eye's layer (from the source's, or its only one)
+            blit_helper->ReinterpretColorAsMsDepth(
+                dst->info.size.width, dst->info.size.height, dst->info.num_samples, src->info.pixel_format,
+                dst->info.pixel_format, src->GetImage(), dst->GetImage(), Vr::Multiview::Stereo(*src) ? 1 : 0, 1);
+        }
     } else {
         LOG_WARNING(Render_Vulkan, "Unimplemented depth overlap copy");
     }
@@ -571,10 +585,12 @@ void Runtime::CopyDepthStencil(VideoCore::Image* src, VideoCore::Image* dst,
         .extent = {dst->info.size.width, dst->info.size.height, 1},
     };
 
+    boost::container::small_vector<vk::ImageCopy, 2> copies{region}; // VR: the right eye's layer
+    Vr::Multiview::StereoCopies(*src, *dst, copies);
     scheduler.Record([src_image = src->GetImage(), dst_image = dst->GetImage(),
-                      region](vk::CommandBuffer cmdbuf) {
+                      copies](vk::CommandBuffer cmdbuf) {
         cmdbuf.copyImage(src_image, vk::ImageLayout::eTransferSrcOptimal, dst_image,
-                         vk::ImageLayout::eTransferDstOptimal, region);
+                         vk::ImageLayout::eTransferDstOptimal, copies);
     });
 
     dst->flags |= VideoCore::ImageFlagBits::GpuModified;
@@ -599,7 +615,8 @@ void Runtime::ResolveImage(VideoCore::Image* src, VideoCore::Image* dst,
         FlushBarriers();
     }
 
-    const auto [src_layers, dst_layers] = SanitizeCopyLayers(src->info, dst->info, 1);
+    const auto [src_layers, dst_layers] =
+        Vr::Multiview::ResolveLayers(*src, *dst, SanitizeCopyLayers(src->info, dst->info, 1)); // VR: both eyes
     if (!needs_resolve) {
         const vk::ImageCopy region = {
             .srcSubresource{
@@ -711,6 +728,7 @@ void Runtime::SetBackingSamples(VideoCore::Image* image, u32 num_samples, bool c
     }
 
     if (copy_backing) {
+        Vr::Multiview::AuditCopy("SetBackingSamples copy (layer 0 only)", *image, *image); // VR: development audit
         scheduler.EndRendering();
         ASSERT(image->info.resources.levels == 1 && image->info.resources.layers == 1);
 
