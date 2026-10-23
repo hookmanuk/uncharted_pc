@@ -107,10 +107,11 @@ BUTTON_PROMPTS = [('auto', 'Automatic (last device used)'),
                   ('0', "PlayStation (the game's own)")]
 FRAME_GEN_MULTIPLIERS = [('2', '2×'), ('3', '3× (DLSS, GeForce RTX 50)'),
                          ('4', '4× (DLSS, GeForce RTX 50)')]
-# VR fork: the size each eye is drawn at (BB_VR_EYE_RES), square; 2880 is 4K's pixel count.
+# VR fork: the size each eye is drawn at (BB_VR_EYE_RES), square. The games' render target memory stops at 2560 x 2560
+# (scripts/vr_resolution.py: their GPU memory context must stay below 4 GB).
 VR_EYE_SIZES = [(size, f'{size} × {size}' + note) for size, note in (
-    ('1080', ''), ('1600', ''), ('2160', ''), ('2560', ''), ('2880', ' (recommended)'), ('3200', ''),
-    ('3584', ''), ('3840', ''), ('4320', ''))]
+    ('1440', " (the games' own pixel count)"), ('1600', ''), ('1800', ''), ('2048', ''), ('2160', ' (recommended)'),
+    ('2400', ''), ('2560', ' (the most)'))]
 # Controls (input.ini, read by the game: src/runtime_pad.c). Actions with their PS4 names, the
 # default keys ("A|B": two bindings) and the default controller buttons (SDL names).
 BUTTON_ACTIONS = [
@@ -217,7 +218,7 @@ APP_DEFAULTS = {'game_dir': '', 'game_dir_u1': '', 'game_dir_u2': '', 'game_dir_
                 'pad_invert_y': False, 'art_banner': '', 'art_u1': '', 'art_u2': '', 'art_u3': '', 'steam_art': '', 'art_crops': {},
                 'shortcut_name': 'Uncharted: The Nathan Drake Collection', 'shortcut_icon': '', 'trophy_game': 'u1',
                 'pad_vibration': True, 'pad_vibration_strength': '100', 'button_prompts': 'auto', 'key_bindings': {}, 'pad_bindings': {}, 'check_updates': True,
-                'vr': False, 'vr_eye_size': '2880',  # VR fork: the VR card (Display page)
+                'vr': False, 'vr_eye_size': '2160',  # VR fork: the VR card (Display page)
                 **{key: 'auto' for key in FIXES},
                 **{f'{game}_infinite_{cheat}': False for game, _t, _s, _e in GAMES for cheat in ('health', 'ammo')}}
 
@@ -517,7 +518,7 @@ def vr_environment(s, env):
     if s.get('vr'):
         env['BB_VR'] = '1'
         env['BB_VR_STEREO'] = 'mv'
-        env['BB_VR_EYE_RES'] = str(s.get('vr_eye_size') or '2880')
+        env['BB_VR_EYE_RES'] = str(s.get('vr_eye_size') or '2160')
         env['BB_FRAME_GEN'] = 'off'
         env['BB_UPSCALER'] = 'off'
         # The headset paces the game: the game runs unpaced and each flip waits for the headset's next frame once it
@@ -1488,8 +1489,8 @@ class Launcher:
                      'with head tracking; Uncharted 2 and 3 show on a large screen in front of you for now, as do '
                      'menus and cutscene videos. Anti-aliasing and frame generation stay off in VR. F8 recentres.'))
         self.row(f, _('Resolution per eye'), self.choice(f, 'vr_eye_size', VR_EYE_SIZES, 34),
-                 _('The size each eye is drawn at in 3D: lower is faster, higher is sharper. 2880 × 2880 has the '
-                   "pixels of 4K. For now each eye is drawn at the games' own 1920 × 1080."))
+                 _('The size each eye is drawn at: lower is faster, higher is sharper. Uncharted 1 renders at it; '
+                   'its menus and HUD lay themselves out for the square picture.'))
         self.new_card(f, None)
 
     def build_controls(self):

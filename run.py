@@ -14,6 +14,7 @@ The in-game "Apply and restart" runs this script again through BB_RESTART_COMMAN
 """
 import ctypes
 import os
+import struct
 from pathlib import Path
 import subprocess
 import sys
@@ -60,6 +61,40 @@ def find_executable(name):
         if candidate.is_file():
             return candidate
     return None
+
+
+def vr_render_size(env, out, exe):
+    """VR fork: the game renders at the eye size (scripts/vr_resolution.py: patches when the version is known)."""
+    size = env.get('BB_VR_EYE_RES', '') if env.get('BB_VR') == '1' else ''
+    if size.isdigit() and int(size) > 2560:  # the games' render target memory stops there (vr_resolution.py)
+        size = '2560'
+    run_script('vr_resolution.py', out, exe, size or '0')
+    env.pop('BB_VR_RENDER_SIZE', None)
+    if not (out / 'vr_patches.bin').is_file():
+        return None
+    env['BB_VR_RENDER_SIZE'] = f'{size}x{size}'
+    if (out / 'vr_patches.dmem').is_file() and not env.get('BB_DMEM_MB'):  # the larger render targets' memory
+        env['BB_DMEM_MB'] = (out / 'vr_patches.dmem').read_text(encoding='ascii').strip()
+    return out / 'vr_patches.bin'
+
+
+def vr_patches(env, out, exe, patches):
+    """VR fork: the eye size's patches joined to the cheats' (bb-probe takes one --patches file). Both are BBPATCH2:
+    the image base (used only for pointer writes, which neither has), the count, then writes at image offsets."""
+    vr = vr_render_size(env, out, exe)
+    if not vr or not patches:
+        return vr or patches
+    parts, base = [], None
+    for path in (patches, vr):
+        data = Path(path).read_bytes()
+        if data[:8] != b'BBPATCH2':
+            fail(f'{path} is not a patch file')
+        part_base, count = struct.unpack_from('<QQ', data, 8)
+        base = part_base if base is None else base
+        parts.append((count, data[24:]))
+    merged = out / 'patches-vr.bin'
+    merged.write_bytes(b'BBPATCH2' + struct.pack('<QQ', base, sum(n for n, _ in parts)) + b''.join(d for _, d in parts))
+    return merged
 
 
 def executable_name(value):
@@ -278,6 +313,7 @@ def main():
         command = [str(probe), str(out / 'boot-linked.bin'), '--content-profile', str(out / 'content.bin'),
                    '--app0', str(game), '--user', str(user_dir), '--timeout', env.get('BB_TIMEOUT', '0')]
         command += isa_rewrite_args(probe, out)
+        patches = vr_patches(env, out, file, patches)  # VR fork: the eye size's patches with the cheats'
         if patches:
             command += ['--patches', str(patches)]
         if guest_argv:

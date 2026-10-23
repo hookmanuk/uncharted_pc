@@ -24,6 +24,7 @@
 #include <xbyak/xbyak.h>
 
 #include "video_core/renderer_vulkan/vr/vr_camera.h"
+#include "video_core/renderer_vulkan/vr/vr_fixes.h"
 #include "video_core/renderer_vulkan/vr/vr_multiview.h"
 
 #ifdef _WIN32
@@ -485,8 +486,9 @@ void DoInstall() {
 std::atomic<bool> g_image_mapped{false}; // the game's image is mapped (Install saw it)
 
 float ScreenAspect() {
-    // The HUD's canvas. Uncharted fork: 16:9 until each game's screen aspect is found (Driveclub read its eboot's).
-    return 16.f / 9.f;
+    // The HUD's canvas: the game's render size (square at a VR eye size: the HUD lays itself out for it).
+    u32 width = 0, height = 0;
+    return Fixes::RenderSize(width, height) && height ? float(width) / float(height) : 16.f / 9.f;
 }
 
 void Install() {

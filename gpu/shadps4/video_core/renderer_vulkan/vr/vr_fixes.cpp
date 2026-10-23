@@ -30,12 +30,12 @@ int ReplaceConstant(std::vector<u32>& spirv, u32 from, u32 to) {
 
 } // namespace
 
-// Uncharted fork: the collection renders at 1920x1080 and shows that (BB_RENDER_RES: the size the port patches in at
-// start). Driveclub read its sizes from its eboot.
+// Uncharted fork: the collection renders at 1920x1080, or at the eye size run.py patched in (BB_VR_RENDER_SIZE,
+// scripts/vr_resolution.py). Driveclub read its sizes from its eboot.
 bool RenderSize(u32& width, u32& height) {
     static const std::pair<u32, u32> size = [] {
         u32 w = 1920, h = 1080;
-        if (const char* res = std::getenv("BB_RENDER_RES"); res && std::sscanf(res, "%ux%u", &w, &h) != 2) {
+        if (const char* res = std::getenv("BB_VR_RENDER_SIZE"); res && std::sscanf(res, "%ux%u", &w, &h) != 2) {
             w = 1920, h = 1080;
         }
         return std::pair{w, h};
