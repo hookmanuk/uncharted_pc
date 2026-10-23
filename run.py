@@ -60,6 +60,21 @@ def find_executable(name):
     return None
 
 
+def vr_render_size(env, out, exe):
+    """VR fork: the game renders at the eye size (scripts/vr_resolution.py: patches when the version is known)."""
+    size = env.get('BB_VR_EYE_RES', '') if env.get('BB_VR') == '1' else ''
+    if size.isdigit() and int(size) > 2560:  # the games' render target memory stops there (vr_resolution.py)
+        size = '2560'
+    run_script('vr_resolution.py', out, exe, size or '0')
+    env.pop('BB_VR_RENDER_SIZE', None)
+    if not (out / 'vr_patches.bin').is_file():
+        return []
+    env['BB_VR_RENDER_SIZE'] = f'{size}x{size}'
+    if (out / 'vr_patches.dmem').is_file() and not env.get('BB_DMEM_MB'):  # the larger render targets' memory
+        env['BB_DMEM_MB'] = (out / 'vr_patches.dmem').read_text(encoding='ascii').strip()
+    return ['--patches', str(out / 'vr_patches.bin')]
+
+
 def executable_name(value):
     return EXECUTABLES.get(value.lower(), value) if value else EXECUTABLES['u1']
 
@@ -158,6 +173,7 @@ def main():
         env['BB_RESTART_COMMAND'] = subprocess.list2cmdline([sys.executable, *this, '--after', str(os.getpid()), *args])
         command = [str(probe), str(out / 'boot-linked.bin'), '--content-profile', str(out / 'content.bin'),
                    '--app0', str(game), '--user', str(user_dir), '--timeout', env.get('BB_TIMEOUT', '0')]
+        command += vr_render_size(env, out, file)  # VR fork
         if guest_argv:
             command += ['--guest-argv', str(guest_argv)]
         loadexec.unlink(missing_ok=True)
