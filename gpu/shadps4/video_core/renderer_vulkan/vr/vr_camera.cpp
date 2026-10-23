@@ -58,10 +58,30 @@ struct Site {
 // the image's +0xa86b30 (position, orientation, field of view in degrees at +0x20); its view is at +0x30. The camera
 // update (+0xa6f.. +0xa7178) writes the input and the field of view every frame, then calls this. The outputs: +0x10
 // camera to world, +0x50 world to camera, +0x90 projection (P00 negative: x mirrored), +0xd0 view-projection.
-constexpr u64 U1MainView = 0xa86b60;
-const std::vector<Site> Sites = {
-    {0x2c8dd0, {0x55, 0x48, 0x89, 0xe5, 0x41, 0x56, 0x53, 0x48, 0x81, 0xec, 0xa0, 0x00, 0x00, 0x00}, &ProjectionHandler},
+//
+// Uncharted 2 (big2-ps4_Shipping.elf): the same view, its fields 0x40 lower (input +0x210, position +0x240, aspect,
+// x scale, near, far at +0x250), built in one function (image +0x3e2c50). Each frame's render views are copies in GPU
+// memory, built from the call at +0x61194f (also the shadow cascades: x scale 0, near 2.5 and more); the static view in
+// the image (+0xeb81e0, from +0x16605d) is a wide (100 degree) one, not the one drawn. The shaders get the near plane
+// as it is (U1's get half of it).
+struct Game {
+    const char* name;
+    std::vector<Site> sites; // the first one identifies the game (its bytes in the image)
+    u64 main_view;   // image offset of the player's view, or 0: any camera-like view from main_caller
+    u64 main_caller; // image offset of the call's return address (main_view 0)
+    u32 input;       // the camera-to-world input: three rows and the position (row vectors)
+    u32 params;      // aspect, x scale, near, far
+    float shader_near; // the near plane in the shaders' constants, per unit of the view's
 };
+const std::vector<Game> Games = {
+    {"Uncharted 1",
+     {{0x2c8dd0, {0x55, 0x48, 0x89, 0xe5, 0x41, 0x56, 0x53, 0x48, 0x81, 0xec, 0xa0, 0x00, 0x00, 0x00}, &ProjectionHandler}},
+     0xa86b60, 0, 0x250, 0x290, 0.5f},
+    {"Uncharted 2",
+     {{0x3e2c50, {0x55, 0x48, 0x89, 0xe5, 0x53, 0x48, 0x81, 0xec, 0x28, 0x01, 0x00, 0x00}, &ProjectionHandler}},
+     0, 0x61194f, 0x210, 0x250, 1.0f},
+};
+const Game* g_game = nullptr;
 
 struct alignas(16) Mat {
     float m[16];
@@ -303,11 +323,14 @@ float g_near_written = 0.f, g_near_original = 0.f;
 
 extern "C" void ProjectionHandler(u64* regs) {
     auto* view = reinterpret_cast<u8*>(regs[RDI]);
-    if (u64(view) != g_image_base + U1MainView) {
+    const Game& game = *g_game;
+    auto* input = reinterpret_cast<float*>(view + game.input);   // rows x, y, z, position (w unused)
+    auto* params = reinterpret_cast<float*>(view + game.params); // aspect, x scale, near, far
+    if (game.main_view ? u64(view) != g_image_base + game.main_view
+                       : regs[RegCount] != g_image_base + game.main_caller || !(params[1] > 0.1f) ||
+                             !(params[2] > 0.05f && params[2] < 1.f)) {
         return;
     }
-    auto* input = reinterpret_cast<float*>(view + 0x250);  // rows x, y, z, position (w unused)
-    auto* params = reinterpret_cast<float*>(view + 0x290); // aspect, x scale, near, far
     if (g_near_written != 0.f && params[2] == g_near_written) {
         params[2] = g_near_original; // the game did not set it again this frame
     }
@@ -382,8 +405,9 @@ extern "C" void ProjectionHandler(u64* regs) {
     Rendered& entry = g_history[g_history_count++ % HistorySize];
     std::memcpy(entry.position, out + 12, sizeof(entry.position));
     entry.head = g_rendered;
-    // The shaders get half the view's near plane (0.48 in the view, 0.24 in the velocity pass's constants).
-    entry.depth_term = f > n ? -(n * 0.5f) * f / (f - n * 0.5f) : 0.f;
+    // The near plane as the shaders get it (U1: half the view's: 0.48 in the view, 0.24 in the velocity pass).
+    const float sn = n * game.shader_near;
+    entry.depth_term = f > sn ? -sn * f / (f - sn) : 0.f;
     static int told = 0; // development: the first tags written
     if (told < 12 && std::getenv("BB_VR_TAGLOG")) {
         ++told;
@@ -443,7 +467,7 @@ void DoInstall() {
     if (const char* v = std::getenv("BB_VR_FOV")) {
         g_fov_mode = std::atoi(v);
     }
-    for (const Site& site : Sites) {
+    for (const Site& site : g_game->sites) {
         auto* code = reinterpret_cast<u8*>(g_image_base + site.offset);
         MEMORY_BASIC_INFORMATION mbi{};
         if (!VirtualQuery(code, &mbi, sizeof(mbi)) || mbi.State != MEM_COMMIT ||
@@ -455,7 +479,7 @@ void DoInstall() {
         }
     }
     const bool cull_head = !(std::getenv("BB_VR_CULL_HEAD") && std::getenv("BB_VR_CULL_HEAD")[0] == '0');
-    for (const Site& site : Sites) {
+    for (const Site& site : g_game->sites) {
         if (site.handler == &CameraSetHandler && !cull_head) {
             continue;
         }
@@ -493,37 +517,43 @@ float ScreenAspect() {
 
 void Install() {
 #ifdef _WIN32
-    if (Sites.empty()) { // no camera hooks for this game yet: the game on a flat screen
-        static std::once_flag once;
-        std::call_once(once, [] {
-            std::printf("VR camera: no camera hooks for this game yet (the game on a flat screen)\n");
-            std::fflush(stdout);
-        });
-        return;
-    }
-    // The game image is mapped before the first frame: the executable allocation holding the first site's bytes.
+    // The game image is mapped before the first frame: the executable allocation holding a known game's first site's
+    // bytes. None after a minute of frames: a game without camera hooks (the game on a flat screen).
     if (!g_image_base) {
         static int calls = 0;
+        if (calls > 3600) {
+            return;
+        }
         if (calls++ % 60 != 0) {
             return;
         }
-        const Site& site = Sites[0];
         MEMORY_BASIC_INFORMATION mbi{};
-        for (u64 at = 0x400000; at < 0x80000000ull && VirtualQuery(reinterpret_cast<void*>(at), &mbi, sizeof(mbi));
+        for (u64 at = 0x400000; at < 0x80000000ull && VirtualQuery(reinterpret_cast<void*>(at), &mbi, sizeof(mbi)) &&
+                                !g_image_base;
              at = u64(mbi.BaseAddress) + mbi.RegionSize) {
             const u64 base = u64(mbi.BaseAddress);
-            if (mbi.State == MEM_COMMIT && u64(mbi.AllocationBase) == base &&
-                (mbi.Protect & (PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE)) &&
-                site.offset + site.bytes.size() <= mbi.RegionSize &&
-                std::memcmp(reinterpret_cast<const void*>(base + site.offset), site.bytes.data(), site.bytes.size()) ==
-                    0) {
-                g_image_base = base;
-                std::printf("VR camera: game image at %#llx\n", (unsigned long long)base);
-                std::fflush(stdout);
-                break;
+            if (mbi.State != MEM_COMMIT || u64(mbi.AllocationBase) != base ||
+                !(mbi.Protect & (PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE))) {
+                continue;
+            }
+            for (const Game& game : Games) {
+                const Site& site = game.sites[0];
+                if (site.offset + site.bytes.size() <= mbi.RegionSize &&
+                    std::memcmp(reinterpret_cast<const void*>(base + site.offset), site.bytes.data(),
+                                site.bytes.size()) == 0) {
+                    g_image_base = base;
+                    g_game = &game;
+                    std::printf("VR camera: %s, game image at %#llx%c", game.name, (unsigned long long)base, 10);
+                    std::fflush(stdout);
+                    break;
+                }
             }
         }
         if (!g_image_base) {
+            if (calls > 3600) {
+                std::printf("VR camera: no camera hooks for this game (the game on a flat screen)%c", 10);
+                std::fflush(stdout);
+            }
             return;
         }
     }
@@ -584,7 +614,8 @@ bool TaggedRendered(float depth_term, float (&layer_pose)[7], float (&tangents)[
             best_error = error;
         }
     }
-    if (!best || best_error > NearStep * 0.5f * 0.4f) { // the tags are NearStep / 2 apart in the shaders' term
+    // The tags are NearStep * shader_near apart in the shaders' term.
+    if (!best || best_error > NearStep * (g_game ? g_game->shader_near : 1.f) * 0.4f) {
         return false;
     }
     std::memcpy(layer_pose, best->head.layer, sizeof(layer_pose));
