@@ -518,12 +518,9 @@ float ScreenAspect() {
 void Install() {
 #ifdef _WIN32
     // The game image is mapped before the first frame: the executable allocation holding a known game's first site's
-    // bytes. None after a minute of frames: a game without camera hooks (the game on a flat screen).
+    // bytes, looked for every 60th frame (the game unpaced at boot flips hundreds a second: no deadline).
     if (!g_image_base) {
         static int calls = 0;
-        if (calls > 3600) {
-            return;
-        }
         if (calls++ % 60 != 0) {
             return;
         }
@@ -550,8 +547,8 @@ void Install() {
             }
         }
         if (!g_image_base) {
-            if (calls > 3600) {
-                std::printf("VR camera: no camera hooks for this game (the game on a flat screen)%c", 10);
+            if (calls == 3601) {
+                std::printf("VR camera: no known game image yet (the game on a flat screen until then)%c", 10);
                 std::fflush(stdout);
             }
             return;
