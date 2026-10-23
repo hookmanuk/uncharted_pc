@@ -326,12 +326,15 @@ def write_input_ini(s):
 
 
 def vr_environment(s, env):
-    """VR fork: the VR card. BB_VR=1 starts the OpenXR runtime (SteamVR, or XR_RUNTIME_JSON's); the headset paces the
-    game, so no generated frames."""
+    """VR fork: the VR card. BB_VR=1 starts the OpenXR runtime (SteamVR, or XR_RUNTIME_JSON's) with both eyes
+    rendered (multiview); the headset paces the game, so no generated frames, and the port's temporal upscaler is off
+    (it works on one eye and jitters the camera; the HUD capture needs the game's own display buffer)."""
     if s.get('vr'):
         env['BB_VR'] = '1'
+        env['BB_VR_STEREO'] = 'mv'
         env['BB_VR_EYE_RES'] = str(s.get('vr_eye_size') or '2880')
         env['BB_FRAME_GEN'] = 'off'
+        env['BB_UPSCALER'] = 'off'
 
 
 def game_environment(s, start=None):
@@ -1061,12 +1064,12 @@ class Launcher:
         """VR fork: the VR card, first on the Display page."""
         self.section(f, _('VR'), top=6)
         self.check(f, 'vr', _('Play in a VR headset (OpenXR)'),
-                   _('Starts your OpenXR runtime (SteamVR, Virtual Desktop, ...) with the game. For now the game '
-                     'shows on a large screen in front of you; head tracking and 3D come in later versions. '
-                     'Frame generation stays off in VR. F8 recentres the screen.'))
+                   _('Starts your OpenXR runtime (SteamVR, Virtual Desktop, ...) with the game. Uncharted 1 plays in 3D '
+                     'with head tracking; Uncharted 2 and 3 show on a large screen in front of you for now, as do '
+                     'menus and cutscene videos. Anti-aliasing and frame generation stay off in VR. F8 recentres.'))
         self.row(f, _('Resolution per eye'), self.choice(f, 'vr_eye_size', VR_EYE_SIZES, 34),
                  _('The size each eye is drawn at in 3D: lower is faster, higher is sharper. 2880 × 2880 has the '
-                   "pixels of 4K. Until 3D arrives the screen shows the games' own 1920 × 1080."))
+                   "pixels of 4K. For now each eye is drawn at the games' own 1920 × 1080."))
         self.new_card(f, None)
 
     def build_controls(self):

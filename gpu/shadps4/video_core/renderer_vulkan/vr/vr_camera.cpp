@@ -33,11 +33,12 @@
 namespace Vulkan::Vr::Camera {
 namespace {
 
-constexpr u64 ImageBase = 0x800000000ULL;
+u64 g_image_base = 0; // the game image (the loader maps it where it finds room: found by the first site's bytes)
 
 extern "C" void SceneHandler(u64* regs);
 extern "C" void ViewHandler(u64* regs);
 extern "C" void CameraSetHandler(u64* regs);
+extern "C" void ProjectionHandler(u64* regs);
 
 struct Site {
     u64 offset;
@@ -45,10 +46,21 @@ struct Site {
     void (*handler)(u64*);
 };
 
-// The game's camera setters to hook (Uncharted fork: per game, found in stage 3; none yet, so no head tracking and
-// the game on a flat screen). Driveclub's were Camera::Set (+0x72d9e0, CameraSetHandler), Scene::SetCamera (+0x5e7a20,
-// SceneHandler) and its two view setters (+0x736650, +0x7376e0, ViewHandler): see the Driveclub recomp's vr branch.
-const std::vector<Site> Sites;
+// The game's camera setters to hook. Driveclub's were Camera::Set (+0x72d9e0, CameraSetHandler), Scene::SetCamera
+// (+0x5e7a20, SceneHandler) and its two view setters (+0x736650, +0x7376e0, ViewHandler): see the Driveclub recomp's
+// vr branch.
+//
+// Uncharted 1 (eboot.bin, CUSA02343 01.00): a view's projection update (image +0x2c8dd0, rdi = the view). It builds the
+// projection from the view's aspect (+0x290, the field of view's height / width), x scale (+0x294), near (+0x298) and
+// far (+0x29c), then (+0x2c9070) every matrix of the view from its camera-to-world input: three rows at +0x250 (the
+// camera's x: left, y: up, z: forward) and the position at +0x280 (row vectors, metres). The render camera object is
+// the image's +0xa86b30 (position, orientation, field of view in degrees at +0x20); its view is at +0x30. The camera
+// update (+0xa6f.. +0xa7178) writes the input and the field of view every frame, then calls this. The outputs: +0x10
+// camera to world, +0x50 world to camera, +0x90 projection (P00 negative: x mirrored), +0xd0 view-projection.
+constexpr u64 U1MainView = 0xa86b60;
+const std::vector<Site> Sites = {
+    {0x2c8dd0, {0x55, 0x48, 0x89, 0xe5, 0x41, 0x56, 0x53, 0x48, 0x81, 0xec, 0xa0, 0x00, 0x00, 0x00}, &ProjectionHandler},
+};
 
 struct alignas(16) Mat {
     float m[16];
@@ -273,6 +285,89 @@ extern "C" void SceneHandler(u64* regs) {
     regs[RSI] = reinterpret_cast<u64>(copy.bytes);
 }
 
+// Uncharted 1: the main camera's view (rdi) gets the head. Its camera-to-world input becomes head x camera (the head's
+// pose turned into the game camera's axes, x left and z forward: C = diag(-1, 1, -1) on both sides), and its field of
+// view the headset's (symmetric: the game builds a symmetric projection; the layer says what was rendered). The game
+// rebuilds the input every frame; should it not, its own is put back before the head goes on again.
+alignas(16) float g_input_original[16];
+alignas(16) float g_input_written[16];
+bool g_input_written_valid = false;
+
+extern "C" void ProjectionHandler(u64* regs) {
+    auto* view = reinterpret_cast<u8*>(regs[RDI]);
+    if (u64(view) != g_image_base + U1MainView) {
+        return;
+    }
+    auto* input = reinterpret_cast<float*>(view + 0x250);  // rows x, y, z, position (w unused)
+    auto* params = reinterpret_cast<float*>(view + 0x290); // aspect, x scale, near, far
+    g_near = params[2];
+    if (g_log_next.load(std::memory_order_relaxed) > 0 && g_log_next.fetch_sub(1) > 0) {
+        std::printf("VR camera: view %#llx pos %.3f %.3f %.3f fwd %.3f %.3f %.3f aspect %.4f xscale %.4f near %.4f "
+                    "far %.1f\n",
+                    (unsigned long long)regs[RDI], input[12], input[13], input[14], input[8], input[9], input[10],
+                    params[0], params[1], params[2], params[3]);
+        std::fflush(stdout);
+    }
+    if (!g_head_enabled) {
+        return;
+    }
+    Head head;
+    {
+        std::scoped_lock lock{g_head_mutex};
+        if (!g_head_valid) {
+            return;
+        }
+        head = g_head;
+        g_rendered = g_head;
+        g_rendered_valid = true;
+    }
+    if (g_input_written_valid && std::memcmp(input, g_input_written, sizeof(g_input_written)) == 0) {
+        std::memcpy(input, g_input_original, sizeof(g_input_original));
+    }
+    std::memcpy(g_input_original, input, sizeof(g_input_original));
+    static const float world_scale = [] {
+        const char* v = std::getenv("BB_VR_WORLD_SCALE");
+        return v ? float(std::atof(v)) : 1.f;
+    }();
+    constexpr float axes[4] = {-1.f, 1.f, -1.f, 1.f};
+    float h[16], in[16], out[16];
+    for (int r = 0; r < 4; ++r) {
+        for (int c = 0; c < 4; ++c) {
+            h[r * 4 + c] = head.pose[r * 4 + c] * axes[r] * axes[c];
+        }
+    }
+    h[12] *= world_scale, h[13] *= world_scale, h[14] *= world_scale;
+    std::memcpy(in, input, sizeof(in));
+    in[3] = in[7] = in[11] = 0.f;
+    in[15] = 1.f;
+    Multiply(h, in, out);
+    for (int r = 0; r < 4; ++r) {
+        for (int c = 0; c < 3; ++c) {
+            input[r * 4 + c] = out[r * 4 + c];
+        }
+    }
+    std::memcpy(g_input_written, input, sizeof(g_input_written));
+    g_input_written_valid = true;
+
+    float l = head.tan[0], r = head.tan[1], u = head.tan[2], d = head.tan[3];
+    if (Multiview::Enabled()) { // the eyes' sideways shift uncovers each eye's outer edge (see SceneHandler)
+        static const float overscan = [] {
+            const char* v = std::getenv("BB_VR_OVERSCAN");
+            return v ? float(std::atof(v)) : 0.08f;
+        }();
+        l -= overscan;
+        r += overscan;
+    }
+    const float tx = std::max(-l, r), ty = std::max(u, -d);
+    params[0] = ty / tx;
+    params[1] = 1.f / tx;
+    std::scoped_lock lock{g_head_mutex};
+    g_rendered.tan[0] = -tx, g_rendered.tan[1] = tx, g_rendered.tan[2] = ty, g_rendered.tan[3] = -ty;
+    Rendered& entry = g_history[g_history_count++ % HistorySize];
+    std::memcpy(entry.position, out + 12, sizeof(entry.position));
+    entry.head = g_rendered;
+}
+
 struct Stub : Xbyak::CodeGenerator {
     Stub(const Site& site) : Xbyak::CodeGenerator(4096) {
         using namespace Xbyak::util;
@@ -308,7 +403,7 @@ struct Stub : Xbyak::CodeGenerator {
         pop(rax);
         db(site.bytes.data(), site.bytes.size());
         jmp(ptr[rip]);
-        dq(ImageBase + site.offset + site.bytes.size());
+        dq(g_image_base + site.offset + site.bytes.size());
     }
 };
 
@@ -326,7 +421,7 @@ void DoInstall() {
         g_fov_mode = std::atoi(v);
     }
     for (const Site& site : Sites) {
-        auto* code = reinterpret_cast<u8*>(ImageBase + site.offset);
+        auto* code = reinterpret_cast<u8*>(g_image_base + site.offset);
         MEMORY_BASIC_INFORMATION mbi{};
         if (!VirtualQuery(code, &mbi, sizeof(mbi)) || mbi.State != MEM_COMMIT ||
             std::memcmp(code, site.bytes.data(), site.bytes.size()) != 0) {
@@ -344,7 +439,7 @@ void DoInstall() {
         auto* stub = new Stub(site);
         stub->ready();
         g_stubs.push_back(stub);
-        auto* code = reinterpret_cast<u8*>(ImageBase + site.offset);
+        auto* code = reinterpret_cast<u8*>(g_image_base + site.offset);
         std::vector<u8> patch(site.bytes.size(), 0x90);
         patch[0] = 0x48; // mov rax, imm64
         patch[1] = 0xb8;
@@ -382,11 +477,31 @@ void Install() {
         });
         return;
     }
-    // The game image is mapped before the first frame; check it is there.
-    MEMORY_BASIC_INFORMATION mbi{};
-    if (!VirtualQuery(reinterpret_cast<void*>(ImageBase + Sites[0].offset), &mbi, sizeof(mbi)) ||
-        mbi.State != MEM_COMMIT) {
-        return;
+    // The game image is mapped before the first frame: the executable allocation holding the first site's bytes.
+    if (!g_image_base) {
+        static int calls = 0;
+        if (calls++ % 60 != 0) {
+            return;
+        }
+        const Site& site = Sites[0];
+        MEMORY_BASIC_INFORMATION mbi{};
+        for (u64 at = 0x400000; at < 0x80000000ull && VirtualQuery(reinterpret_cast<void*>(at), &mbi, sizeof(mbi));
+             at = u64(mbi.BaseAddress) + mbi.RegionSize) {
+            const u64 base = u64(mbi.BaseAddress);
+            if (mbi.State == MEM_COMMIT && u64(mbi.AllocationBase) == base &&
+                (mbi.Protect & (PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE)) &&
+                site.offset + site.bytes.size() <= mbi.RegionSize &&
+                std::memcmp(reinterpret_cast<const void*>(base + site.offset), site.bytes.data(), site.bytes.size()) ==
+                    0) {
+                g_image_base = base;
+                std::printf("VR camera: game image at %#llx\n", (unsigned long long)base);
+                std::fflush(stdout);
+                break;
+            }
+        }
+        if (!g_image_base) {
+            return;
+        }
     }
 #endif
     g_image_mapped.store(true, std::memory_order_release);

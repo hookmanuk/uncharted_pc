@@ -58,7 +58,7 @@ void SetSkippedShaders(const std::string& list);
 bool SkipDraw(u64 vs_hash, u64 fs_hash);
 
 void OnDraw(Scheduler& scheduler, Runtime& runtime, VideoCore::TextureCache& texture_cache, const Shader::Info& vs,
-            const GraphicsPipelineKey& key,
+            const Shader::Info* fs, const GraphicsPipelineKey& key,
             VideoCore::ImageId color, VideoCore::ImageId target2, VideoCore::ImageId depth);
 
 /// Pipeline cache, a colour target's blend state. While the HUD draws alone (over transparent black in the display
@@ -101,6 +101,7 @@ struct Frame {
     u32 slot = 0;
     u32 width = 0, height = 0;
     bool has_pose = false; // the head pose and field of view it was rendered with
+    bool rgba = false;     // Uncharted fork: the scene and HUD bytes are in RGBA order (the display buffer's), not BGRA
     float layer_pose[7];
     float tangents[4];
 };

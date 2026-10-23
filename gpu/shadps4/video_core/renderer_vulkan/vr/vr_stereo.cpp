@@ -61,6 +61,7 @@ struct Slot {
     Image hud;   // RGBA8 UNORM: the HUD over transparent black
     Image scene_right; // multiview: the right eye's scene (layer 1 of the display buffer)
     bool has_right = false;
+    bool rgba = false; // the display buffer's bytes are RGBA (Uncharted), not BGRA (Driveclub)
     u32 width = 0, height = 0;
     bool has_depth = false;
     bool has_hud = false;
@@ -476,6 +477,37 @@ void FindCamera(const Shader::Info& vs) {
     }
 }
 
+// Uncharted fork, development (BB_VR_SCENELOG=<frames>): the camera as the collection's motion blur velocity pass (pixel
+// shader 0xf4b18264, docs/upscaler.md) binds it: each constant buffer's guest address and its first 96 floats (c0..c23:
+// c0..c3 depth to view, c8..c9 depth, c12..c23 view to world 3x4).
+int g_scene_log = [] {
+    const char* v = std::getenv("BB_VR_SCENELOG");
+    return v ? std::atoi(v) : 0;
+}();
+void LogSceneConstants(const Shader::Info& stage) {
+    if (stage.pgm_hash != 0xf4b18264ULL || g_scene_log <= 0) {
+        return;
+    }
+    --g_scene_log;
+    for (u32 i = 0; i < stage.buffers.size(); ++i) {
+        const auto sharp = stage.buffers[i].GetSharp(stage);
+        const auto* f = reinterpret_cast<const float*>(sharp.base_address);
+        if (!f || sharp.GetSize() < 96 * 4) {
+            continue;
+        }
+        std::string text;
+        for (u32 c = 0; c < 24; ++c) {
+            char row[96];
+            std::snprintf(row, sizeof(row), " c%u %.4f %.4f %.4f %.4f;", c, f[c * 4], f[c * 4 + 1], f[c * 4 + 2],
+                          f[c * 4 + 3]);
+            text += row;
+        }
+        std::printf("VR scene: ps %#llx buffer %u at %#llx (%u bytes):%s\n", (unsigned long long)stage.pgm_hash, i,
+                    (unsigned long long)sharp.base_address, sharp.GetSize(), text.c_str());
+        std::fflush(stdout);
+    }
+}
+
 void AdjustBlend(AmdGpu::BlendControl& control, u64 target_address) {
     static const bool keep = std::getenv("BB_VR_KEEP_SCENE") != nullptr;
     if (!g.ready || keep || !control.enable || !FrameCapture::IsDisplayBuffer(target_address)) {
@@ -692,7 +724,7 @@ void LogFragmentImages(const Shader::Info& vs, const Shader::Info* fs, u32 depth
 }
 
 void OnDraw(Scheduler& scheduler, Runtime& runtime, VideoCore::TextureCache& texture_cache, const Shader::Info& vs,
-            const GraphicsPipelineKey& key,
+            const Shader::Info* fs, const GraphicsPipelineKey& key,
             VideoCore::ImageId color_id, VideoCore::ImageId target2_id, VideoCore::ImageId gbuffer_depth_id) {
     const u64 vs_hash = vs.pgm_hash;
     Multiview::SetDrawHash(vs_hash);
@@ -750,6 +782,12 @@ void OnDraw(Scheduler& scheduler, Runtime& runtime, VideoCore::TextureCache& tex
             g_tex_vs = 0;
         }
     }
+    if (g_scene_log > 0) {
+        LogSceneConstants(vs);
+        if (fs) {
+            LogSceneConstants(*fs);
+        }
+    }
     const int targets = std::popcount(key.mrt_mask);
     // DRAWLOG: multi-target draws too (the G-buffer passes), marked "mrt N".
     if (targets >= 2 && g_log_draws.load(std::memory_order_relaxed) > 0 && g_log_draws.fetch_sub(1) > 0 && color_id) {
@@ -787,6 +825,17 @@ void OnDraw(Scheduler& scheduler, Runtime& runtime, VideoCore::TextureCache& tex
     }
     if (targets != 1) {
         return;
+    }
+    // Uncharted fork: the collection draws its scene into single targets (no multi-target G-buffer passes): the frame's
+    // depth is the largest 32-bit float depth target any draw uses before the HUD.
+    if (g.ready && gbuffer_depth_id) {
+        const auto& depth = texture_cache.GetImage(gbuffer_depth_id);
+        const u32 w = depth.info.size.width, h = depth.info.size.height;
+        const auto f = depth.info.pixel_format;
+        if ((f == vk::Format::eD32SfloatS8Uint || f == vk::Format::eD32Sfloat) && u64(w) * h >= g_frame_depth_area) {
+            g_frame_depth = gbuffer_depth_id;
+            g_frame_depth_area = u64(w) * h;
+        }
     }
     const VideoCore::ImageId depth_id = g_frame_depth;
     if (g_log_draws.load(std::memory_order_relaxed) > 0 && g_log_draws.fetch_sub(1) > 0 && color_id) {
@@ -908,6 +957,7 @@ void OnDraw(Scheduler& scheduler, Runtime& runtime, VideoCore::TextureCache& tex
         return;
     }
     slot.has_depth = false;
+    slot.rgba = format == vk::Format::eR8G8B8A8Unorm || format == vk::Format::eR8G8B8A8Srgb;
     slot.has_right = multiview && Make(slot.scene_right, VK_FORMAT_R8G8B8A8_UNORM, width, height, color_usage);
     VkImage depth_image{};
     u32 depth_width = 0, depth_height = 0;
@@ -981,6 +1031,7 @@ bool TakeFrame(Frame& frame) {
     frame.width = slot.width;
     frame.height = slot.height;
     frame.has_pose = slot.has_pose;
+    frame.rgba = slot.rgba;
     std::memcpy(frame.layer_pose, slot.layer_pose, sizeof(frame.layer_pose));
     std::memcpy(frame.tangents, slot.tangents, sizeof(frame.tangents));
     return slot.has_depth || slot.has_right;
@@ -992,6 +1043,14 @@ void OnDisplayBuffer(Runtime& runtime, vk::CommandBuffer command_buffer, VideoCo
         return;
     }
     Slot& slot = g.slots[g.complete.back()];
+    static int told = 0; // development: the first few HUD captures (or why not)
+    if (told < 3) {
+        ++told;
+        std::printf("VR stereo: HUD from the display buffer %ux%u format %d at %#llx (frame %ux%u, has HUD %d)%c",
+                    display.info.size.width, display.info.size.height, int(display.info.pixel_format),
+                    (unsigned long long)display.info.guest_address, slot.width, slot.height, int(slot.has_hud), 10);
+        std::fflush(stdout);
+    }
     if (slot.has_hud || display.info.size.width != slot.width || display.info.size.height != slot.height) {
         return;
     }
@@ -1071,7 +1130,7 @@ void RecordEyes(vk::CommandBuffer command_buffer, const Frame& frame, const VkIm
     const u32 w = frame.width, h = frame.height;
     if (g_eye_dump_frames > 0 && --g_eye_dump_frames == 0) {
         const VkDeviceSize size = VkDeviceSize(g_eye_dump_w) * g_eye_dump_h * 4;
-        for (int n = 0; n < 3; ++n) {
+        for (int n = 0; n < 4; ++n) { // 0 left, 1 right, 2 the centre scene, 3 the HUD (Uncharted fork)
             char name[32];
             std::snprintf(name, sizeof(name), "eye_%d.raw", n);
             WriteReadback(g_eye_dump, size * n, g_eye_dump_w, g_eye_dump_h, name);
@@ -1081,12 +1140,15 @@ void RecordEyes(vk::CommandBuffer command_buffer, const Frame& frame, const VkIm
     }
     FrameLog(cmd, slot.scene.image, VK_IMAGE_LAYOUT_GENERAL, w, h);
     const bool dump = g_eye_dump_frames == 0 && g_eye_dump_requested.exchange(false) &&
-                      MakeReadback(g_eye_dump, VkDeviceSize(w) * h * 4 * 3);
+                      MakeReadback(g_eye_dump, VkDeviceSize(w) * h * 4 * 4);
     if (dump) {
         g_eye_dump_w = w;
         g_eye_dump_h = h;
         g_eye_dump_frames = 6;
         CopyToReadback(cmd, slot.scene.image, VK_IMAGE_LAYOUT_GENERAL, g_eye_dump, VkDeviceSize(w) * h * 4 * 2, w, h);
+        if (slot.has_hud) {
+            CopyToReadback(cmd, slot.hud.image, VK_IMAGE_LAYOUT_GENERAL, g_eye_dump, VkDeviceSize(w) * h * 4 * 3, w, h);
+        }
     }
     if (slot.has_right && !dump) {
         // Multiview: each eye's own scene straight into the headset's image (one copy per eye, bit for bit: the
