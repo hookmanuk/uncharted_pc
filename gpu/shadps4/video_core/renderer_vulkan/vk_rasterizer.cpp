@@ -32,6 +32,9 @@
 #include "video_core/renderer_vulkan/vk_shader_hle.h"
 #include "video_core/texture_cache/image_view.h"
 #include "video_core/texture_cache/texture_cache.h"
+#include "video_core/renderer_vulkan/vr/vr_dev.h" // VR
+#include "video_core/renderer_vulkan/vr/vr_multiview.h" // VR
+#include "video_core/renderer_vulkan/vr/vr_stereo.h" // VR
 
 namespace Vulkan {
 
@@ -1474,6 +1477,8 @@ void Rasterizer::DrawRecord(const GraphicsPipeline* pipeline, const PreparedDraw
     motion_geometry = 0;
 
     PrepareRenderState(pipeline);
+    Vr::Stereo::OnDraw(scheduler, runtime, texture_cache, pipeline->GetStage(Shader::SwStage::Vertex), // VR
+                       pipeline->GetGraphicsKey(), cb_descs[0].first, cb_descs[2].first, db_desc.first);
     if (upscaler->Enabled() && std::popcount(pipeline->GetGraphicsKey().mrt_mask) == 1) {
         const auto& viewport = Regs().viewports[0];
         upscaler->OnDraw(pipeline->GetStage(Shader::SwStage::Vertex).pgm_hash,
@@ -1741,9 +1746,12 @@ void Rasterizer::DrawRecord(const GraphicsPipeline* pipeline, const PreparedDraw
     const auto& fetch_shader = pipeline->GetFetchShader();
     const auto [vertex_offset, instance_offset] = GetDrawOffsets(regs, vs_info, fetch_shader);
 
-    const vk::Pipeline handle = pipeline->Handle();
+    const vk::Pipeline handle = Vr::Multiview::Variant(pipeline->Handle(), state.view_mask); // VR
     const u32 num_indices = regs.num_indices;
-    const u32 num_instances = regs.num_instances.NumInstances();
+    const auto* skip_ps = pipeline->GetStages()[u32(Shader::SwStage::Fragment)]; // VR: development (SKIP)
+    const u32 num_instances = Vr::Stereo::SkipDraw(vs_info.pgm_hash, skip_ps ? skip_ps->pgm_hash : 0)
+                                  ? 0
+                                  : regs.num_instances.NumInstances();
     const u32 first_vertex = vertex_offset;
     const u32 first_instance = instance_offset;
     const void* checkpoint = nullptr;
@@ -1855,6 +1863,8 @@ void Rasterizer::DrawIndirectRecord(const GraphicsPipeline* pipeline, bool is_in
     motion_draw = false;
     motion_geometry = 0;
     PrepareRenderState(pipeline);
+    Vr::Stereo::OnDraw(scheduler, runtime, texture_cache, pipeline->GetStage(Shader::SwStage::Vertex), // VR
+                       pipeline->GetGraphicsKey(), cb_descs[0].first, cb_descs[2].first, db_desc.first);
     if (upscaler->Enabled() && std::popcount(pipeline->GetGraphicsKey().mrt_mask) == 1) {
         const auto& viewport = Regs().viewports[0];
         upscaler->OnDraw(pipeline->GetStage(Shader::SwStage::Vertex).pgm_hash,
@@ -1902,7 +1912,7 @@ void Rasterizer::DrawIndirectRecord(const GraphicsPipeline* pipeline, bool is_in
 
     ASSERT(stride == (is_indexed ? sizeof(VkDrawIndexedIndirectCommand)
                                  : sizeof(VkDrawIndirectCommand)));
-    const vk::Pipeline handle = pipeline->Handle();
+    const vk::Pipeline handle = Vr::Multiview::Variant(pipeline->Handle(), state.view_mask); // VR
     const vk::Buffer args = buffer->Handle();
     const u64 args_offset = base;
     const vk::Buffer counts = count_address != 0 ? count_buffer->Handle() : vk::Buffer{};
@@ -2032,9 +2042,10 @@ void Rasterizer::DispatchRecord(const ComputePipeline* pipeline) {
     const auto& cs_program = CsRegs();
 
     const auto& cs = pipeline->GetStage(Shader::SwStage::Compute);
-    if (SkipShader(cs.pgm_hash)) {
+    if (SkipShader(cs.pgm_hash) || Vr::Stereo::SkipDraw(cs.pgm_hash, 0)) { // VR: development (SKIP)
         return;
     }
+    Vr::Stereo::LogDispatch(cs.pgm_hash); // VR: development (DRAWLOG)
     // After the resource binding: its transfers (image uploads, downloads) mark themselves.
     const auto mark = [&] {
         if (auto* profiler = GpuProfiler::Get()) {
@@ -2047,6 +2058,7 @@ void Rasterizer::DispatchRecord(const ComputePipeline* pipeline) {
     if (upscaler->Enabled()) {
         upscaler->OnDispatch(cs.pgm_hash);
     }
+    Vr::Dev::OnDispatch(cs, cs_program.dim_x, cs_program.dim_y); // VR: development dumps
     if (ExecuteShaderHLE(cs, Regs(), cs_program, *this)) {
         return;
     }
@@ -2251,6 +2263,7 @@ void Rasterizer::DispatchRecord(const ComputePipeline* pipeline) {
             cmdbuf.pipelineBarrier2(dependency);
         }
     });
+    Vr::Multiview::SecondEye(scheduler, pipeline->GetLayout(), push_data, handle, dim_x, dim_y, dim_z); // VR
     DebugState.IncDispatch();
 
     ResetBindings(true);
@@ -2308,6 +2321,7 @@ void Rasterizer::DispatchIndirectRecord(const ComputePipeline* pipeline, VAddr a
         cmdbuf.bindPipeline(vk::PipelineBindPoint::eCompute, handle);
         cmdbuf.dispatchIndirect(args, args_offset);
     });
+    Vr::Multiview::SecondEye(scheduler, pipeline->GetLayout(), push_data, handle, 0, 0, 0, args, args_offset); // VR
     DebugState.IncDispatch();
 
     ResetBindings(true);
@@ -3070,6 +3084,7 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, const PreparedStage* pre
                 push_data.AddOffset(binding.buffer, 0);
             }
             buffer_infos.emplace_back(constant_ring->Handle(), ring->offset, ring->size);
+            Vr::Multiview::NoteRingBuffer(ring->address, ring->size); // VR: development audit
         } else if (desc.IsSpecial()) {
             if (desc.buffer_type == Shader::BufferType::GdsBuffer) {
                 const auto* gds_buf = buffer_cache.GetGdsBuffer();
@@ -3195,6 +3210,7 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, const PreparedStage* pre
                     return std::min<u64>(size, u64(stride) * (records - 1) + element);
                 }();
                 bound_buffers.emplace_back(buffer, offset, tracked_size, desc.is_written);
+                Vr::Multiview::NoteBuffer(vsharp.base_address, size, desc.is_written, adjust); // VR
                 if (g_gpu_checkpoints && num_checkpoint_buffers < std::size(checkpoint_buffers)) {
                     checkpoint_buffers[num_checkpoint_buffers++] = {
                         vsharp.base_address, static_cast<u32>(size), desc.is_written};
@@ -3226,6 +3242,7 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, const PreparedStage* pre
         set_write.descriptorCount = 1;
         set_write.descriptorType = vk::DescriptorType::eStorageBuffer;
         set_write.pBufferInfo = &buffer_infos.back();
+        Vr::Multiview::EyeBufferWrite(instance, runtime, desc.IsSpecial(), set_write, buffer_infos); // VR: per eye
         ++binding.buffer;
     }
 }
@@ -3599,6 +3616,7 @@ void Rasterizer::BindTextures(const Shader::Info& stage, const PreparedStage* pr
                 }
             }
             image.usage.storage |= is_storage;
+            Vr::Multiview::NoteImage(image, is_storage); // VR
             image.usage.texture |= !is_storage;
             if (FrameCapture::Active()) {
                 FrameCapture::Sampled(image.info, is_storage);
@@ -4165,6 +4183,7 @@ RenderState Rasterizer::BeginRenderingFull(const GraphicsPipeline* pipeline) {
         state.height = proxy.height;
         target_scale = {float(size.width) / 1920.0f, float(size.height) / 1080.0f};
     }
+    state.view_mask = Vr::Multiview::PassViewMask(texture_cache, cb_descs, state.num_color_attachments, db_desc); // VR
     if (FrameCapture::Active()) {
         std::array<const VideoCore::ImageInfo*, AmdGpu::NUM_COLOR_BUFFERS> colors{};
         for (u32 cb = 0; cb < state.num_color_attachments; ++cb) {

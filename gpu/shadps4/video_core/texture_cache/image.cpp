@@ -14,6 +14,7 @@
 #include "video_core/renderer_vulkan/vk_vram.h"
 #include "video_core/texture_cache/blit_helper.h"
 #include "video_core/texture_cache/image.h"
+#include "video_core/renderer_vulkan/vr/vr_multiview.h" // VR
 
 #include <vk_mem_alloc.h>
 
@@ -230,7 +231,7 @@ Image::Image(const Vulkan::Instance& instance, Vulkan::Runtime& runtime_,
             .depth = info.size.depth,
         },
         .mipLevels = static_cast<u32>(info.resources.levels),
-        .arrayLayers = static_cast<u32>(info.resources.layers),
+        .arrayLayers = Vulkan::Vr::Multiview::BackingLayers(info, static_cast<u32>(info.resources.layers)), // VR
         .samples = LiverpoolToVK::NumSamples(info.num_samples, supported_samples),
         .tiling = tiling,
         .usage = usage_flags,
@@ -350,7 +351,7 @@ void Image::GetBarriers(Barriers& barriers, vk::ImageLayout dst_layout, vk::Acce
                             .baseMipLevel = mip,
                             .levelCount = 1,
                             .baseArrayLayer = layer,
-                            .layerCount = 1,
+                            .layerCount = Vulkan::Vr::Multiview::Stereo(*this) ? 2u : 1u, // VR: both eyes
                         },
                     });
                     state.layout = dst_layout;

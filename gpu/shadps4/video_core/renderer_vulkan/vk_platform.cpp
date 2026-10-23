@@ -27,6 +27,7 @@
 #include "video_core/renderer_vulkan/vk_platform.h"
 #include "video_core/renderer_vulkan/vk_dlss.h"
 #include "video_core/renderer_vulkan/vk_xess.h"
+#include "video_core/renderer_vulkan/vr/vr_openxr.h" // VR
 
 #ifdef __APPLE__
 #include <mach-o/dyld.h>
@@ -300,6 +301,7 @@ vk::UniqueInstance CreateInstance(Frontend::WindowSystemType window_type, bool e
     if (Xess* xess = Xess::Get()) {
         xess->AppendInstanceExtensions(extensions);
     }
+    Vr::AppendInstanceExtensions(extensions); // VR: OpenXR's instance extensions
 
     const vk::ApplicationInfo application_info = {
         .pApplicationName = "shadPS4",

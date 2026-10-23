@@ -149,6 +149,12 @@ add_host_shader(depth_resample.frag depth_stencil_bits_frag STENCIL_BITS=1)
 add_host_shader(camera_motion.comp camera_motion_debug_comp DEBUG_OVERLAY=1)
 add_host_shader(frame_gen_inputs.comp frame_gen_inputs_comp)
 add_host_shader(frame_gen_ui.comp frame_gen_ui_comp)
+add_host_shader(../renderer_vulkan/vr/vr_stereo.comp vr_stereo_splat_comp SPLAT=1) # VR
+add_host_shader(../renderer_vulkan/vr/vr_stereo.comp vr_stereo_resolve_comp SPLAT=0) # VR
+add_host_shader(../renderer_vulkan/vr/vr_stereo.comp vr_stereo_mirror_comp SPLAT=0 MIRROR=1) # VR
+add_host_shader(../renderer_vulkan/vr/vr_sharpen.comp vr_sharpen_comp) # VR
+add_host_shader(../renderer_vulkan/vr/vr_luma_sharpen.comp vr_luma_sharpen_comp) # VR
+add_host_shader(../renderer_vulkan/vr/vr_sharpen.comp vr_sharpen_r11_comp OUT_R11G11B10=1) # VR
 foreach(BPP IN ITEMS 8 16 32 64 96 128)
     add_host_shader(tiling.comp tiling_micro_${BPP}_comp BITS_PER_PIXEL=${BPP} IS_MACRO_TILED=0)
     add_host_shader(tiling.comp tiling_macro_${BPP}_comp BITS_PER_PIXEL=${BPP} IS_MACRO_TILED=1)

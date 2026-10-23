@@ -5,6 +5,7 @@
 #include "shader_recompiler/backend/spirv/spirv_emit_context.h"
 #include "shader_recompiler/ir/debug_print.h"
 #include "shader_recompiler/ir/microinstruction.h"
+#include "shader_recompiler/backend/spirv/emit_spirv_vr.h" // VR
 
 namespace Shader::Backend::SPIRV {
 
@@ -16,6 +17,7 @@ void EmitPrologue(EmitContext& ctx) {
         ctx.DefineWorkgroupIndex();
     }
     ctx.DefineBufferProperties();
+    Vr::EyeBuffers(ctx); // VR: the eye's copy of each guest buffer
 }
 
 void ConvertDepthMode(EmitContext& ctx) {
@@ -187,9 +189,10 @@ static void EmitFragmentMotion(EmitContext& ctx) {
 }
 
 void EmitEpilogue(EmitContext& ctx) {
-    if (Sirit::ValidId(ctx.motion_out_cur)) {
+    if (Sirit::ValidId(ctx.motion_out_cur)) { // VR fork: before the eye's shift (it cancels in the motion)
         EmitVertexMotion(ctx);
     }
+    Vr::Epilogue(ctx); // VR: the eye's clip shift
     if (Sirit::ValidId(ctx.motion_frag_out)) {
         EmitFragmentMotion(ctx);
     }
@@ -218,6 +221,7 @@ void EmitDiscardCond(EmitContext& ctx, Id condition) {
 }
 
 void EmitEmitVertex(EmitContext& ctx) {
+    Vr::BeforeEmitVertex(ctx); // VR: the eye's clip shift
     ctx.OpEmitVertex();
 }
 

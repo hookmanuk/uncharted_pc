@@ -16,6 +16,7 @@
 #include "shader_recompiler/ir/basic_block.h"
 #include "shader_recompiler/ir/program.h"
 #include "shader_recompiler/runtime_info.h"
+#include "shader_recompiler/backend/spirv/emit_spirv_vr.h" // VR
 
 namespace Shader::Backend::SPIRV {
 namespace {
@@ -657,6 +658,7 @@ void PatchPhiNodes(const IR::Program& program, EmitContext& ctx) {
 std::vector<u32> EmitSPIRV(const Profile& profile, const RuntimeInfo& runtime_info,
                            const IR::Program& program, Bindings& binding) {
     EmitContext ctx{profile, runtime_info, program.info, binding};
+    Vr::ScanScreenParams(program); // VR: outputs holding the screen position
     const Id main{DefineMain(ctx, program)};
     DefineEntryPoint(program.info, ctx, main);
     SetupCapabilities(program.info, profile, runtime_info, ctx);

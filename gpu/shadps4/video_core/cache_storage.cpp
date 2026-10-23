@@ -23,6 +23,7 @@
 #include <queue>
 #include <string>
 #include <thread>
+#include "video_core/renderer_vulkan/vr/vr_multiview.h" // VR
 
 namespace {
 
@@ -135,7 +136,8 @@ void DataBase::Open() {
     if (EmulatorSettings.IsPipelineCacheArchived()) {
         mz_zip_zero_struct(&zip_ar);
 
-        const auto base_name = std::string{game_info.GameSerial()} + BbNanGuard::ShaderCacheSuffix();
+        const auto base_name = std::string{game_info.GameSerial()} + BbNanGuard::ShaderCacheSuffix() +
+                               Vulkan::Vr::Multiview::CacheSuffix(); // VR: stereo shaders apart
         cache_path = GetUserPath(PathType::CacheDir) /
                      std::filesystem::path{base_name + DeviceSuffix()}.replace_extension(".zip");
         RemoveUntaggedCache(GetUserPath(PathType::CacheDir) /
@@ -151,7 +153,8 @@ void DataBase::Open() {
             mz_zip_writer_init_file(&zip_ar, cache_path.string().c_str(), 0);
         }
     } else {
-        const auto base_name = std::string{game_info.GameSerial()} + BbNanGuard::ShaderCacheSuffix();
+        const auto base_name = std::string{game_info.GameSerial()} + BbNanGuard::ShaderCacheSuffix() +
+                               Vulkan::Vr::Multiview::CacheSuffix(); // VR: stereo shaders apart
         cache_path = GetUserPath(PathType::CacheDir) / (base_name + DeviceSuffix());
         RemoveUntaggedCache(GetUserPath(PathType::CacheDir) / base_name, cache_path);
         if (!std::filesystem::exists(cache_path)) {
