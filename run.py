@@ -66,8 +66,8 @@ def find_executable(name):
 def vr_render_size(env, out, exe):
     """VR fork: the game renders at the eye size (scripts/vr_resolution.py: patches when the version is known)."""
     size = env.get('BB_VR_EYE_RES', '') if env.get('BB_VR') == '1' else ''
-    if size.isdigit() and int(size) > 2560:  # the games' render target memory stops there (vr_resolution.py)
-        size = '2560'
+    if size.isdigit() and int(size) > 5120:  # checked up to 5120 x 5120 (vr_resolution.py: 64-bit arena sizes)
+        size = '5120'
     run_script('vr_resolution.py', out, exe, size or '0')
     env.pop('BB_VR_RENDER_SIZE', None)
     # The direct memory for this executable's render targets (a switch to another game recomputes it); one the user

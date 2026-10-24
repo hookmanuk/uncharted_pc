@@ -59,6 +59,15 @@ GPU_CONTEXT_LIMIT = (4096 - 2) << 20
 # whose arena is at +0x10 of its owner) keep their 32-bit sizes: a mismatch, the passed size.
 # (image offset of the size spill, of its reload, of the stack protector check's jne)
 U1_ARENA_INIT = (0x35c8e1, 0x35c945, 0x35c998)
+# The memory table (contexts first, then the arenas: 32-byte entries id, type, size, alignment) of each game, read by
+# id: the CPU context (2, kAllocAppCpu) holds the "screenshoot buffer" arena, three full-screen RGBA buffers
+# (3840 per eye: two of 56 MB took 112 of its 128 MB, the third failed).
+U1_TABLE = 0x9713b0
+U2_TABLE = 0xe6af10
+U3_TABLE = 0x13a9ec0
+CPU_CONTEXT_ID = 2
+SCREENSHOT_ID = 0x80  # (0x81, the 128 MB before it, is another: growing it only moved this one along)
+SCREENSHOT_BUFFERS = 3
 U2_ARENA_INIT = (0x4e1f01, 0x4e1f65, 0x4e1fb8)
 U3_ARENA_INIT = (0x4957c1, 0x495825, 0x495878)
 ARENA_SPILL = (bytes.fromhex('8955c4 4989f6 4989fd 48'), bytes.fromhex('05'), 4, bytes.fromhex('488b00 488945d0'))
@@ -67,6 +76,27 @@ ARENA_RELOAD = bytes.fromhex('8b45c4 498b4d18 488d148500000000')
 ARENA_RELOAD_NEW = bytes.fromhex('488b45c0 498b4d18 4889c2 48c1e202')
 ARENA_CHECK = bytes.fromhex('750f')
 ARENA_CHECK_NEW = bytes.fromhex('6690')
+# A heap past 4 GB: each arena's memory is reserved from its context's arena (the table's id: +0x498b30 in U3) with
+# the whole size, which three steps cut to 32 bits: the reservation (mov esi, r12d before its allocator's virtual
+# Allocate), that Allocate (mov ebx, esi: the arena owner's), and HeapArena::Allocate (mov r15d, esi). A 4161 MB
+# render target heap took 65 MB of the GPU arena and the next arena (the texture allocator) began inside it:
+# "Views into vram allocator not supported yet". Each step keeps the 64 bits (Allocate's callers may leave anything in
+# the upper half of a 32-bit size: HeapArena::Allocate takes it only for 4-64 GB, upper 1..15; a guest pointer's is
+# 0x10 and more). Found by their bytes (one match each); the stack protector's store gives HeapArena::Allocate's room.
+ALLOC64 = [  # (pattern, offset in the match, original, new); the first: every match (the reservation's four
+    # overloads, each taking a 64-bit size: mov r12, rdi)
+    (rb'\x48\x89\xc7\x44\x89\xe6\x44\x89\xf2\x49\x89\xc9\xff\x53\x48', 3, '4489e6', '4c89e6'),
+    (rb'\x44\x89\x6d\xcc\x89\xf3\x49\x89\xfe\xe8....\x85\xdb\xbe\x01\x00\x00\x00\x0f\x45\xf3', 0, '44896dcc89f3',
+     '8955cc4889f3'),
+    (rb'\x44\x89\x6d\xcc\x89\xf3\x49\x89\xfe\xe8....\x85\xdb\xbe\x01\x00\x00\x00\x0f\x45\xf3', 14,
+     '85dbbe010000000f45f3', '4889de4885f67502ffc6'),
+    (rb'\x41\x89\xf7\x49\x89\xfd\x48[\x8b\x8d]\x05....\x48\x8b\x00\x48\x89\x45\xd0\x44\x89\xf8\x48\x89\x85\xc8\xfe\xff\xff', 0,
+     None, '4989fd 89f0 4889f1 48c1e920 83f910 7303 4889f0 4989c7 488985c8feffff'),
+    (rb'\x45\x85\xff\xb8\x01\x00\x00\x00\x48\x8b\xbd\xc8\xfe\xff\xff\x48\x0f\x44\xf8', 0, '4585ff', '4d85ff'),
+]
+# HeapArena::Allocate's stack protector check (its store is gone): the first after its prologue.
+ALLOC64_CHECK = rb'\x48[\x8b\x8d]\x0d....\x48\x8b\x09\x48\x3b\x4d\xd0\x75'
+
 # The GPU context with the 64-bit arena: the direct memory and the render target heaps grow to the eye size.
 GPU_CONTEXT_LIMIT_64 = (12288 - 2) << 20
 if os.environ.get('VR_GPU_CONTEXT_MB'):  # development: another limit
@@ -123,9 +153,9 @@ U3_HEAPS = [(0x13aad28, 0x8bc4000), (0x13aad48, 0x2310bc00)]
 U3_SPARE = (0x13aae28, 0xd0b0400)
 U3_CONTEXT = (0x13a9f08, 0xbec00000)
 U3_SYSTEM = (0xcb, 0x120000000)
-SITES = {'eboot.bin': (U1_SITES, U1_SCALED, (U1_HEAPS, U1_SPARE), (U1_CONTEXT,), U1_SYSTEM, U1_ARENA_INIT),
-         'big2-ps4_Shipping.elf': (U2_SITES, U2_SCALED, (U2_HEAPS, U2_SPARE), (U2_CONTEXT,), U2_SYSTEM, U2_ARENA_INIT),
-         'big3-ps4_Shipping.elf': (U3_SITES, U3_SCALED, (U3_HEAPS, U3_SPARE), (U3_CONTEXT,), U3_SYSTEM, U3_ARENA_INIT)}
+SITES = {'eboot.bin': (U1_SITES, U1_SCALED, (U1_HEAPS, U1_SPARE), (U1_CONTEXT,), U1_SYSTEM, U1_ARENA_INIT, U1_TABLE),
+         'big2-ps4_Shipping.elf': (U2_SITES, U2_SCALED, (U2_HEAPS, U2_SPARE), (U2_CONTEXT,), U2_SYSTEM, U2_ARENA_INIT, U2_TABLE),
+         'big3-ps4_Shipping.elf': (U3_SITES, U3_SCALED, (U3_HEAPS, U3_SPARE), (U3_CONTEXT,), U3_SYSTEM, U3_ARENA_INIT, U3_TABLE)}
 ASPECT_16_9 = 0x3fe38e39
 WIDTH_FIELDS = {0x08, 0x18, 0x24, 0x38}
 
@@ -165,8 +195,57 @@ def arena_patches(elf, arena):
     return out
 
 
+def table_entry(elf, table, ident):
+    """(image offset of the size, the size) of the memory table's entry `ident`, or None."""
+    for n in range(512):
+        at = file_offset(elf, table + n * 32, 32)
+        if at is None:
+            return None
+        entry, kind, entry_size, _align = struct.unpack_from('<IIQQ', elf, at)
+        if not (1 <= kind <= 12) or entry_size >> 40:
+            return None  # past the table
+        if entry == ident:
+            return table + n * 32 + 8, entry_size
+    return None
+
+
+def code_segment(elf):
+    phoff, = struct.unpack_from('<Q', elf, 0x20)
+    phentsize, phnum = struct.unpack_from('<HH', elf, 0x36)
+    for i in range(phnum):
+        kind, flags, offset, vaddr, _paddr, filesz = struct.unpack_from('<IIQQQQ', elf, phoff + i * phentsize)
+        if kind == 1 and flags & 1:
+            return vaddr, elf[offset:offset + filesz]
+    return 0, b''
+
+
+def alloc64_patches(elf):
+    """The 64-bit reservation of an arena (above), or None when a site is not found exactly once."""
+    import re
+    vaddr, code = code_segment(elf)
+    out, prologue = [], None
+    for n, (pattern, at, original, new) in enumerate(ALLOC64):
+        matches = [m.start() for m in re.finditer(pattern, code, re.S)]
+        if not matches or (n and len(matches) != 1):
+            return None
+        new = bytes.fromhex(new)
+        for match in matches:
+            start = match + at
+            if original is not None and code[start:start + len(new)] != bytes.fromhex(original):
+                return None
+            if original is None:
+                prologue = start
+            out.append((vaddr + start, new))
+    check = re.search(ALLOC64_CHECK, code[prologue:prologue + 0x200], re.S)
+    if not check or code[prologue + check.end():prologue + check.end() + 1] not in (b'\x0f', b'\x10', b'\x11', b'\x12',
+                                                                                b'\x13', b'\x14', b'\x15'):
+        return None
+    out.append((vaddr + prologue + check.end() - 1, b'\x66\x90'))
+    return out
+
+
 def patches(elf, sites, size, fields):
-    sites, scaled, (heaps, spare), context, system, arena = sites
+    sites, scaled, (heaps, spare), context, system, arena, table = sites
     out = []
     for address, original in [*heaps, spare, *context]:
         at = file_offset(elf, address, 8)
@@ -186,6 +265,11 @@ def patches(elf, sites, size, fields):
         budget -= growth
         growths.append(growth)
         out.append((address, struct.pack('<Q', original + growth)))
+        if original + growth > 0xffffffff:  # a heap past 4 GB: its reservation in 64 bits
+            alloc64 = alloc64_patches(elf)
+            if alloc64 is None:
+                return None
+            out += [patch for patch in alloc64 if patch not in out]
     extra = sum(growths)
     for address, original in context:
         at = file_offset(elf, address, 8)
@@ -195,13 +279,21 @@ def patches(elf, sites, size, fields):
         if original + extra > 0xffffffff:  # the GPU Mem arena's size in 64 bits
             out += arena_fix
     patches.arena_64 = any(original + extra > 0xffffffff for _, original in context)
+    # The screenshot arena (and its CPU context) for three buffers of the eye size, plus 8 MB.
+    shot, cpu = table_entry(elf, table, SCREENSHOT_ID), table_entry(elf, table, CPU_CONTEXT_ID)
+    if shot is None or cpu is None:
+        return None
+    shot_growth = (max(0, SCREENSHOT_BUFFERS * size * size * 4 + (8 << 20) - shot[1]) + 0x1fffff) & ~0x1fffff
+    if shot_growth:
+        out.append((shot[0], struct.pack('<Q', shot[1] + shot_growth)))
+        out.append((cpu[0], struct.pack('<Q', cpu[1] + shot_growth)))
     address, original = system
     expected = bytes.fromhex('48ba') + struct.pack('<Q', original)
     at = file_offset(elf, address, len(expected))
     if at is None or elf[at:at + len(expected)] != expected:
         return None
-    out.append((address + 2, struct.pack('<Q', original + extra * len(context))))
-    patches.extra_mb = (extra * len(context) + 0xfffff) >> 20
+    out.append((address + 2, struct.pack('<Q', original + extra * len(context) + shot_growth)))
+    patches.extra_mb = (extra * len(context) + shot_growth + 0xfffff) >> 20
     for address, reg, field, original, axis in scaled:
         if fields and field not in fields:
             continue

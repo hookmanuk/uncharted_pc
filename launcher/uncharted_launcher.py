@@ -107,11 +107,12 @@ BUTTON_PROMPTS = [('auto', 'Automatic (last device used)'),
                   ('0', "PlayStation (the game's own)")]
 FRAME_GEN_MULTIPLIERS = [('2', '2×'), ('3', '3× (DLSS, GeForce RTX 50)'),
                          ('4', '4× (DLSS, GeForce RTX 50)')]
-# VR fork: the size each eye is drawn at (BB_VR_EYE_RES), square. The games' render target memory stops at 2560 x 2560
-# (scripts/vr_resolution.py: their GPU memory context must stay below 4 GB).
+# VR fork: the size each eye is drawn at (BB_VR_EYE_RES), square, up to 5120 x 5120 (scripts/vr_resolution.py grows
+# the games' memory past their 4 GB arenas; the frame rate falls with the pixel count: 5120 is ~70 FPS on an RTX 5090).
 VR_EYE_SIZES = [(size, f'{size} × {size}' + note) for size, note in (
     ('1440', " (the games' own pixel count)"), ('1600', ''), ('1800', ''), ('2048', ''), ('2160', ' (recommended)'),
-    ('2400', ''), ('2560', ' (the most)'))]
+    ('2400', ''), ('2560', ''), ('2880', ''), ('3200', ''), ('3584', ''), ('3840', ''), ('4320', ''), ('4800', ''),
+    ('5120', ' (the most)'))]
 # Controls (input.ini, read by the game: src/runtime_pad.c). Actions with their PS4 names, the
 # default keys ("A|B": two bindings) and the default controller buttons (SDL names).
 BUTTON_ACTIONS = [
