@@ -537,6 +537,23 @@ void LogDraws() {
 
 bool g_scene_drawn = false; // the motion blur's velocity pass ran since the last flip: a 3D frame (CaptureAtFlip)
 
+// Uncharted fork: a frame without its frame tag was not drawn with the head-tracked camera (U1's title menu draws its
+// animated backdrop with a camera of its own). Shown in stereo with the latest head pose, it followed the head. A few in
+// a row (the odd missed tag in play) keep that; from the tenth on the frame is not taken: it stays whole in the display
+// buffer and the headset shows it on the flat screen (Driveclub's menus). The next tagged frame is stereo again.
+constexpr int UntaggedToScreen = 10;
+int g_untagged = 0;
+
+// At a stereo capture: whether this frame is stereo (above). Clears the frame's tag when it is not.
+bool StereoFrame() {
+    g_untagged = g_frame_pose_valid ? 0 : g_untagged + 1;
+    if (g_untagged < UntaggedToScreen) {
+        return true;
+    }
+    g_frame_pose_valid = false;
+    return false;
+}
+
 void OnVelocityConstants(const float* c, u32 dwords) {
     g_scene_drawn = true;
     if (!g.ready || g_frame_pose_valid || dwords < 10) {
@@ -930,6 +947,9 @@ void OnDraw(Scheduler& scheduler, Runtime& runtime, VideoCore::TextureCache& tex
         return; // no 3D this frame (2D menus): the whole frame for the flat screen
     }
     g_scene_taken = true;
+    if (!StereoFrame()) {
+        return; // not drawn with the head (a menu's own camera): the whole frame for the flat screen
+    }
     const vk::Format format = color.info.pixel_format;
     if (format != vk::Format::eR8G8B8A8Unorm && format != vk::Format::eR8G8B8A8Srgb &&
         format != vk::Format::eB8G8R8A8Unorm && format != vk::Format::eB8G8R8A8Srgb) {
@@ -1058,17 +1078,25 @@ bool TakeFrame(Frame& frame) {
 // capture at its second display draw. At the flip its finished display buffer is the scene: both eyes are taken from
 // it, with an empty HUD. Not when the frame's scene was taken at its HUD: Uncharted 3 copies the finished display buffer
 // out and back after its HUD (fight prompts), a second run of display draws holding the cleared first layer. Only a 3D
-// frame (its velocity pass ran): 2D menus stay on the flat screen, as in Driveclub (the start menu followed the head).
+// frame, as the capture at the HUD asks: its velocity pass ran and a scene depth was drawn. The title and menus draw
+// their 2D layout into the display buffer over an animated backdrop with no depth: taken whole, that layout followed
+// the head (Matt: "the start menu ... is tied to my head"). They stay on the flat screen, as in Driveclub. The frame's
+// depth is forgotten at every flip, so a menu after play does not inherit the last scene's.
 bool CaptureAtFlip(Runtime& runtime, vk::CommandBuffer command_buffer, VideoCore::Image& display) {
-    const bool pending = g_display_draws > 0 && !g_scene_taken && !g_captured_this_frame && g_scene_drawn;
+    const bool pending =
+        g_display_draws > 0 && !g_scene_taken && !g_captured_this_frame && g_scene_drawn && bool(g_frame_depth);
     g_display_draws = 0;
     g_scene_taken = false;
     g_captured_this_frame = false;
     g_scene_drawn = false;
+    if (!pending) {
+        g_frame_depth = {};
+        g_frame_depth_area = 0;
+    }
     if (u32 w, h; Fixes::MovieRect(w, h)) {
         return true; // a movie: the headset's screen shows it (vr_openxr.cpp), nothing to compose
     }
-    if (!pending || !g.ready || Camera::Near() <= 0.f || !Multiview::Stereo(display)) {
+    if (!pending || !g.ready || Camera::Near() <= 0.f || !Multiview::Stereo(display) || !StereoFrame()) {
         return false;
     }
     const vk::Format format = display.info.pixel_format;
