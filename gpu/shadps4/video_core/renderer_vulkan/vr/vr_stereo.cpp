@@ -1053,11 +1053,13 @@ bool TakeFrame(Frame& frame) {
 
 // Uncharted fork: a frame without a HUD (one draw into the display buffer: U2's train, cutscenes) never reached the
 // capture at its second display draw. At the flip its finished display buffer is the scene: both eyes are taken from
-// it, with an empty HUD.
+// it, with an empty HUD. Not when the frame's scene was taken at its HUD: Uncharted 3 copies the finished display buffer
+// out and back after its HUD (fight prompts), a second run of display draws holding the cleared first layer.
 bool CaptureAtFlip(Runtime& runtime, vk::CommandBuffer command_buffer, VideoCore::Image& display) {
-    const bool pending = g_display_draws > 0 && !g_scene_taken;
+    const bool pending = g_display_draws > 0 && !g_scene_taken && !g_captured_this_frame;
     g_display_draws = 0;
     g_scene_taken = false;
+    g_captured_this_frame = false;
     if (u32 w, h; Fixes::MovieRect(w, h)) {
         return true; // a movie: the headset's screen shows it (vr_openxr.cpp), nothing to compose
     }
