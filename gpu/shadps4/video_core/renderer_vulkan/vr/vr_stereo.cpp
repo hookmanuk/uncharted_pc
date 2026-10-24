@@ -241,16 +241,14 @@ SharpenSettings Sharpening() {
 
 // VR fork: TV gamma, as upstream 0.3.0's flat presenter (feab068): DriveClub was graded for TVs decoding with gamma 2.4,
 // headsets (as PC displays) decode sRGB, about 2.2, so the picture looked washed out. Each eye's encoded values to the
-// power 2.4 / 2.2, in the LumaSharpen pass (the scene; the HUD layer keeps its own). On by default (Matt 2026-10-23,
-// after an A/B in the headset: "this is good"); BB_VR_TV_GAMMA=0 turns it off, =<gamma> sets the TV gamma (2.4).
+// power 2.4 / 2.2, in the LumaSharpen pass (the scene; the HUD layer keeps its own). Driveclub has it on by default
+// (Matt 2026-10-23: "this is good"); Uncharted fork: off, as the port's flat presenter (the eyes match the flat game).
+// BB_VR_TV_GAMMA=<gamma> turns it on (2.4: Driveclub's).
 float TvGammaPower() {
     static const float power = [] {
         const char* v = std::getenv("BB_VR_TV_GAMMA");
-        if (v && v[0] == '0' && v[1] == 0) {
-            return 1.0f;
-        }
         const float g = v ? float(std::atof(v)) : 0.0f;
-        return (g >= 1.8f && g <= 3.0f ? g : 2.4f) / 2.2f;
+        return g >= 1.8f && g <= 3.0f ? g / 2.2f : 1.0f;
     }();
     return power;
 }
