@@ -260,6 +260,8 @@ def main():
         if clang64.is_dir():
             env['PATH'] = f'{clang64}{os.pathsep}{env.get("PATH", "")}'
 
+    if env.get('BB_VR') == '1':  # VR fork: the eye size is the render size (vr_render_size), not BB_GAME_RES
+        env.pop('BB_GAME_RES', None)
     game_res(env)
     exe = executable_name(env.get('BB_EXE', ''))
     user_dir = Path(env.get('BB_USER_DIR', data / 'user')).resolve()

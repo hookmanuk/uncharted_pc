@@ -526,6 +526,9 @@ def vr_environment(s, env):
         # The headset paces the game: the game runs unpaced and each flip waits for the headset's next frame once it
         # keeps up (vr_openxr.cpp FramePeriod): the game's frame rate is the headset's refresh rate.
         env['BB_VBLANK_HZ'] = '240'
+        # The eye size is the render size (run.py, scripts/vr_resolution.py): the Display page's resolution is for the
+        # flat game (both rewrite the same display configuration).
+        env.pop('BB_GAME_RES', None)
 
 
 def game_environment(s, start=None):
