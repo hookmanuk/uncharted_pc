@@ -10,6 +10,7 @@ Each site's original instruction is checked in OUT_DIR/eboot.elf (prepare.py's p
 virtual addresses): a game or version whose bytes differ gets no patch. FIELDS: the configuration's fields to change
 (hex offsets, comma-separated, 1000 for all the size pairs; default all of them, the scaled ones too).
 """
+import os
 import struct
 import sys
 from pathlib import Path
@@ -50,6 +51,26 @@ U1_SPARE = (0x9722d8, 0xd0b0400)
 # 932 MB, and the heaps no longer fitted). Growth past that is not given (larger eyes: an upscaler from a smaller
 # render).
 GPU_CONTEXT_LIMIT = (4096 - 2) << 20
+# Past 4 GB: the 32 bits are HeapArena::Init's (rdi the arena, rsi its memory, edx its size: spilled and reloaded as a
+# dword, so the arena's end and size were the context's size modulo 4 GB: "GPU Mem [F:243269632 T:897581056]" for a
+# 5192548352-byte context). Its callers keep the whole size in the arena's owner (+0xc8, the arena at +0x50: the
+# arena's +0x78), so Init takes the size from there when its low 32 bits are the ones passed, kept in a qword of the
+# frame ([rbp-0x40], free; the stack protector's store gives the bytes, its check goes). Other arenas (the caller
+# whose arena is at +0x10 of its owner) keep their 32-bit sizes: a mismatch, the passed size.
+# (image offset of the size spill, of its reload, of the stack protector check's jne)
+U1_ARENA_INIT = (0x35c8e1, 0x35c945, 0x35c998)
+U2_ARENA_INIT = (0x4e1f01, 0x4e1f65, 0x4e1fb8)
+U3_ARENA_INIT = (0x4957c1, 0x495825, 0x495878)
+ARENA_SPILL = (bytes.fromhex('8955c4 4989f6 4989fd 48'), bytes.fromhex('05'), 4, bytes.fromhex('488b00 488945d0'))
+ARENA_SPILL_NEW = bytes.fromhex('4989f6 4989fd 89d0 488b4f78 39d1 480f44c1 488945c0 90')
+ARENA_RELOAD = bytes.fromhex('8b45c4 498b4d18 488d148500000000')
+ARENA_RELOAD_NEW = bytes.fromhex('488b45c0 498b4d18 4889c2 48c1e202')
+ARENA_CHECK = bytes.fromhex('750f')
+ARENA_CHECK_NEW = bytes.fromhex('6690')
+# The GPU context with the 64-bit arena: the direct memory and the render target heaps grow to the eye size.
+GPU_CONTEXT_LIMIT_64 = (12288 - 2) << 20
+if os.environ.get('VR_GPU_CONTEXT_MB'):  # development: another limit
+    GPU_CONTEXT_LIMIT = GPU_CONTEXT_LIMIT_64 = int(os.environ['VR_GPU_CONTEXT_MB']) << 20
 U1_CONTEXT = (0x9713f8, 0xbac00000)
 # (Entries 1 + 2 + 3 make the system context, 4.5 GB; entry 2 is kAllocAppCpu, 1600 MB.)
 # The system direct memory context that holds it (4.5 GB): an immediate, movabs rdx, 0x120000000 at image +0xcb.
@@ -102,9 +123,9 @@ U3_HEAPS = [(0x13aad28, 0x8bc4000), (0x13aad48, 0x2310bc00)]
 U3_SPARE = (0x13aae28, 0xd0b0400)
 U3_CONTEXT = (0x13a9f08, 0xbec00000)
 U3_SYSTEM = (0xcb, 0x120000000)
-SITES = {'eboot.bin': (U1_SITES, U1_SCALED, (U1_HEAPS, U1_SPARE), (U1_CONTEXT,), U1_SYSTEM),
-         'big2-ps4_Shipping.elf': (U2_SITES, U2_SCALED, (U2_HEAPS, U2_SPARE), (U2_CONTEXT,), U2_SYSTEM),
-         'big3-ps4_Shipping.elf': (U3_SITES, U3_SCALED, (U3_HEAPS, U3_SPARE), (U3_CONTEXT,), U3_SYSTEM)}
+SITES = {'eboot.bin': (U1_SITES, U1_SCALED, (U1_HEAPS, U1_SPARE), (U1_CONTEXT,), U1_SYSTEM, U1_ARENA_INIT),
+         'big2-ps4_Shipping.elf': (U2_SITES, U2_SCALED, (U2_HEAPS, U2_SPARE), (U2_CONTEXT,), U2_SYSTEM, U2_ARENA_INIT),
+         'big3-ps4_Shipping.elf': (U3_SITES, U3_SCALED, (U3_HEAPS, U3_SPARE), (U3_CONTEXT,), U3_SYSTEM, U3_ARENA_INIT)}
 ASPECT_16_9 = 0x3fe38e39
 WIDTH_FIELDS = {0x08, 0x18, 0x24, 0x38}
 
@@ -127,17 +148,35 @@ def file_offset(elf, address, length):
     return None
 
 
+def arena_patches(elf, arena):
+    """HeapArena::Init with a 64-bit size (above), or None when the bytes are not the expected ones."""
+    spill, reload, check = arena
+    head, mid, gap, tail = ARENA_SPILL
+    at = file_offset(elf, spill, len(ARENA_SPILL_NEW))
+    if at is None or elf[at:at + len(head)] != head or elf[at + len(head) + 1:at + len(head) + 2] != mid or \
+            elf[at + len(head)] not in (0x8b, 0x8d) or elf[at + len(head) + 2 + gap:at + len(ARENA_SPILL_NEW)] != tail:
+        return None
+    out = [(spill, ARENA_SPILL_NEW)]
+    for address, original, new in ((reload, ARENA_RELOAD, ARENA_RELOAD_NEW), (check, ARENA_CHECK, ARENA_CHECK_NEW)):
+        at = file_offset(elf, address, len(original))
+        if at is None or elf[at:at + len(original)] != original:
+            return None
+        out.append((address, new))
+    return out
+
+
 def patches(elf, sites, size, fields):
-    sites, scaled, (heaps, spare), context, system = sites
+    sites, scaled, (heaps, spare), context, system, arena = sites
     out = []
     for address, original in [*heaps, spare, *context]:
         at = file_offset(elf, address, 8)
         if at is None or struct.unpack_from('<Q', elf, at)[0] != original:
             return None
-    # The heaps' growth comes with the context's (below its 4 GB limit). Whole 2 MB: the game
+    # The heaps' growth comes with the context's (below 4 GB without the arena fix). Whole 2 MB: the game
     # asserts its memory contexts are (+0x36a430: megabytes, +0x36a8c3: even ones).
     pixels = size * size / (1920 * 1080)
-    budget = GPU_CONTEXT_LIMIT - context[0][1]
+    arena_fix = arena_patches(elf, arena)
+    budget = (GPU_CONTEXT_LIMIT_64 if arena_fix else GPU_CONTEXT_LIMIT) - context[0][1]
     patches.capped = False
     growths = []
     for address, original in heaps:
@@ -153,6 +192,9 @@ def patches(elf, sites, size, fields):
         if at is None or struct.unpack_from('<Q', elf, at)[0] != original:
             return None
         out.append((address, struct.pack('<Q', original + extra)))
+        if original + extra > 0xffffffff:  # the GPU Mem arena's size in 64 bits
+            out += arena_fix
+    patches.arena_64 = any(original + extra > 0xffffffff for _, original in context)
     address, original = system
     expected = bytes.fromhex('48ba') + struct.pack('<Q', original)
     at = file_offset(elf, address, len(expected))
