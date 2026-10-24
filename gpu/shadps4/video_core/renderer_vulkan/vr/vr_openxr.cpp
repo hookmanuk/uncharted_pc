@@ -154,6 +154,9 @@ struct State {
     std::atomic<u64> display_period_ns{0};
     std::atomic<bool> capped{false};
     std::atomic<bool> flip_token{false}; // set by each headset frame, taken by a capped flip
+    std::mutex token_mutex;              // with token_cv: the vblank thread's wait for the token (WaitForHeadsetFrame)
+    std::condition_variable token_cv;
+    u64 headset_frames = 0;              // under token_mutex: tokens given
     std::chrono::steady_clock::time_point flips_since{};
     u32 flips = 0;
     u64 shown_serial = 0;       // the headset's thread: the last publication shown
@@ -910,7 +913,12 @@ void FrameLoop() {
         if (g.frame_state.predictedDisplayPeriod > 0) {
             g.display_period_ns.store(u64(g.frame_state.predictedDisplayPeriod), std::memory_order_relaxed);
         }
-        g.flip_token.store(true, std::memory_order_relaxed); // one game flip per headset frame (while capped)
+        {
+            std::scoped_lock lock{g.token_mutex};
+            g.flip_token.store(true, std::memory_order_relaxed); // one game flip per headset frame (while capped)
+            ++g.headset_frames;
+        }
+        g.token_cv.notify_all();
         // VR fork: the head for this frame's display time before the wait, so the game's next frame renders with it.
         UpdateHead();
         if (float pose[7], tangents[4]; Multiview::Enabled() && Camera::LastRendered(pose, tangents)) {
@@ -1143,6 +1151,20 @@ std::chrono::nanoseconds FramePeriod(std::chrono::nanoseconds limit) {
 
 bool FlipAllowed() {
     return !g.capped.load(std::memory_order_relaxed) || g.flip_token.load(std::memory_order_relaxed);
+}
+
+bool WaitForHeadsetFrame(std::chrono::steady_clock::time_point deadline) {
+    static const bool enabled = !(std::getenv("BB_VR_TOKEN_WAKE") && std::getenv("BB_VR_TOKEN_WAKE")[0] == '0');
+    if (!enabled || !g.capped.load(std::memory_order_relaxed)) {
+        return false;
+    }
+    // One early tick per headset frame (one since the last: also a token given during the tick itself).
+    static u64 seen = 0;
+    std::unique_lock lock{g.token_mutex};
+    g.token_cv.wait_until(lock, deadline,
+                          [] { return g.headset_frames != seen || !g.capped.load(std::memory_order_relaxed); });
+    seen = g.headset_frames;
+    return true;
 }
 
 // The presenter, each game flip in VR: the adaptive cap's flip rate over 2 s windows.

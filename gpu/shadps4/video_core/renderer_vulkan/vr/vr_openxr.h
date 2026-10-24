@@ -89,6 +89,11 @@ std::chrono::nanoseconds FramePeriod(std::chrono::nanoseconds limit);
 /// The present thread: a flip may go now (uncapped, or the headset began a frame since the last flip).
 bool FlipAllowed();
 
+/// The vblank thread, between ticks (Uncharted fork): while capped, sleeps until `deadline` or the headset's next frame
+/// (its token), so a held flip goes at the headset's frame, not at the next vblank tick (240 Hz: 0-4.2 ms later, the
+/// headset waiting for it). False: not capped, the caller sleeps its own way.
+bool WaitForHeadsetFrame(std::chrono::steady_clock::time_point deadline);
+
 /// After the presenter's submit: hands the layer to the runtime (xrEndFrame).
 void SubmitFrame(VkSemaphore semaphore, u64 tick);
 
