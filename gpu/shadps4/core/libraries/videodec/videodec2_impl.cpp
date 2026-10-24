@@ -8,6 +8,7 @@
 #include "common/logging/log.h"
 #include "video_utils.h"
 #include "videodec_error.h"
+#include "video_core/renderer_vulkan/vr/vr_fixes.h" // VR
 
 #include "common/support/avdec.h"
 
@@ -115,6 +116,7 @@ s32 VdecDecoder::Decode(const OrbisVideodec2InputData& input_data,
     const auto width = Common::AlignUp<u32>(frame->width, 16);
     const auto pitch = Common::AlignUp<u32>(frame->width, 64);
     const auto height = Common::AlignUp<u32>(frame->height, 16);
+    Vulkan::Vr::Fixes::NoteMovieFrame(u64(frame_buffer.frame_buffer), pitch, frame->width, frame->height, height); // VR
 
     output_info.is_valid = true;
     output_info.is_error_frame = false;
@@ -208,6 +210,7 @@ s32 VdecDecoder::Flush(OrbisVideodec2FrameBuffer& frame_buffer,
     const auto width = Common::AlignUp<u32>(frame->width, 16);
     const auto pitch = Common::AlignUp<u32>(frame->width, 64);
     const auto height = Common::AlignUp<u32>(frame->height, 16);
+    Vulkan::Vr::Fixes::NoteMovieFrame(u64(frame_buffer.frame_buffer), pitch, frame->width, frame->height, height); // VR
 
     output_info.is_valid = true;
     output_info.is_error_frame = false;

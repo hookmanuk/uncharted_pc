@@ -1821,6 +1821,7 @@ void Rasterizer::DispatchRecord(const ComputePipeline* pipeline) {
         return;
     }
     Vr::Stereo::LogDispatch(cs.pgm_hash); // VR: development (DRAWLOG)
+    Vr::Fixes::FixMovieImages(cs); // VR: the movies' frames at their decoded size
     // After the resource binding: its transfers (image uploads, downloads) mark themselves.
     const auto mark = [&] {
         if (auto* profiler = GpuProfiler::Get()) {

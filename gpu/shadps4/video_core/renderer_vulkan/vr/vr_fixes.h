@@ -8,6 +8,7 @@
 #include <vector>
 
 #include "common/types.h"
+#include "shader_recompiler/info.h"
 
 namespace Vulkan::Vr::Fixes {
 
@@ -26,5 +27,19 @@ inline bool NativeSize(u32 width, u32 height) {
 
 /// The game's output size (the display buffer; above the render size when an upscaler runs); false while unknown.
 bool OutputSize(u32& width, u32& height);
+
+/// The video decoder (Uncharted fork): a movie frame in NV12 at `buffer` (luma rows `pitch` bytes apart, `rows` of
+/// them, the chroma after them), `width` x `height` pixels.
+void NoteMovieFrame(u64 buffer, u32 pitch, u32 width, u32 height, u32 rows);
+
+/// Each dispatch (Uncharted fork): the collection's movie shader (NV12 to the display buffer) gets its luma and chroma
+/// images at the render size (the game makes them from its display configuration, square in VR: rows sheared, the
+/// chroma read from the next frame's buffer); they become the decoded frame's layout.
+void FixMovieImages(const Shader::Info& cs);
+
+/// A movie plays (its shader ran in the last 0.3 s): its size, drawn at the display buffer's top left (the shader
+/// copies texels: at a square render size the rest of the buffer is the frame's edge repeated). The headset shows that
+/// region on the screen at the movie's aspect, not stereo.
+bool MovieRect(u32& width, u32& height);
 
 } // namespace Vulkan::Vr::Fixes
