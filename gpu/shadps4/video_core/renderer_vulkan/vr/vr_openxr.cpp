@@ -155,7 +155,7 @@ struct State {
     // The adaptive frame cap (FramePeriod): the headset's period (ns, from xrWaitFrame) and the game's flips.
     std::atomic<u64> display_period_ns{0};
     std::atomic<bool> capped{false};
-    std::atomic<bool> flip_token{false}; // set by each headset frame, taken by a capped flip
+    std::atomic<int> flip_tokens{0}; // given by each headset frame, taken by a capped flip (see Ahead())
     std::mutex token_mutex;              // with token_cv: the vblank thread's wait for the token (WaitForHeadsetFrame)
     std::condition_variable token_cv;
     u64 headset_frames = 0;              // under token_mutex: tokens given
@@ -861,6 +861,15 @@ bool Finished(const State::Published& p) {
            value >= p.tick;
 }
 
+// The game renders one frame ahead of the headset (two flips in flight while capped). The headset shows the newest
+// finished frame, so it rarely waits for the GPU; one more frame of latency (the frame tags keep each image on the head
+// pose it was rendered for). U3 2560 + DLSS at 90 Hz: frames over a period 5.8-8.4% -> 0-0.7%, 1% low 76-80 -> 82-84.
+// BB_VR_AHEAD=0: the headset waits for the frame it just let the game flip.
+bool Ahead() {
+    static const bool ahead = !(std::getenv("BB_VR_AHEAD") && std::getenv("BB_VR_AHEAD")[0] == '0');
+    return ahead;
+}
+
 // The headset's thread, after xrWaitFrame: waits (up to 100 ms) for the game's next publication and its GPU work, so a
 // slow game frame makes the headset frame late and the runtime sees the drop (SteamVR's frame timing, its reprojection
 // and motion smoothing). Before, the loop submitted the last frame again on time: SteamVR always reported the full
@@ -872,6 +881,21 @@ void WaitForGameFrame() {
     }
     const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(100);
     State::Published newest;
+    if (Ahead()) { // a finished frame not shown yet: no wait
+        std::array<State::Published, 3> recent;
+        {
+            std::scoped_lock lock{g.publish_mutex};
+            recent = g.recent;
+        }
+        for (const State::Published& p : recent) {
+            if (p.kind == State::Content::None || p.serial <= g.shown_serial) {
+                break;
+            }
+            if (Finished(p)) {
+                return;
+            }
+        }
+    }
     {
         std::unique_lock lock{g.publish_mutex};
         if (!g.publish_cv.wait_until(lock, deadline, [] {
@@ -920,7 +944,11 @@ void FrameLoop() {
         }
         {
             std::scoped_lock lock{g.token_mutex};
-            g.flip_token.store(true, std::memory_order_relaxed); // one game flip per headset frame (while capped)
+            // One game flip per headset frame (while capped); one more banked when the game runs a frame ahead.
+            const int most = Ahead() ? 2 : 1;
+            int tokens = g.flip_tokens.load(std::memory_order_relaxed);
+            while (tokens < most && !g.flip_tokens.compare_exchange_weak(tokens, tokens + 1)) {
+            }
             ++g.headset_frames;
         }
         g.token_cv.notify_all();
@@ -1161,13 +1189,15 @@ void Recenter() {
 
 std::chrono::nanoseconds FramePeriod(std::chrono::nanoseconds limit) {
     if (g.capped.load(std::memory_order_relaxed)) {
-        g.flip_token.store(false, std::memory_order_relaxed);
+        int tokens = g.flip_tokens.load(std::memory_order_relaxed);
+        while (tokens > 0 && !g.flip_tokens.compare_exchange_weak(tokens, tokens - 1)) {
+        }
     }
     return limit;
 }
 
 bool FlipAllowed() {
-    return !g.capped.load(std::memory_order_relaxed) || g.flip_token.load(std::memory_order_relaxed);
+    return !g.capped.load(std::memory_order_relaxed) || g.flip_tokens.load(std::memory_order_relaxed) > 0;
 }
 
 bool WaitForHeadsetFrame(std::chrono::steady_clock::time_point deadline) {
