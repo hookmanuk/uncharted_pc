@@ -241,14 +241,16 @@ SharpenSettings Sharpening() {
 
 // VR fork: TV gamma, as upstream 0.3.0's flat presenter (feab068): DriveClub was graded for TVs decoding with gamma 2.4,
 // headsets (as PC displays) decode sRGB, about 2.2, so the picture looked washed out. Each eye's encoded values to the
-// power 2.4 / 2.2, in the LumaSharpen pass (the scene; the HUD layer keeps its own). Driveclub has it on by default
-// (Matt 2026-10-23: "this is good"); Uncharted fork: off, as the port's flat presenter (the eyes match the flat game).
-// BB_VR_TV_GAMMA=<gamma> turns it on (2.4: Driveclub's).
+// power 2.4 / 2.2, in the LumaSharpen pass (the scene; the HUD layer keeps its own). On by default (Matt 2026-10-23,
+// after an A/B in the headset: "this is good"); BB_VR_TV_GAMMA=0 turns it off, =<gamma> sets the TV gamma (2.4).
 float TvGammaPower() {
     static const float power = [] {
         const char* v = std::getenv("BB_VR_TV_GAMMA");
+        if (v && v[0] == '0' && v[1] == 0) {
+            return 1.0f;
+        }
         const float g = v ? float(std::atof(v)) : 0.0f;
-        return g >= 1.8f && g <= 3.0f ? g / 2.2f : 1.0f;
+        return (g >= 1.8f && g <= 3.0f ? g : 2.4f) / 2.2f;
     }();
     return power;
 }
@@ -533,7 +535,10 @@ void LogDraws() {
     g_log_draws = 5000;
 }
 
+bool g_scene_drawn = false; // the motion blur's velocity pass ran since the last flip: a 3D frame (CaptureAtFlip)
+
 void OnVelocityConstants(const float* c, u32 dwords) {
+    g_scene_drawn = true;
     if (!g.ready || g_frame_pose_valid || dwords < 10) {
         return;
     }
@@ -1052,12 +1057,14 @@ bool TakeFrame(Frame& frame) {
 // Uncharted fork: a frame without a HUD (one draw into the display buffer: U2's train, cutscenes) never reached the
 // capture at its second display draw. At the flip its finished display buffer is the scene: both eyes are taken from
 // it, with an empty HUD. Not when the frame's scene was taken at its HUD: Uncharted 3 copies the finished display buffer
-// out and back after its HUD (fight prompts), a second run of display draws holding the cleared first layer.
+// out and back after its HUD (fight prompts), a second run of display draws holding the cleared first layer. Only a 3D
+// frame (its velocity pass ran): 2D menus stay on the flat screen, as in Driveclub (the start menu followed the head).
 bool CaptureAtFlip(Runtime& runtime, vk::CommandBuffer command_buffer, VideoCore::Image& display) {
-    const bool pending = g_display_draws > 0 && !g_scene_taken && !g_captured_this_frame;
+    const bool pending = g_display_draws > 0 && !g_scene_taken && !g_captured_this_frame && g_scene_drawn;
     g_display_draws = 0;
     g_scene_taken = false;
     g_captured_this_frame = false;
+    g_scene_drawn = false;
     if (u32 w, h; Fixes::MovieRect(w, h)) {
         return true; // a movie: the headset's screen shows it (vr_openxr.cpp), nothing to compose
     }

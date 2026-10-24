@@ -823,9 +823,7 @@ void VideoOutDriver::PresentThread(std::stop_token token) {
         }
 
         if (!immediate_flips || main_port.flip_rate != 0 || movie) {
-            if (movie || !Vulkan::Vr::WaitForHeadsetFrame(tick_deadline)) { // VR: or the headset's frame
-                timer.End();
-            }
+            timer.End();
             continue;
         }
         while (!token.stop_requested()) {

@@ -49,9 +49,11 @@ void Log(const char* format, ...) {
 
 struct Functions {
     PFN_xrGetInstanceProcAddr GetInstanceProcAddr{};
+    PFN_xrGetDisplayRefreshRateFB GetDisplayRefreshRateFB{}; // XR_FB_display_refresh_rate, when the runtime has it
 #define XR_FN(name) PFN_xr##name name{};
 #define XR_FUNCTIONS                                                                                                   \
     XR_FN(CreateInstance)                                                                                              \
+    XR_FN(EnumerateInstanceExtensionProperties)                                                                        \
     XR_FN(DestroyInstance)                                                                                             \
     XR_FN(GetSystem)                                                                                                   \
     XR_FN(GetVulkanInstanceExtensionsKHR)                                                                              \
@@ -154,11 +156,12 @@ struct State {
     std::array<double, 5> part_sum{}, part_max{};
     // The adaptive frame cap (FramePeriod): the headset's period (ns, from xrWaitFrame) and the game's flips.
     std::atomic<u64> display_period_ns{0};
+    // Uncharted fork: the headset's refresh period (XR_FB_display_refresh_rate, else the shortest display period seen).
+    // The predicted display period doubles while SteamVR holds a slow game at half rate: capping the game at that
+    // (45 Hz, the game making 54) tied the output to the runtime's throttle, not the game's render rate.
+    std::atomic<u64> refresh_period_ns{0};
     std::atomic<bool> capped{false};
-    std::atomic<int> flip_tokens{0}; // given by each headset frame, taken by a capped flip (see Ahead())
-    std::mutex token_mutex;              // with token_cv: the vblank thread's wait for the token (WaitForHeadsetFrame)
-    std::condition_variable token_cv;
-    u64 headset_frames = 0;              // under token_mutex: tokens given
+    std::atomic<bool> flip_token{false}; // set by each headset frame, taken by a capped flip
     std::chrono::steady_clock::time_point flips_since{};
     u32 flips = 0;
     u64 shown_serial = 0;       // the headset's thread: the last publication shown
@@ -182,6 +185,11 @@ struct State {
     std::vector<double> intervals;
     double last_submit = 0.0;
     u32 repeats = 0, screens = 0;
+    // Development (BB_VR_POSELOG=<frames>): per headset frame, the head's yaw at its display time, the submitted
+    // layer's, whether the frame was new and whether its pose came from its frame tag (judder in a real headset).
+    float log_head_yaw = 0.f;
+    bool log_new_frame = false, log_tagged = false;
+    u64 log_serial = 0;
     float frame_layer_pose[7]{}, frame_tangents[4]{}; // the stereo frame's rendered pose (its layer)
     float ipd = 0.064f;
 
@@ -268,18 +276,34 @@ void Init() {
         return;
     }
     LoadFunctions(XR_NULL_HANDLE); // xrCreateInstance and friends work without an instance
-    const char* extensions[] = {XR_KHR_VULKAN_ENABLE_EXTENSION_NAME};
+    // Uncharted fork: the headset's refresh rate (XR_FB_display_refresh_rate, SteamVR has it) for the frame cap, as the
+    // predicted display period doubles while the runtime holds the game at half rate.
+    bool refresh_rate = false;
+    if (g.xr.EnumerateInstanceExtensionProperties) {
+        u32 count = 0;
+        g.xr.EnumerateInstanceExtensionProperties(nullptr, 0, &count, nullptr);
+        std::vector<XrExtensionProperties> offered(count, {XR_TYPE_EXTENSION_PROPERTIES});
+        g.xr.EnumerateInstanceExtensionProperties(nullptr, count, &count, offered.data());
+        for (const auto& extension : offered) {
+            refresh_rate |= std::strcmp(extension.extensionName, XR_FB_DISPLAY_REFRESH_RATE_EXTENSION_NAME) == 0;
+        }
+    }
+    const char* extensions[] = {XR_KHR_VULKAN_ENABLE_EXTENSION_NAME, XR_FB_DISPLAY_REFRESH_RATE_EXTENSION_NAME};
     XrInstanceCreateInfo info{XR_TYPE_INSTANCE_CREATE_INFO};
     std::strcpy(info.applicationInfo.applicationName, "Uncharted VR");
     std::strcpy(info.applicationInfo.engineName, "Uncharted PC port");
     info.applicationInfo.apiVersion = XR_MAKE_VERSION(1, 0, 0);
-    info.enabledExtensionCount = 1;
+    info.enabledExtensionCount = refresh_rate ? 2 : 1;
     info.enabledExtensionNames = extensions;
     if (!g.xr.CreateInstance || !Check(g.xr.CreateInstance(&info, &g.instance), "xrCreateInstance")) {
         g.instance = XR_NULL_HANDLE;
         return;
     }
     LoadFunctions(g.instance);
+    if (refresh_rate) {
+        g.xr.GetInstanceProcAddr(g.instance, "xrGetDisplayRefreshRateFB",
+                                 reinterpret_cast<PFN_xrVoidFunction*>(&g.xr.GetDisplayRefreshRateFB));
+    }
     XrSystemGetInfo system_info{XR_TYPE_SYSTEM_GET_INFO};
     system_info.formFactor = XR_FORM_FACTOR_HEAD_MOUNTED_DISPLAY;
     if (!Check(g.xr.GetSystem(g.instance, &system_info, &g.system), "xrGetSystem (no headset?)")) {
@@ -487,6 +511,17 @@ bool AcquireChain(State::Chain& chain) {
     return true;
 }
 
+// The headset's refresh rate (XR_FB_display_refresh_rate), for the frame cap (NoteFlip). Without the extension the cap
+// takes the shortest display period seen.
+void ReadRefreshRate() {
+    float hz = 0.f;
+    if (g.xr.GetDisplayRefreshRateFB && g.session &&
+        XR_SUCCEEDED(g.xr.GetDisplayRefreshRateFB(g.session, &hz)) && hz > 10.f) {
+        g.refresh_period_ns.store(u64(1e9 / double(hz)), std::memory_order_relaxed);
+        Log("headset refresh rate %.1f Hz", hz);
+    }
+}
+
 void PollEvents() {
     XrEventDataBuffer event{XR_TYPE_EVENT_DATA_BUFFER};
     while (g.xr.PollEvent(g.instance, &event) == XR_SUCCESS) {
@@ -498,10 +533,13 @@ void PollEvents() {
                 XrSessionBeginInfo begin{XR_TYPE_SESSION_BEGIN_INFO};
                 begin.primaryViewConfigurationType = XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO;
                 g.running = Check(g.xr.BeginSession(g.session, &begin), "xrBeginSession");
+                ReadRefreshRate();
             } else if (changed.state == XR_SESSION_STATE_STOPPING) {
                 g.xr.EndSession(g.session);
                 g.running = false;
             }
+        } else if (event.type == XR_TYPE_EVENT_DATA_DISPLAY_REFRESH_RATE_CHANGED_FB) {
+            ReadRefreshRate();
         } else if (event.type == XR_TYPE_EVENT_DATA_REFERENCE_SPACE_CHANGE_PENDING) {
             // The runtime moved LOCAL (a seated reset in its dashboard): the seat follows.
             g.recenter_requested = true;
@@ -559,6 +597,10 @@ void UpdateHead() {
     const float layer_pose[7] = {location.pose.orientation.x, location.pose.orientation.y, location.pose.orientation.z,
                                  location.pose.orientation.w, location.pose.position.x,    location.pose.position.y,
                                  location.pose.position.z};
+    {
+        const XrQuaternionf& o = location.pose.orientation; // development (BB_VR_POSELOG): the head's yaw, degrees
+        g.log_head_yaw = std::atan2(2.f * (o.w * o.y + o.x * o.z), 1.f - 2.f * (o.y * o.y + o.x * o.x)) * 57.2958f;
+    }
     XrQuaternionf q = location.pose.orientation;
     XrVector3f p = location.pose.position;
     // Yaw of the head's forward (-Z) about +Y.
@@ -730,6 +772,8 @@ bool Show(const State::Published& p) {
         part(3);
         std::memcpy(g.frame_layer_pose, p.layer_pose, sizeof(g.frame_layer_pose));
         std::memcpy(g.frame_tangents, p.tangents, sizeof(g.frame_tangents));
+        g.log_tagged = p.stereo.has_pose; // development (BB_VR_POSELOG)
+        g.log_serial = p.serial;
         if (g.content == State::Content::Screen) {
             static const bool auto_recenter = !(std::getenv("BB_VR_AUTO_RECENTER") &&
                                                 std::getenv("BB_VR_AUTO_RECENTER")[0] == '0');
@@ -842,6 +886,29 @@ void EndFrame() {
     end.environmentBlendMode = XR_ENVIRONMENT_BLEND_MODE_OPAQUE;
     end.layerCount = layer_count;
     end.layers = layers;
+    static int pose_log = [] {
+        const char* v = std::getenv("BB_VR_POSELOG");
+        return v ? std::atoi(v) : 0;
+    }();
+    if (pose_log > 0) { // development: one line per headset frame (see State::log_head_yaw)
+        static FILE* f = [] {
+            const char* temp = std::getenv("TEMP");
+            return std::fopen((std::string(temp ? temp : ".") + "/vr_poselog.txt").c_str(), "w");
+        }();
+        if (f) {
+            const float* l = g.frame_layer_pose;
+            const float sub = std::atan2(2.f * (l[3] * l[1] + l[0] * l[2]), 1.f - 2.f * (l[1] * l[1] + l[0] * l[0])) *
+                              57.2958f;
+            std::fprintf(f, "%lld %.3f %.3f %d %d %d %llu %d\n", (long long)g.frame_state.predictedDisplayTime,
+                         g.log_head_yaw, sub, int(stereo), int(g.log_new_frame), int(g.log_tagged),
+                         (unsigned long long)g.log_serial, int(g.frame_state.predictedDisplayPeriod / 1000));
+            if (--pose_log == 0) {
+                std::fclose(f);
+                f = nullptr;
+                Log("pose log written");
+            }
+        }
+    }
     QueueLock lock;
     Check(g.xr.EndFrame(g.session, &end), "xrEndFrame");
 }
@@ -861,15 +928,6 @@ bool Finished(const State::Published& p) {
            value >= p.tick;
 }
 
-// The game renders one frame ahead of the headset (two flips in flight while capped). The headset shows the newest
-// finished frame, so it rarely waits for the GPU; one more frame of latency (the frame tags keep each image on the head
-// pose it was rendered for). U3 2560 + DLSS at 90 Hz: frames over a period 5.8-8.4% -> 0-0.7%, 1% low 76-80 -> 82-84.
-// BB_VR_AHEAD=0: the headset waits for the frame it just let the game flip.
-bool Ahead() {
-    static const bool ahead = !(std::getenv("BB_VR_AHEAD") && std::getenv("BB_VR_AHEAD")[0] == '0');
-    return ahead;
-}
-
 // The headset's thread, after xrWaitFrame: waits (up to 100 ms) for the game's next publication and its GPU work, so a
 // slow game frame makes the headset frame late and the runtime sees the drop (SteamVR's frame timing, its reprojection
 // and motion smoothing). Before, the loop submitted the last frame again on time: SteamVR always reported the full
@@ -881,21 +939,6 @@ void WaitForGameFrame() {
     }
     const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(100);
     State::Published newest;
-    if (Ahead()) { // a finished frame not shown yet: no wait
-        std::array<State::Published, 3> recent;
-        {
-            std::scoped_lock lock{g.publish_mutex};
-            recent = g.recent;
-        }
-        for (const State::Published& p : recent) {
-            if (p.kind == State::Content::None || p.serial <= g.shown_serial) {
-                break;
-            }
-            if (Finished(p)) {
-                return;
-            }
-        }
-    }
     {
         std::unique_lock lock{g.publish_mutex};
         if (!g.publish_cv.wait_until(lock, deadline, [] {
@@ -940,18 +983,16 @@ void FrameLoop() {
         }
         stage(0, since);
         if (g.frame_state.predictedDisplayPeriod > 0) {
-            g.display_period_ns.store(u64(g.frame_state.predictedDisplayPeriod), std::memory_order_relaxed);
-        }
-        {
-            std::scoped_lock lock{g.token_mutex};
-            // One game flip per headset frame (while capped); one more banked when the game runs a frame ahead.
-            const int most = Ahead() ? 2 : 1;
-            int tokens = g.flip_tokens.load(std::memory_order_relaxed);
-            while (tokens < most && !g.flip_tokens.compare_exchange_weak(tokens, tokens + 1)) {
+            const u64 period = u64(g.frame_state.predictedDisplayPeriod);
+            g.display_period_ns.store(period, std::memory_order_relaxed);
+            if (!g.xr.GetDisplayRefreshRateFB) { // no refresh rate from the runtime: the shortest period seen
+                const u64 shortest = g.refresh_period_ns.load(std::memory_order_relaxed);
+                if (!shortest || period < shortest) {
+                    g.refresh_period_ns.store(period, std::memory_order_relaxed);
+                }
             }
-            ++g.headset_frames;
         }
-        g.token_cv.notify_all();
+        g.flip_token.store(true, std::memory_order_relaxed); // one game flip per headset frame (while capped)
         // VR fork: the head for this frame's display time before the wait, so the game's next frame renders with it.
         UpdateHead();
         if (float pose[7], tangents[4]; Multiview::Enabled() && Camera::LastRendered(pose, tangents)) {
@@ -988,6 +1029,7 @@ void FrameLoop() {
             }
         }
         g.repeats += !shown;
+        g.log_new_frame = shown; // development (BB_VR_POSELOG)
         g.screens += shown && g.content == State::Content::Screen;
         stage(2, since);
         EndFrame();
@@ -1189,35 +1231,20 @@ void Recenter() {
 
 std::chrono::nanoseconds FramePeriod(std::chrono::nanoseconds limit) {
     if (g.capped.load(std::memory_order_relaxed)) {
-        int tokens = g.flip_tokens.load(std::memory_order_relaxed);
-        while (tokens > 0 && !g.flip_tokens.compare_exchange_weak(tokens, tokens - 1)) {
-        }
+        g.flip_token.store(false, std::memory_order_relaxed);
     }
     return limit;
 }
 
 bool FlipAllowed() {
-    return !g.capped.load(std::memory_order_relaxed) || g.flip_tokens.load(std::memory_order_relaxed) > 0;
-}
-
-bool WaitForHeadsetFrame(std::chrono::steady_clock::time_point deadline) {
-    static const bool enabled = !(std::getenv("BB_VR_TOKEN_WAKE") && std::getenv("BB_VR_TOKEN_WAKE")[0] == '0');
-    if (!enabled || !g.capped.load(std::memory_order_relaxed)) {
-        return false;
-    }
-    // One early tick per headset frame (one since the last: also a token given during the tick itself).
-    static u64 seen = 0;
-    std::unique_lock lock{g.token_mutex};
-    g.token_cv.wait_until(lock, deadline,
-                          [] { return g.headset_frames != seen || !g.capped.load(std::memory_order_relaxed); });
-    seen = g.headset_frames;
-    return true;
+    return !g.capped.load(std::memory_order_relaxed) || g.flip_token.load(std::memory_order_relaxed);
 }
 
 // The presenter, each game flip in VR: the adaptive cap's flip rate over 2 s windows.
 void NoteFlip() {
     static const bool enabled = !(std::getenv("BB_VR_CAP") && std::getenv("BB_VR_CAP")[0] == '0');
-    const u64 period = g.display_period_ns.load(std::memory_order_relaxed);
+    const u64 refresh = g.refresh_period_ns.load(std::memory_order_relaxed);
+    const u64 period = refresh ? refresh : g.display_period_ns.load(std::memory_order_relaxed);
     if (!enabled || !period) {
         return;
     }
@@ -1232,10 +1259,10 @@ void NoteFlip() {
     }
     const double rate = g.flips / seconds, hz = 1e9 / double(period);
     const bool capped = g.capped.load(std::memory_order_relaxed);
-    if (!capped && rate >= 1.03 * hz) { // Uncharted fork: 1.12 left 100 FPS on a 90 Hz headset uncapped (judder)
+    if (!capped && rate >= 1.12 * hz) {
         g.capped = true;
         Log("the game holds %.0f FPS: capped at the headset's %.0f Hz", rate, hz);
-    } else if (capped && rate < 0.93 * hz) {
+    } else if (capped && rate < 0.95 * hz) {
         g.capped = false;
         Log("the game makes %.0f FPS of the headset's %.0f Hz: uncapped", rate, hz);
     }
