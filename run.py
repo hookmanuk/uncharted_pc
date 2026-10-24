@@ -70,10 +70,17 @@ def vr_render_size(env, out, exe):
         size = '2560'
     run_script('vr_resolution.py', out, exe, size or '0')
     env.pop('BB_VR_RENDER_SIZE', None)
+    # The direct memory for this executable's render targets (a switch to another game recomputes it); one the user
+    # set stays.
+    vr_render_size.user_dmem = getattr(vr_render_size, 'user_dmem', env.get('BB_DMEM_MB'))
+    if vr_render_size.user_dmem:
+        env['BB_DMEM_MB'] = vr_render_size.user_dmem
+    else:
+        env.pop('BB_DMEM_MB', None)
     if not (out / 'vr_patches.bin').is_file():
         return None
     env['BB_VR_RENDER_SIZE'] = f'{size}x{size}'
-    if (out / 'vr_patches.dmem').is_file() and not env.get('BB_DMEM_MB'):  # the larger render targets' memory
+    if (out / 'vr_patches.dmem').is_file() and not vr_render_size.user_dmem:  # the larger render targets' memory
         env['BB_DMEM_MB'] = (out / 'vr_patches.dmem').read_text(encoding='ascii').strip()
     return out / 'vr_patches.bin'
 
@@ -313,7 +320,7 @@ def main():
         command = [str(probe), str(out / 'boot-linked.bin'), '--content-profile', str(out / 'content.bin'),
                    '--app0', str(game), '--user', str(user_dir), '--timeout', env.get('BB_TIMEOUT', '0')]
         command += isa_rewrite_args(probe, out)
-        patches = vr_patches(env, out, file, patches)  # VR fork: the eye size's patches with the cheats'
+        patches = vr_patches(env, out, exe, patches)  # VR fork: the eye size's patches (per executable) with the cheats'
         if patches:
             command += ['--patches', str(patches)]
         if guest_argv:
