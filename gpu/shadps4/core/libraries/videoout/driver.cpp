@@ -783,6 +783,8 @@ void VideoOutDriver::PresentThread(std::stop_token token) {
             const auto request = receive_request();
             if (request && frame_limit) {
                 next_flip = std::max(next_flip + Vulkan::Vr::FramePeriod(frame_period), now - frame_period); // VR
+            } else if (request) {
+                Vulkan::Vr::FramePeriod(frame_period); // VR: the flip takes the headset frame's token (no frame limit)
             }
             if (!request) {
                 if (timer.GetTotalWait().count() < 0) { // Dont draw too fast

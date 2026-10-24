@@ -185,6 +185,8 @@ struct State {
     std::vector<double> intervals;
     double last_submit = 0.0;
     u32 repeats = 0, screens = 0;
+    std::atomic<u32> count_publications{0}; // stereo frames published to the headset since the last report
+    std::atomic<u32> count_flips{0};        // the game's flips (RecordFrame: one per presented game frame)
     // Development (BB_VR_POSELOG=<frames>): per headset frame, the head's yaw at its display time, the submitted
     // layer's, whether the frame was new and whether its pose came from its frame tag (judder in a real headset).
     float log_head_yaw = 0.f;
@@ -680,6 +682,14 @@ void NoteFrameTime() {
         "%.1f Hz); %u repeated, %u flat screen",
         new_frames / sum, headset_fps, 1.0 / p99, 100.0 * over / double(g.intervals.size()),
         100.0 * late / double(g.intervals.size()), 1.0 / period, g.repeats, g.screens);
+    {
+        u32 renders = 0, captures = 0;
+        Stereo::TakeCounts(renders, captures);
+        Log("per second: game flips %.1f, game 3D frames %.1f, stereo frames taken %.1f, published %.1f, headset frames "
+            "%.1f",
+            g.count_flips.exchange(0) / sum, renders / sum, captures / sum, g.count_publications.exchange(0) / sum,
+            double(g.intervals.size()) / sum);
+    }
     const double n = double(g.intervals.size());
     Log("headset loop ms (avg / max): wait frame %.2f / %.1f, game frame %.2f / %.1f, begin %.2f / %.1f, show %.2f / "
         "%.1f, end frame %.2f / %.1f",
@@ -1158,6 +1168,7 @@ void RecordFrame(vk::CommandBuffer cmd, vk::Image frame, u32 width, u32 height, 
     f8_down = f8;
 #endif
     g.pending = {};
+    ++g.count_flips; // development: the VR report's game flips
     if (!g.session) {
         return;
     }
@@ -1273,6 +1284,7 @@ void NoteFlip() {
 void SubmitFrame(VkSemaphore semaphore, u64 tick) {
     if (g.pending.kind == State::Content::Stereo) {
         NoteFlip();
+        ++g.count_publications;
     }
     if (g.pending.kind == State::Content::None) {
         return;

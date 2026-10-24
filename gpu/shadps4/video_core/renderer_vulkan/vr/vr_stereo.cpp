@@ -536,6 +536,8 @@ void LogDraws() {
 }
 
 bool g_scene_drawn = false; // the motion blur's velocity pass ran since the last flip: a 3D frame (CaptureAtFlip)
+// The VR report's counts: the game's 3D frames (velocity passes) and the stereo frames taken from them.
+std::atomic<u32> g_count_renders{0}, g_count_captures{0};
 
 // Uncharted fork: a frame without its frame tag was not drawn with the head-tracked camera (U1's title menu draws its
 // animated backdrop with a camera of its own). Shown in stereo with the latest head pose, it followed the head. A few in
@@ -554,8 +556,14 @@ bool StereoFrame() {
     return false;
 }
 
+void TakeCounts(u32& renders, u32& captures) {
+    renders = g_count_renders.exchange(0);
+    captures = g_count_captures.exchange(0);
+}
+
 void OnVelocityConstants(const float* c, u32 dwords) {
     g_scene_drawn = true;
+    ++g_count_renders;
     if (!g.ready || g_frame_pose_valid || dwords < 10) {
         return;
     }
@@ -1052,6 +1060,7 @@ void OnDraw(Scheduler& scheduler, Runtime& runtime, VideoCore::TextureCache& tex
     std::memcpy(slot.tangents, g_frame_tangents, sizeof(slot.tangents));
     g.next_slot = (index + 1) % SlotCount;
     g.complete.push_back(index);
+    ++g_count_captures;
     while (g.complete.size() > SlotCount - 1) {
         g.complete.pop_front();
     }
@@ -1145,6 +1154,7 @@ bool CaptureAtFlip(Runtime& runtime, vk::CommandBuffer command_buffer, VideoCore
     std::memcpy(slot.tangents, g_frame_tangents, sizeof(slot.tangents));
     g.next_slot = (index + 1) % SlotCount;
     g.complete.push_back(index);
+    ++g_count_captures;
     while (g.complete.size() > SlotCount - 1) {
         g.complete.pop_front();
     }

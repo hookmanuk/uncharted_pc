@@ -73,6 +73,9 @@ void LogDraws();
 /// Development (DRAWLOG): compute dispatches are logged too (their shader).
 void LogDispatch(u64 cs_hash);
 
+/// The VR report: the game's 3D frames (velocity passes) and the stereo frames taken, since the last call.
+void TakeCounts(u32& renders, u32& captures);
+
 /// Development (TSHOT trigger): during the next 3000 draws, the RGBA8 target at `guest_address` is saved before each
 /// draw whose vertex shader differs from the previous one (%TEMP%\dcvr\tshot_<n>_<vs>.raw: width, height, then RGBA).
 void ShootTarget(u64 guest_address);
