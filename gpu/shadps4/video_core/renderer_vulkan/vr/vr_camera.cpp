@@ -111,6 +111,9 @@ struct Rendered {
     float position[3];
     Head head;
     float depth_term; // Uncharted: -(near / 2) * far / (far - near / 2), the frame's tagged near (TaggedRendered)
+    float shader_near = 0.f; // the tagged near as the shaders get it (TaggedRendered matches this)
+    u32 tag = 0;      // development (BB_VR_TAGLOG): the tag, and the near and far as written
+    float near_plane = 0.f, far_plane = 0.f;
 };
 constexpr u32 HistorySize = 32;
 Rendered g_history[HistorySize];
@@ -319,10 +322,13 @@ extern "C" void SceneHandler(u64* regs) {
 alignas(16) float g_input_original[16];
 alignas(16) float g_input_written[16];
 bool g_input_written_valid = false;
-// Frame tags: each frame's near plane is the game's plus k * NearStep (k = 1..63, cycling), so the frame's projection
+// Frame tags: each frame's near plane is the game's plus k * NearStep (k = 1..16, cycling), so the frame's projection
 // says which head pose it was rendered with (the GPU renders a frame or two behind this hook): the stereo capture reads
-// it back from the motion blur's velocity pass (TaggedRendered). 63 steps are 1.3 mm at most.
-constexpr float NearStep = 2e-5f;
+// it back from the motion blur's velocity pass (TaggedRendered). 16 steps are 3.2 mm at most. The step is ten times
+// the far plane's effect on the shaders' depth term (U1: 1.15e-5 at a far of 5000, 2.3e-5 at 2500, against 1e-5
+// steps before): passes drawn with another far matched no tag, or the wrong one (1.7% of frames).
+constexpr float NearStep = 2e-4f;
+constexpr u32 TagCount = 16;
 u32 g_tag = 0;
 float g_near_written = 0.f, g_near_original = 0.f;
 
@@ -401,7 +407,7 @@ extern "C" void ProjectionHandler(u64* regs) {
     params[0] = ty / tx;
     params[1] = 1.f / tx;
     g_near_original = params[2];
-    g_tag = g_tag % 63 + 1;
+    g_tag = g_tag % TagCount + 1;
     params[2] = g_near_original + float(g_tag) * NearStep;
     g_near_written = params[2];
     const float n = params[2], f = params[3];
@@ -413,6 +419,10 @@ extern "C" void ProjectionHandler(u64* regs) {
     // The near plane as the shaders get it (U1: half the view's: 0.48 in the view, 0.24 in the velocity pass).
     const float sn = n * game.shader_near;
     entry.depth_term = f > sn ? -sn * f / (f - sn) : 0.f;
+    entry.shader_near = f > sn ? sn : 0.f;
+    entry.tag = g_tag;
+    entry.near_plane = n;
+    entry.far_plane = f;
     static int told = 0; // development: the first tags written
     if (told < 12 && std::getenv("BB_VR_TAGLOG")) {
         ++told;
@@ -603,21 +613,46 @@ u32 RecentPositions(float (*positions)[3], u32 max) {
     return count;
 }
 
-bool TaggedRendered(float depth_term, float (&layer_pose)[7], float (&tangents)[4]) {
+// Matched on the near plane itself (-c9 / c8 of the velocity pass): the depth term alone also moves with the far plane,
+// and frames drawn with another far (2500 of 5000) shifted it by a whole tag step (1.7% of frames found no tag, and a
+// shift of exactly one step would match the frame before). Some velocity passes carry c8 = 1 (the near is then the
+// term's): those match on the depth term as before.
+bool TaggedRendered(float shader_near, float depth_term, float (&layer_pose)[7], float (&tangents)[4]) {
     std::scoped_lock lock{g_head_mutex};
     const u32 count = std::min(g_history_count, HistorySize);
     const Rendered* best = nullptr;
     float best_error = 0.f;
-    for (u32 n = 0; n < count; ++n) { // oldest to newest: the newest of equal matches wins
-        const Rendered& e = g_history[(g_history_count - count + n) % HistorySize];
-        const float error = std::abs(e.depth_term - depth_term);
-        if (e.depth_term != 0.f && (!best || error <= best_error)) {
-            best = &e;
-            best_error = error;
+    for (int pass = shader_near != 0.f ? 0 : 1; pass < 2; ++pass) { // the near plane, else (c8 = 1) the depth term
+        best = nullptr;
+        for (u32 n = 0; n < count; ++n) { // oldest to newest: the newest of equal matches wins
+            const Rendered& e = g_history[(g_history_count - count + n) % HistorySize];
+            const float have = pass ? e.depth_term : e.shader_near, want = pass ? depth_term : shader_near;
+            const float error = std::abs(have - want);
+            if (have != 0.f && (!best || error <= best_error)) {
+                best = &e;
+                best_error = error;
+            }
         }
+        break;
     }
     // The tags are NearStep * shader_near apart in the shaders' term.
     if (!best || best_error > NearStep * (g_game ? g_game->shader_near : 1.f) * 0.4f) {
+        static const bool log = std::getenv("BB_VR_TAGLOG") != nullptr; // development: why a frame found no tag
+        static int told = 0;
+        if (log && told < 60) {
+            ++told;
+            std::string text;
+            for (u32 n = 0; n < std::min(count, 6u); ++n) { // the newest six
+                const Rendered& e = g_history[(g_history_count - 1 - n) % HistorySize];
+                char row[96];
+                std::snprintf(row, sizeof(row), " [age %u tag %u near %.6f far %.1f shader near %.7f]", n, e.tag,
+                              e.near_plane, e.far_plane, e.shader_near);
+                text += row;
+            }
+            std::printf("VR tag miss: read %.7f, best error %.2e (tag %u);%s%c", depth_term, best_error,
+                        best ? best->tag : 0, text.c_str(), 10);
+            std::fflush(stdout);
+        }
         return false;
     }
     std::memcpy(layer_pose, best->head.layer, sizeof(layer_pose));

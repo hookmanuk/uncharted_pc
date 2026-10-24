@@ -33,9 +33,9 @@ float ScreenAspect();
 /// The pose and field of view the last player view was rendered with (for the headset layer).
 bool LastRendered(float (&layer_pose)[7], float (&tangents)[4]);
 
-/// Uncharted: the pose and field of view of the recent player view whose projection's depth term (-near * far /
-/// (far - near), the near plane tagged per frame) is `depth_term`. False when none matches.
-bool TaggedRendered(float depth_term, float (&layer_pose)[7], float (&tangents)[4]);
+/// Uncharted: the pose and field of view of the recent player view whose tagged near plane (as the shaders get it) is
+/// `shader_near`, else whose depth term (-near * far / (far - near)) is `depth_term`. False when neither matches.
+bool TaggedRendered(float shader_near, float depth_term, float (&layer_pose)[7], float (&tangents)[4]);
 
 /// The pose and field of view of the recent player view rendered from `position` (the camera's world position as the GPU
 /// sees it, the head's offset included); `distance` gets the closest match's distance.

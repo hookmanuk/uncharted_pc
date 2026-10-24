@@ -567,11 +567,15 @@ void OnVelocityConstants(const float* c, u32 dwords) {
     if (!g.ready || g_frame_pose_valid || dwords < 10) {
         return;
     }
-    g_frame_pose_valid = Camera::TaggedRendered(c[9], g_frame_layer_pose, g_frame_tangents);
+    // z = c9 / (depth - c8): c8 = f / (f - n), c9 = -n f / (f - n), so the near plane is -c9 / c8 whatever the far.
+    // c8 = 1 exactly in some passes: -c9 / c8 is then the depth term, not the near (the term is matched instead).
+    const float shader_near = c[8] > 1.000001f ? -c[9] / c[8] : 0.f;
+    g_frame_pose_valid = Camera::TaggedRendered(shader_near, c[9], g_frame_layer_pose, g_frame_tangents);
     static int told = 0; // development (BB_VR_TAGLOG): the first tags read
     if (told < 12 && std::getenv("BB_VR_TAGLOG")) {
         ++told;
-        std::printf("VR tag: read %.7f -> %d%c", c[9], int(g_frame_pose_valid), 10);
+        std::printf("VR tag: read c8 %.7f c9 %.7f near %.7f -> %d%c", c[8], c[9], shader_near, int(g_frame_pose_valid),
+                    10);
         std::fflush(stdout);
     }
 }
