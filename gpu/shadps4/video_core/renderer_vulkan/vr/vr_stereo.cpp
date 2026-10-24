@@ -1058,6 +1058,9 @@ bool CaptureAtFlip(Runtime& runtime, vk::CommandBuffer command_buffer, VideoCore
     const bool pending = g_display_draws > 0 && !g_scene_taken;
     g_display_draws = 0;
     g_scene_taken = false;
+    if (u32 w, h; Fixes::MovieRect(w, h)) {
+        return true; // a movie: the headset's screen shows it (vr_openxr.cpp), nothing to compose
+    }
     if (!pending || !g.ready || Camera::Near() <= 0.f || !Multiview::Stereo(display)) {
         return false;
     }

@@ -20,6 +20,7 @@
 #include "video_core/renderer_vulkan/vr/vr_camera.h"
 #include "video_core/renderer_vulkan/vr/vr_multiview.h"
 #include "video_core/renderer_vulkan/vr/vr_dev.h"
+#include "video_core/renderer_vulkan/vr/vr_fixes.h"
 #include "video_core/renderer_vulkan/vr/vr_openxr.h"
 #include "video_core/renderer_vulkan/vr/vr_stereo.h"
 
@@ -135,6 +136,7 @@ struct State {
         Stereo::Frame stereo{};
         float layer_pose[7]{}, tangents[4]{};
         u32 screen = 0, screen_width = 0, screen_height = 0;
+        bool movie = false; // the screen holds a movie (its own aspect, not the game's canvas)
         VkSemaphore semaphore{};
         u64 tick = 0;
         u64 serial = 0;
@@ -161,6 +163,7 @@ struct State {
     u32 flips = 0;
     u64 shown_serial = 0;       // the headset's thread: the last publication shown
     Content content = Content::None; // the headset's thread: what the swapchains hold
+    bool screen_movie = false;       // the headset's thread: the screen holds a movie
 
     // Stereo: an eye swapchain each and the HUD's (sRGB, the scene's size).
     struct Chain {
@@ -772,6 +775,7 @@ bool Show(const State::Published& p) {
         g.screen_since = std::chrono::steady_clock::now();
     }
     g.content = State::Content::Screen;
+    g.screen_movie = p.movie;
     return true;
 }
 
@@ -784,7 +788,8 @@ void EndFrame() {
     quad.subImage.imageRect = {{0, 0}, {s32(g.width), s32(g.height)}};
     quad.pose.orientation.w = 1.f;
     quad.pose.position = {0.f, 0.f, -2.5f};
-    quad.size = {3.f, 3.f / Camera::ScreenAspect()}; // the game's canvas (a square render keeps 16:9 content)
+    // The game's canvas (a square render keeps 16:9 content), or a movie's own aspect.
+    quad.size = {3.f, g.screen_movie ? 3.f * float(g.height) / float(g.width) : 3.f / Camera::ScreenAspect()};
     const XrCompositionLayerBaseHeader* layers[2] = {reinterpret_cast<XrCompositionLayerBaseHeader*>(&quad), nullptr};
     float layer_pose[7], tangents[4];
     XrCompositionLayerProjection projection{XR_TYPE_COMPOSITION_LAYER_PROJECTION};
@@ -1087,10 +1092,20 @@ void RecordFrame(vk::CommandBuffer cmd, vk::Image frame, u32 width, u32 height, 
         return;
     }
     Camera::Install();
+    // Uncharted fork: a movie goes to the screen at once (its region of the frame, its aspect).
+    u32 source_width = width, source_height = height, movie_width = 0, movie_height = 0, display_width = 0,
+        display_height = 0;
+    const bool movie = Fixes::MovieRect(movie_width, movie_height) &&
+                       Fixes::OutputSize(display_width, display_height) && movie_width <= display_width &&
+                       movie_height <= display_height;
+    if (movie) { // the frame is the display buffer scaled to the presenter's size
+        source_width = std::max(1u, u32(u64(width) * movie_width / display_width));
+        source_height = std::max(1u, u32(u64(height) * movie_height / display_height));
+    }
     // A stereo frame: published with the pose it was rendered with; the desktop window shows it.
     Stereo::Frame stereo{};
     float layer_pose[7], tangents[4];
-    if (Stereo::TakeFrame(stereo) && (stereo.has_pose || Camera::LastRendered(layer_pose, tangents)) &&
+    if (Stereo::TakeFrame(stereo) && !movie && (stereo.has_pose || Camera::LastRendered(layer_pose, tangents)) &&
         Camera::Near() > 0.f) {
         auto& p = g.pending;
         p.kind = State::Content::Stereo;
@@ -1102,11 +1117,12 @@ void RecordFrame(vk::CommandBuffer cmd, vk::Image frame, u32 width, u32 height, 
         return;
     }
     // A late frame while racing: the headset keeps the last eyes. Menus without 3D go to the screen.
-    if (g.frames_since_stereo < 45) {
+    if (g.frames_since_stereo < 45 && !movie) {
         ++g.frames_since_stereo;
         return;
     }
-    if (g.format == VK_FORMAT_UNDEFINED || !MakeScreens(width, height)) {
+    g.frames_since_stereo = 45;
+    if (g.format == VK_FORMAT_UNDEFINED || !MakeScreens(source_width, source_height)) {
         return;
     }
     const u32 index = g.screen_next;
@@ -1116,17 +1132,18 @@ void RecordFrame(vk::CommandBuffer cmd, vk::Image frame, u32 width, u32 height, 
     Barrier(c, target, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 0, VK_ACCESS_TRANSFER_WRITE_BIT);
     VkImageBlit blit{};
     blit.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
-    blit.srcOffsets[1] = {s32(width), s32(height), 1};
+    blit.srcOffsets[1] = {s32(source_width), s32(source_height), 1};
     blit.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
-    blit.dstOffsets[1] = {s32(width), s32(height), 1};
+    blit.dstOffsets[1] = {s32(source_width), s32(source_height), 1};
     VULKAN_HPP_DEFAULT_DISPATCHER.vkCmdBlitImage(c, VkImage(frame), VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, target,
                                                  VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &blit, VK_FILTER_LINEAR);
     Barrier(c, target, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
             VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT);
     g.pending.kind = State::Content::Screen;
     g.pending.screen = index;
-    g.pending.screen_width = width;
-    g.pending.screen_height = height;
+    g.pending.screen_width = source_width;
+    g.pending.screen_height = source_height;
+    g.pending.movie = movie;
 }
 
 float StereoBaseline() {
