@@ -37,9 +37,15 @@ void NoteMovieFrame(u64 buffer, u32 pitch, u32 width, u32 height, u32 rows);
 /// chroma read from the next frame's buffer); they become the decoded frame's layout.
 void FixMovieImages(const Shader::Info& cs);
 
-/// A movie plays (its shader ran in the last 0.3 s): its size, drawn at the display buffer's top left (the shader
-/// copies texels: at a square render size the rest of the buffer is the frame's edge repeated). The headset shows that
-/// region on the screen at the movie's aspect, not stereo.
+/// The video decoder, VR (Uncharted fork): the canvas movies are fitted into (black bars, the movie's shape kept), as
+/// the community build's BB_GAME_RES display size: the render size's shape in a 1080p frame's buffer (1408 x 1408 for a
+/// square). The movie shader stretches the canvas over the display buffer (vk_shader_util.cpp), so a movie keeps its
+/// shape on the headset's screen at the canvas's aspect, as the menus drawn over it do. False outside VR (`width`,
+/// `height` untouched).
+bool MovieCanvas(s32& width, s32& height);
+
+/// A movie plays (its shader ran in the last 0.3 s): its size. It fills the display buffer (MovieCanvas): the headset
+/// shows the whole frame on the screen, not stereo.
 bool MovieRect(u32& width, u32& height);
 
 } // namespace Vulkan::Vr::Fixes

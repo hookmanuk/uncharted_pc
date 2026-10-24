@@ -138,7 +138,6 @@ struct State {
         Stereo::Frame stereo{};
         float layer_pose[7]{}, tangents[4]{};
         u32 screen = 0, screen_width = 0, screen_height = 0;
-        bool movie = false; // the screen holds a movie (its own aspect, not the game's canvas)
         VkSemaphore semaphore{};
         u64 tick = 0;
         u64 serial = 0;
@@ -166,7 +165,6 @@ struct State {
     u32 flips = 0;
     u64 shown_serial = 0;       // the headset's thread: the last publication shown
     Content content = Content::None; // the headset's thread: what the swapchains hold
-    bool screen_movie = false;       // the headset's thread: the screen holds a movie
 
     // Stereo: an eye swapchain each and the HUD's (sRGB, the scene's size).
     struct Chain {
@@ -829,7 +827,6 @@ bool Show(const State::Published& p) {
         g.screen_since = std::chrono::steady_clock::now();
     }
     g.content = State::Content::Screen;
-    g.screen_movie = p.movie;
     return true;
 }
 
@@ -842,8 +839,8 @@ void EndFrame() {
     quad.subImage.imageRect = {{0, 0}, {s32(g.width), s32(g.height)}};
     quad.pose.orientation.w = 1.f;
     quad.pose.position = {0.f, 0.f, -2.5f};
-    // The game's canvas (a square render keeps 16:9 content), or a movie's own aspect.
-    quad.size = {3.f, g.screen_movie ? 3.f * float(g.height) / float(g.width) : 3.f / Camera::ScreenAspect()};
+    // The game's canvas (a square render keeps 16:9 content; movies are fitted into it: Fixes::MovieCanvas).
+    quad.size = {3.f, 3.f / Camera::ScreenAspect()};
     const XrCompositionLayerBaseHeader* layers[2] = {reinterpret_cast<XrCompositionLayerBaseHeader*>(&quad), nullptr};
     float layer_pose[7], tangents[4];
     XrCompositionLayerProjection projection{XR_TYPE_COMPOSITION_LAYER_PROJECTION};
@@ -1173,16 +1170,10 @@ void RecordFrame(vk::CommandBuffer cmd, vk::Image frame, u32 width, u32 height, 
         return;
     }
     Camera::Install();
-    // Uncharted fork: a movie goes to the screen at once (its region of the frame, its aspect).
-    u32 source_width = width, source_height = height, movie_width = 0, movie_height = 0, display_width = 0,
-        display_height = 0;
-    const bool movie = Fixes::MovieRect(movie_width, movie_height) &&
-                       Fixes::OutputSize(display_width, display_height) && movie_width <= display_width &&
-                       movie_height <= display_height;
-    if (movie) { // the frame is the display buffer scaled to the presenter's size
-        source_width = std::max(1u, u32(u64(width) * movie_width / display_width));
-        source_height = std::max(1u, u32(u64(height) * movie_height / display_height));
-    }
+    // Uncharted fork: a movie goes to the screen at once (the whole frame: Fixes::MovieCanvas).
+    const u32 source_width = width, source_height = height;
+    u32 movie_width = 0, movie_height = 0;
+    const bool movie = Fixes::MovieRect(movie_width, movie_height);
     // A stereo frame: published with the pose it was rendered with; the desktop window shows it.
     Stereo::Frame stereo{};
     float layer_pose[7], tangents[4];
@@ -1224,7 +1215,6 @@ void RecordFrame(vk::CommandBuffer cmd, vk::Image frame, u32 width, u32 height, 
     g.pending.screen = index;
     g.pending.screen_width = source_width;
     g.pending.screen_height = source_height;
-    g.pending.movie = movie;
 }
 
 float StereoBaseline() {

@@ -97,6 +97,15 @@ ALLOC64 = [  # (pattern, offset in the match, original, new); the first: every m
 # HeapArena::Allocate's stack protector check (its store is gone): the first after its prologue.
 ALLOC64_CHECK = rb'\x48[\x8b\x8d]\x0d....\x48\x8b\x09\x48\x3b\x4d\xd0\x75'
 
+# The object motion blur (the Display menu's Motion Blur, "Object" by default) is off in VR: characters were smeared
+# along the head's turn (their previous positions are taken with the game's camera, the head's motion counted as
+# theirs; Matt 2026-10-24, gone with the menu's Off). The options' getter (U1 +0x135100) reads two bytes of a settings
+# block: +0x1ba object blur, +0x1b9 camera blur; the renderer's one check of +0x1ba (U1 +0x4db75f, U2 +0x6674af, U3
+# +0x614b4f, the same code) skips the object blur on 0: its je becomes a jmp. The menu keeps the player's choice.
+BLUR_GETTER = rb'\x48\x8d\x05(....)\x0f\xb6\x88\xba\x01\x00\x00\x80\xb8\xb9\x01\x00\x00\x00\x74.\xb8\x02\x00\x00\x00'
+BLUR_CHECK = (rb'\x48\x8d\x05(....)\x80\xb8\xba\x01\x00\x00\x00\x4c\x8b\xa5....\x48\x8b\x85....\x48\x8b\x8d....'
+              rb'(\x0f\x84\xc3\x00\x00\x00)')
+
 # The GPU context with the 64-bit arena: the direct memory and the render target heaps grow to the eye size.
 GPU_CONTEXT_LIMIT_64 = (12288 - 2) << 20
 if os.environ.get('VR_GPU_CONTEXT_MB'):  # development: another limit
@@ -244,6 +253,21 @@ def alloc64_patches(elf):
     return out
 
 
+def motion_blur_patch(elf):
+    """The object motion blur check's je as a jmp (BLUR_CHECK), or None when the code is not found exactly once."""
+    import re
+    vaddr, code = code_segment(elf)
+    getters = list(re.finditer(BLUR_GETTER, code, re.S))
+    if len(getters) != 1:
+        return None
+    settings = vaddr + getters[0].start() + 7 + struct.unpack('<i', getters[0].group(1))[0]
+    checks = [m for m in re.finditer(BLUR_CHECK, code, re.S)
+              if vaddr + m.start() + 7 + struct.unpack('<i', m.group(1))[0] == settings]
+    if len(checks) != 1:
+        return None
+    return vaddr + checks[0].start(2), b'\xe9\xc4\x00\x00\x00\x90'  # jmp to the je's target (one byte shorter)
+
+
 def patches(elf, sites, size, fields):
     sites, scaled, (heaps, spare), context, system, arena, table = sites
     out = []
@@ -330,6 +354,9 @@ def main():
     if found is None:
         print(f'VR: {exe} is not the version the render size patch knows: 1920x1080 kept')
         return 0
+    blur = motion_blur_patch(elf_path.read_bytes())
+    if blur:
+        found.append(blur)
     with target.open('wb') as f:
         f.write(b'BBPATCH2' + struct.pack('<QQ', 0x400000, len(found)))
         for offset, data in found:

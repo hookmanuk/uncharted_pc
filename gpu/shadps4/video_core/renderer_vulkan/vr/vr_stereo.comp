@@ -18,7 +18,7 @@ layout(push_constant) uniform Constants {
     ivec2 size;     // eye image = scene image size
     ivec2 depth_size;
     float k;        // pixels of shift per unit of reversed depth
-    float pad[3];
+    float pad[3];   // MIRROR: pad[0] 1 when the images hold BGRA bytes
 };
 
 #if MIRROR
@@ -32,8 +32,10 @@ void main() {
         return;
     }
     const vec4 h = imageLoad(hud, p);
-    // The images hold the display buffer's bytes (BGRA order); the window's blit converts by channel name.
-    imageStore(mirror, p, vec4((h.rgb + (1.0 - h.a) * imageLoad(eye, p).rgb).bgr, 1.0));
+    // The images hold the display buffer's bytes (BGRA in Driveclub, RGBA in Uncharted); the window's blit converts by
+    // channel name.
+    const vec3 c = h.rgb + (1.0 - h.a) * imageLoad(eye, p).rgb;
+    imageStore(mirror, p, vec4(pad[0] > 0.5 ? c.bgr : c, 1.0));
 }
 #elif SPLAT
 layout(binding = 0) uniform sampler2D depth_tex;

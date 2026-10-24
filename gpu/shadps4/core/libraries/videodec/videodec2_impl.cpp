@@ -379,6 +379,7 @@ void GameResolution(s32& width, s32& height) {
             w = static_cast<s32>(pw & ~1u);
             h = static_cast<s32>(ph & ~1u);
         }
+        Vulkan::Vr::Fixes::MovieCanvas(w, h); // VR: movies fitted into the eye's square
     }
     width = w;
     height = h;

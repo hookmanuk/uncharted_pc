@@ -1479,6 +1479,11 @@ void Rasterizer::DrawRecord(const GraphicsPipeline* pipeline, const PreparedDraw
     motion_geometry = 0;
 
     PrepareRenderState(pipeline);
+    Vr::Stereo::LogFragmentImages(pipeline->GetStage(Shader::SwStage::Vertex), // VR: development (FSIMG)
+                                  pipeline->GetStages()[u32(Shader::SwStage::Fragment)],
+                                  std::bit_cast<u32>(regs.depth_control), std::bit_cast<u32>(regs.stencil_control),
+                                  std::bit_cast<u32>(regs.stencil_ref_front), regs.num_indices,
+                                  regs.num_instances.NumInstances());
     Vr::Stereo::OnDraw(scheduler, runtime, texture_cache, pipeline->GetStage(Shader::SwStage::Vertex), // VR
                        pipeline->GetStages()[u32(Shader::SwStage::Fragment)], pipeline->GetGraphicsKey(),
                        cb_descs[0].first, cb_descs[2].first, db_desc.first);
@@ -3247,7 +3252,8 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, const PreparedStage* pre
         set_write.descriptorCount = 1;
         set_write.descriptorType = vk::DescriptorType::eStorageBuffer;
         set_write.pBufferInfo = &buffer_infos.back();
-        Vr::Multiview::EyeBufferWrite(instance, runtime, desc.IsSpecial(), set_write, buffer_infos); // VR: per eye
+        Vr::Multiview::EyeBufferWrite(instance, runtime, desc.IsSpecial(), set_write, buffer_infos, stage.pgm_hash,
+                                      buffer_index); // VR: per eye
         ++binding.buffer;
     }
 }

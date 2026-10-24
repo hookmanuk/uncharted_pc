@@ -48,7 +48,8 @@ static void PatchMotionAddresses(std::vector<u32>& code) {
 static bool PatchMovieScale(std::vector<u32>& code) {
     static const std::pair<u32, u32> size = [] {
         unsigned w = 0, h = 0;
-        const char* res = std::getenv("BB_GAME_RES");
+        const char* res = std::getenv("BB_VR_RENDER_SIZE") ? std::getenv("BB_VR_RENDER_SIZE") // VR: the eye size
+                                                            : std::getenv("BB_GAME_RES");
         if (!res || std::sscanf(res, "%ux%u", &w, &h) != 2 || w < 640 || h < 360 ||
             (w == 1920 && h == 1080)) {
             return std::pair<u32, u32>{0, 0};
@@ -119,7 +120,7 @@ vk::ShaderModule CompileSPV(std::span<const u32> code, vk::Device device) {
         }
     }
     std::vector<u32> movie_patched;
-    if (code.size() > 5 && std::getenv("BB_GAME_RES")) {
+    if (code.size() > 5 && (std::getenv("BB_GAME_RES") || std::getenv("BB_VR_RENDER_SIZE"))) { // VR: eye size
         // Cheap pre-check before copying: the 1 / 1920 constant.
         float inv = 1.0f / 1920.0f;
         u32 inv_bits;

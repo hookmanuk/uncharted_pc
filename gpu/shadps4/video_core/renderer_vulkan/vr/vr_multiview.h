@@ -185,6 +185,28 @@ void EyeBufferWrite(const Instance& instance, Runtime& runtime, bool special, vk
     }
 }
 
+/// Per-eye constants (Uncharted fork): the binding NoteBuffer saw, when it is the constants of a full-screen pass that
+/// rebuilds each pixel's view position from its eye's depth with the centre camera's ray (the cascaded shadow resolve):
+/// `left` and `right` its eyes' copies, each moved by its eye's offset. False otherwise (the binding is kept for
+/// EyeBufferInfo).
+bool EyeConstants(const Instance& instance, u64 stage_hash, u32 buffer_index, vk::DescriptorBufferInfo& left,
+                  vk::DescriptorBufferInfo& right);
+
+/// EyeBufferWrite, with the stage and the binding's index: per-eye constants (EyeConstants) first.
+template <typename Infos>
+void EyeBufferWrite(const Instance& instance, Runtime& runtime, bool special, vk::WriteDescriptorSet& write,
+                    Infos& infos, u64 stage_hash, u32 buffer_index) {
+    vk::DescriptorBufferInfo left, right;
+    if (!special && EyeConstants(instance, stage_hash, buffer_index, left, right)) {
+        infos.back() = left;
+        infos.push_back(right);
+        write.descriptorCount = 2;
+        write.pBufferInfo = &infos[infos.size() - 2];
+        return;
+    }
+    EyeBufferWrite(instance, runtime, special, write, infos);
+}
+
 /// Development audit (BB_VR_AUDIT=1): a read-only buffer bound from the constant ring (the player camera's
 /// constants are found among them).
 void NoteRingBuffer(u64 address, u64 size);

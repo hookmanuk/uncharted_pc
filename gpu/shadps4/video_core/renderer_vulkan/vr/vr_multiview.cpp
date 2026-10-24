@@ -16,10 +16,12 @@
 #include <vector>
 
 #include "video_core/buffer_cache/buffer.h"
+#include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_runtime.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
 #include "video_core/renderer_vulkan/vr/vr_fixes.h"
 #include "video_core/renderer_vulkan/vr/vr_multiview.h"
+#include "video_core/renderer_vulkan/vr/vr_openxr.h"
 #include "video_core/texture_cache/image.h"
 #include "video_core/texture_cache/image_view.h"
 
@@ -710,6 +712,72 @@ std::optional<vk::DescriptorBufferInfo> EyeBufferInfo(const Instance& instance, 
         break;
     }
     return second;
+}
+
+// The collection's cascaded shadow resolve (ps 0x7c219ffb, full screen): a pixel's view position is the centre camera's
+// ray through it times the eye's depth, so in each eye the points sat the eye's offset away from where they are (half
+// the eye distance, opposite ways) and each eye tested the shadow maps elsewhere: the shadows differed between the eyes
+// (Matt 2026-10-24: a far bigger shadow on a crate in the left eye). Its buffer 0: four cascades of 16 floats, the
+// split distance then the rows taking the view position (x, y, z, 1) to the shadow map's x, y and depth; each eye's
+// copy moves the rows' translation by row . e, e the eye's offset in that view space: the camera's axes (x left, y
+// up, z forward: its z is the positive depth, the projection's P00 negative), so the left eye is half the eye
+// distance along +x (BB_VR_SHADOW_EYE_SIGN=1 turns it). BB_VR_SHADOW_EYES=0 turns it off.
+constexpr u64 ShadowResolvePs = 0x7c219ffb;
+constexpr u32 ShadowCascades = 4, ShadowCascadeFloats = 16;
+
+std::unique_ptr<VideoCore::Buffer> g_eye_constants; // the per-eye copies, a ring (a few KB a frame, 256 KB)
+u64 g_eye_constants_next = 0;
+
+bool EyeConstants(const Instance& instance, u64 stage_hash, u32 buffer_index, vk::DescriptorBufferInfo& left,
+                  vk::DescriptorBufferInfo& right) {
+    static const bool on = [] {
+        const char* v = std::getenv("BB_VR_SHADOW_EYES");
+        return !(v && v[0] == '0');
+    }();
+    static const float sign = [] {
+        const char* v = std::getenv("BB_VR_SHADOW_EYE_SIGN");
+        return v && v[0] == '1' ? -1.f : 1.f;
+    }();
+    const auto binding = t_eye_binding;
+    constexpr u32 bytes = ShadowCascades * ShadowCascadeFloats * 4;
+    if (!on || !g_enabled || stage_hash != ShadowResolvePs || buffer_index != 0 || !binding.valid ||
+        binding.size < bytes || binding.adjust > 256 || !binding.address) {
+        return false;
+    }
+    const float half = 0.5f * StereoBaseline();
+    std::scoped_lock lock{g_eye_mutex};
+    constexpr u64 RingBytes = 256 * 1024;
+    if (!g_eye_constants) {
+        g_eye_constants = std::make_unique<VideoCore::Buffer>(instance, 0, RingBytes, VideoCore::MemoryType::Stream,
+                                                              "VR per-eye constants");
+    }
+    if (g_eye_constants->mapped_data.empty()) {
+        return false;
+    }
+    const u64 alignment = std::max<u64>(instance.StorageMinAlignment(), 16);
+    const u64 range = binding.adjust + binding.size;
+    vk::DescriptorBufferInfo* infos[2] = {&left, &right};
+    for (int eye = 0; eye < 2; ++eye) {
+        u64 offset = (g_eye_constants_next + alignment - 1) / alignment * alignment;
+        if (offset + range > RingBytes) {
+            offset = 0;
+        }
+        g_eye_constants_next = offset + range;
+        u8* dst = g_eye_constants->mapped_data.data() + offset;
+        std::memset(dst, 0, binding.adjust);
+        std::memcpy(dst + binding.adjust, reinterpret_cast<const void*>(binding.address), binding.size);
+        auto* f = reinterpret_cast<float*>(dst + binding.adjust);
+        const float ex = sign * (eye == 0 ? half : -half); // x points left: the left eye at +x
+        for (u32 c = 0; c < ShadowCascades; ++c) {
+            for (u32 row = 1; row <= 3; ++row) {
+                float* r = f + c * ShadowCascadeFloats + row * 4;
+                r[3] += r[0] * ex;
+            }
+        }
+        *infos[eye] = vk::DescriptorBufferInfo{g_eye_constants->Handle(), offset, range};
+    }
+    t_eye_binding = {};
+    return true;
 }
 
 std::span<const vk::BufferImageCopy> StereoUploads(const VideoCore::Image& dst,

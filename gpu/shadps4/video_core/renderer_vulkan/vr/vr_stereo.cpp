@@ -765,6 +765,31 @@ void LogFragmentImages(const Shader::Info& vs, const Shader::Info* fs, u32 depth
         }
     }
     std::printf("\n");
+    // BB_VR_FSIMG_DATA=<fs hash>: that pixel shader's constant buffers as floats (up to 128 each), as the draw reads them.
+    static const u64 data_fs = [] {
+        const char* v = std::getenv("BB_VR_FSIMG_DATA");
+        return v ? u64(std::strtoull(v, nullptr, 16)) : u64(0);
+    }();
+    if (data_fs && fs->pgm_hash == data_fs) {
+        for (u32 i = 0; i < vs.buffers.size(); ++i) { // the vertex shader's too (buffers 100 + i)
+            const auto sharp = vs.buffers[i].GetSharp(vs);
+            const u32 count = std::min(u32(sharp.GetSize()) / 4, 128u);
+            const auto* f = reinterpret_cast<const float*>(sharp.base_address);
+            for (u32 k = 0; f && k + 3 < count; k += 4) {
+                std::printf("VR fs data: buffer %u dword %3u: %.6g %.6g %.6g %.6g\n", 100 + i, k, f[k], f[k + 1],
+                            f[k + 2], f[k + 3]);
+            }
+        }
+        for (u32 i = 0; i < fs->buffers.size(); ++i) {
+            const auto sharp = fs->buffers[i].GetSharp(*fs);
+            const u32 count = std::min(u32(sharp.GetSize()) / 4, 128u);
+            const auto* f = reinterpret_cast<const float*>(sharp.base_address);
+            for (u32 k = 0; f && k + 3 < count; k += 4) {
+                std::printf("VR fs data: buffer %u dword %3u: %.6g %.6g %.6g %.6g\n", i, k, f[k], f[k + 1], f[k + 2],
+                            f[k + 3]);
+            }
+        }
+    }
     std::fflush(stdout);
 }
 
@@ -1413,7 +1438,7 @@ void RecordMirror(vk::CommandBuffer command_buffer, const Frame& frame, VkImage 
     Slot& slot = g.slots[frame.slot];
     const u32 w = frame.width, h = frame.height;
     const VkImageSubresourceRange range{VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
-    const Push push_base{s32(w), s32(h), s32(slot.depth.width), s32(slot.depth.height), 0.f, {}};
+    const Push push_base{s32(w), s32(h), s32(slot.depth.width), s32(slot.depth.height), 0.f, {slot.rgba ? 0.f : 1.f}};
     if (window && slot.has_hud && Make(g.mirror, VK_FORMAT_R8G8B8A8_UNORM, w, h,
                                        VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT)) {
         // The desktop window: the HUD over the (left eye's) scene, fitted into the window (already cleared and holding

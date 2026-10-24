@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 // VR (dcport-vr): see vr_fixes.h.
 
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <array>
@@ -56,6 +57,19 @@ bool RenderSize(u32& width, u32& height) {
 
 bool OutputSize(u32& width, u32& height) {
     return RenderSize(width, height);
+}
+
+bool MovieCanvas(s32& width, s32& height) {
+    u32 w = 0, h = 0;
+    const char* res = std::getenv("BB_VR_RENDER_SIZE");
+    if (!res || std::sscanf(res, "%ux%u", &w, &h) != 2 || !w || !h) {
+        return false;
+    }
+    // The games' movie buffers hold a 1080p frame (1920 x 1088 NV12; they do not ask the decoder for more): the largest
+    // canvas of the render's shape in as many pixels, rows a multiple of 64 and the pitch of 16 (the decoder's copy).
+    height = s32(std::sqrt(1920.0 * 1088.0 * h / w)) & ~63;
+    width = s32(u64(height) * w / h) & ~15;
+    return true;
 }
 
 void PatchShader(u64 hash, std::vector<u32>& spirv) {
