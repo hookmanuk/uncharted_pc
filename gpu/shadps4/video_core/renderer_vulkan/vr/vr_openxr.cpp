@@ -138,6 +138,7 @@ struct State {
         Stereo::Frame stereo{};
         float layer_pose[7]{}, tangents[4]{};
         u32 screen = 0, screen_width = 0, screen_height = 0;
+        bool movie = false; // a screen frame with a movie (fitted into the render's shape: Fixes::MovieCanvas)
         VkSemaphore semaphore{};
         u64 tick = 0;
         u64 serial = 0;
@@ -165,6 +166,7 @@ struct State {
     u32 flips = 0;
     u64 shown_serial = 0;       // the headset's thread: the last publication shown
     Content content = Content::None; // the headset's thread: what the swapchains hold
+    bool shown_movie = false;          // the headset's thread: the shown screen frame has a movie
 
     // Stereo: an eye swapchain each and the HUD's (sRGB, the scene's size).
     struct Chain {
@@ -827,6 +829,7 @@ bool Show(const State::Published& p) {
         g.screen_since = std::chrono::steady_clock::now();
     }
     g.content = State::Content::Screen;
+    g.shown_movie = p.movie;
     return true;
 }
 
@@ -839,8 +842,9 @@ void EndFrame() {
     quad.subImage.imageRect = {{0, 0}, {s32(g.width), s32(g.height)}};
     quad.pose.orientation.w = 1.f;
     quad.pose.position = {0.f, 0.f, -2.5f};
-    // The game's canvas (a square render keeps 16:9 content; movies are fitted into it: Fixes::MovieCanvas).
-    quad.size = {3.f, 3.f / Camera::ScreenAspect()};
+    // A movie is fitted into the render's shape (Fixes::MovieCanvas): the screen at that shape. The menus are laid out
+    // for 16:9 whatever the render's shape (Matt 2026-10-26: a round button tall in a square render): 16:9.
+    quad.size = {3.f, 3.f / (g.shown_movie ? Camera::ScreenAspect() : 16.f / 9.f)};
     const XrCompositionLayerBaseHeader* layers[2] = {reinterpret_cast<XrCompositionLayerBaseHeader*>(&quad), nullptr};
     float layer_pose[7], tangents[4];
     XrCompositionLayerProjection projection{XR_TYPE_COMPOSITION_LAYER_PROJECTION};
@@ -1215,6 +1219,7 @@ void RecordFrame(vk::CommandBuffer cmd, vk::Image frame, u32 width, u32 height, 
     g.pending.screen = index;
     g.pending.screen_width = source_width;
     g.pending.screen_height = source_height;
+    g.pending.movie = movie;
 }
 
 float StereoBaseline() {
