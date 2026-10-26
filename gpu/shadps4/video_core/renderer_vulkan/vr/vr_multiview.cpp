@@ -719,9 +719,10 @@ std::optional<vk::DescriptorBufferInfo> EyeBufferInfo(const Instance& instance, 
 // the eye distance, opposite ways) and each eye tested the shadow maps elsewhere: the shadows differed between the eyes
 // (Matt 2026-10-24: a far bigger shadow on a crate in the left eye). Its buffer 0: four cascades of 16 floats, the
 // split distance then the rows taking the view position (x, y, z, 1) to the shadow map's x, y and depth; each eye's
-// copy moves the rows' translation by row . e, e the eye's offset in that view space: the camera's axes (x left, y
-// up, z forward: its z is the positive depth, the projection's P00 negative), so the left eye is half the eye
-// distance along +x (BB_VR_SHADOW_EYE_SIGN=1 turns it). BB_VR_SHADOW_EYES=0 turns it off.
+// copy moves the rows' translation by row . e, e the eye's offset in that view space, half the eye distance along x:
+// the left eye at -x. (The first try put it at +x, reading the projection's negative P00 as x pointing left: the eyes
+// then disagreed twice as much. Matt 2026-10-26, a crate's rim shadow in one eye only; at his save both eyes match
+// with -x. BB_VR_SHADOW_EYE_SIGN=1 turns it back.) BB_VR_SHADOW_EYES=0 turns it off.
 constexpr u64 ShadowResolvePs = 0x7c219ffb;
 constexpr u32 ShadowCascades = 4, ShadowCascadeFloats = 16;
 
@@ -767,7 +768,7 @@ bool EyeConstants(const Instance& instance, u64 stage_hash, u32 buffer_index, vk
         std::memset(dst, 0, binding.adjust);
         std::memcpy(dst + binding.adjust, reinterpret_cast<const void*>(binding.address), binding.size);
         auto* f = reinterpret_cast<float*>(dst + binding.adjust);
-        const float ex = sign * (eye == 0 ? half : -half); // x points left: the left eye at +x
+        const float ex = sign * (eye == 0 ? -half : half); // the left eye at -x
         for (u32 c = 0; c < ShadowCascades; ++c) {
             for (u32 row = 1; row <= 3; ++row) {
                 float* r = f + c * ShadowCascadeFloats + row * 4;
