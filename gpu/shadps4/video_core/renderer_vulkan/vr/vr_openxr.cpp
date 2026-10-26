@@ -565,6 +565,13 @@ void Barrier(VkCommandBuffer cmd, VkImage image, VkImageLayout from, VkImageLayo
                          nullptr, 1, &barrier);
 }
 
+// Development (BB_VR_IPD, or the IPD trigger file): the eye distance in metres; 0 draws both eyes at the head, for
+// ground truths (the head moved to an eye renders what that eye should see). Below 0: the runtime's.
+std::atomic<float> g_ipd_override{[] {
+    const char* v = std::getenv("BB_VR_IPD");
+    return v ? float(std::atof(v)) : -1.f;
+}()};
+
 // The head in the LOCAL space at the predicted display time, and the union of the eyes' fields of view, for the camera.
 void UpdateHead() {
     XrSpaceLocation location{XR_TYPE_SPACE_LOCATION};
@@ -645,6 +652,9 @@ void UpdateHead() {
                 ey = views[1].pose.position.y - views[0].pose.position.y,
                 ez = views[1].pose.position.z - views[0].pose.position.z;
     g.ipd = std::sqrt(ex * ex + ey * ey + ez * ez);
+    if (const float ipd = g_ipd_override.load(std::memory_order_relaxed); ipd >= 0.f) {
+        g.ipd = ipd;
+    }
 }
 
 
@@ -1220,6 +1230,10 @@ void RecordFrame(vk::CommandBuffer cmd, vk::Image frame, u32 width, u32 height, 
     g.pending.screen_width = source_width;
     g.pending.screen_height = source_height;
     g.pending.movie = movie;
+}
+
+void SetIpdOverride(float ipd) {
+    g_ipd_override.store(ipd, std::memory_order_relaxed);
 }
 
 float StereoBaseline() {

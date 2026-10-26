@@ -89,6 +89,7 @@ vk::Pipeline Variant(vk::Pipeline pipeline, u16 view_mask);
 
 /// Each frame: the eyes' clip x shift (left eye +shift, right eye -shift; P00 x half the eye distance).
 void SetShift(float shift);
+void SetShadowEyeScale(float scale); // development: the per-eye shadow correction's scale (1 normal, 0 off)
 /// Deferred spot lights (vs 0xf719615a with pixel shaders 0xd80f041b, 0x7b2b16ed): the pixel shader rebuilds the lit
 /// point as light constants plus the view ray times the depth (light-relative: dwords 40-42 minus the ray; light
 /// space: dwords 44-46 plus the light-space ray, the light matrix being dwords 24-34). The vertex shader gives each eye
@@ -207,9 +208,9 @@ void EyeBufferWrite(const Instance& instance, Runtime& runtime, bool special, vk
     EyeBufferWrite(instance, runtime, special, write, infos);
 }
 
-/// Development audit (BB_VR_AUDIT=1): a read-only buffer bound from the constant ring (the player camera's
-/// constants are found among them).
-void NoteRingBuffer(u64 address, u64 size);
+/// A read-only buffer bound from the constant ring, `data` the ring's copy: for per-eye constants (EyeConstants), and
+/// the development audit (BB_VR_AUDIT=1) finds the player camera's constants among them.
+void NoteRingBuffer(u64 address, u64 size, const void* data);
 
 /// Development audit (BB_VR_AUDIT=1): an image copy (`what`) touching a two-layer image, once per kind.
 void AuditCopy(const char* what, const VideoCore::Image& src, const VideoCore::Image& dst);

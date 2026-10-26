@@ -72,6 +72,7 @@ void OnDeviceCreated(VkInstance instance, VkPhysicalDevice physical_device, VkDe
 /// and records the copy of the frame into this frame's layer image.
 /// The distance between the eyes (the headset's IPD times BB_VR_WORLD_SCALE), in metres.
 float StereoBaseline();
+void SetIpdOverride(float ipd); // development: the eye distance in metres (below 0: the runtime's)
 
 void RecordFrame(vk::CommandBuffer cmd, vk::Image frame, u32 width, u32 height, vk::Image window = {},
                  u32 window_width = 0, u32 window_height = 0);

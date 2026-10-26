@@ -552,13 +552,6 @@ bool MainCameraConstants(u64 address, u64 size) {
     return f[96] == float(w) && f[97] == float(h);
 }
 
-void NoteRingBuffer(u64 address, u64 size) {
-    if (g_audit && MainCameraConstants(address, size)) {
-        std::scoped_lock lock{g_audit_mutex};
-        g_audit_main_camera = true;
-    }
-}
-
 void AuditCopy(const char* what, const VideoCore::Image& src, const VideoCore::Image& dst) {
     if (!g_audit || (!Stereo(src) && !Stereo(dst))) {
         return;
@@ -592,6 +585,7 @@ thread_local struct {
     u64 address, size, adjust;
     bool valid;
     bool eye_write; // written by a per-eye compute: the right eye's copy starts from the buffer as it is now
+    const void* ring_data; // bound from the constant ring: its copy of the constants (no per-eye buffer)
 } t_eye_binding{};
 
 bool EyeCompute(u64 hash) {
@@ -618,8 +612,16 @@ bool EyeCompute(u64 hash) {
     return std::find(list.begin(), list.end(), hash) != list.end();
 }
 
+void NoteRingBuffer(u64 address, u64 size, const void* data) {
+    t_eye_binding = {address, size, 0, true, false, data};
+    if (g_audit && MainCameraConstants(address, size)) {
+        std::scoped_lock lock{g_audit_mutex};
+        g_audit_main_camera = true;
+    }
+}
+
 void NoteBuffer(u64 address, u64 size, bool written, u64 adjust) {
-    t_eye_binding = {address, size, adjust, true, false};
+    t_eye_binding = {address, size, adjust, true, false, nullptr};
     if (g_enabled && written && size && EyeCompute(g_dispatch_hash)) {
         t_eye_binding.eye_write = true;
         std::scoped_lock lock{g_eye_mutex};
@@ -669,7 +671,7 @@ std::optional<vk::DescriptorBufferInfo> EyeBufferInfo(const Instance& instance, 
         return std::nullopt;
     }
     vk::DescriptorBufferInfo second = first;
-    if (!g_enabled || !binding.valid || !first.buffer) {
+    if (!g_enabled || !binding.valid || binding.ring_data || !first.buffer) {
         return second;
     }
     std::scoped_lock lock{g_eye_mutex};
@@ -717,14 +719,25 @@ std::optional<vk::DescriptorBufferInfo> EyeBufferInfo(const Instance& instance, 
 // The collection's cascaded shadow resolve (ps 0x7c219ffb, full screen): a pixel's view position is the centre camera's
 // ray through it times the eye's depth, so in each eye the points sat the eye's offset away from where they are (half
 // the eye distance, opposite ways) and each eye tested the shadow maps elsewhere: the shadows differed between the eyes
-// (Matt 2026-10-24: a far bigger shadow on a crate in the left eye). Its buffer 0: four cascades of 16 floats, the
-// split distance then the rows taking the view position (x, y, z, 1) to the shadow map's x, y and depth; each eye's
-// copy moves the rows' translation by row . e, e the eye's offset in that view space, half the eye distance along x:
-// the left eye at -x. (The first try put it at +x, reading the projection's negative P00 as x pointing left: the eyes
-// then disagreed twice as much. Matt 2026-10-26, a crate's rim shadow in one eye only; at his save both eyes match
-// with -x. BB_VR_SHADOW_EYE_SIGN=1 turns it back.) BB_VR_SHADOW_EYES=0 turns it off.
+// (Matt 2026-10-24: a far bigger shadow on a crate in the left eye). Its buffer 2 (from the constant ring): four
+// cascades of 16 floats, rows 1-3 taking (u z, v z, z, 1) to the shadow map's x, y and depth: u, v the pixel's texture
+// coordinates, z its view depth (the unprojection is in the rows); buffer 0 holds the split distances. An eye's clip
+// shift s (left +s, right -s) moves its u by s / 2w, so the eye's u z is the centre's plus s / 2: each eye's copy moves
+// the rows' translation by row.x x -s / 2 (left eye -s / 2). (The first two tries patched buffer 0, read through
+// NoteBuffer, which never sees the ring's constants: they never ran. Matt 2026-10-26, after both: the crate to the
+// right of Nathan in shadow in one eye only.) BB_VR_SHADOW_EYE_SCALE scales it (development), BB_VR_SHADOW_EYE_SIGN=1
+// reverses it, BB_VR_SHADOW_EYES=0 turns it off.
 constexpr u64 ShadowResolvePs = 0x7c219ffb;
 constexpr u32 ShadowCascades = 4, ShadowCascadeFloats = 16;
+
+std::atomic<float> g_shadow_eye_scale{[] {
+    const char* v = std::getenv("BB_VR_SHADOW_EYE_SCALE");
+    return v ? float(std::atof(v)) : 1.f;
+}()};
+
+void SetShadowEyeScale(float scale) {
+    g_shadow_eye_scale.store(scale, std::memory_order_relaxed);
+}
 
 std::unique_ptr<VideoCore::Buffer> g_eye_constants; // the per-eye copies, a ring (a few KB a frame, 256 KB)
 u64 g_eye_constants_next = 0;
@@ -741,11 +754,21 @@ bool EyeConstants(const Instance& instance, u64 stage_hash, u32 buffer_index, vk
     }();
     const auto binding = t_eye_binding;
     constexpr u32 bytes = ShadowCascades * ShadowCascadeFloats * 4;
-    if (!on || !g_enabled || stage_hash != ShadowResolvePs || buffer_index != 0 || !binding.valid ||
-        binding.size < bytes || binding.adjust > 256 || !binding.address) {
+    if (!on || !g_enabled || stage_hash != ShadowResolvePs || buffer_index != 2) {
         return false;
     }
-    const float half = 0.5f * StereoBaseline();
+    // Counted in the log (applied / skipped), so a run shows the correction ran.
+    static u32 applied = 0, skipped = 0;
+    const bool usable = binding.valid && binding.size >= bytes && binding.adjust <= 256 && binding.address;
+    if ((usable ? applied++ : skipped++) % 10000 == 0) {
+        std::printf("VR shadows per eye: applied %u, skipped %u (u z moved by -+%g)\n", applied, skipped,
+                    0.5 * g_shift * g_shadow_eye_scale.load(std::memory_order_relaxed));
+        std::fflush(stdout);
+    }
+    if (!usable) {
+        return false;
+    }
+    const float half = 0.5f * g_shift * g_shadow_eye_scale.load(std::memory_order_relaxed);
     std::scoped_lock lock{g_eye_mutex};
     constexpr u64 RingBytes = 256 * 1024;
     if (!g_eye_constants) {
@@ -766,9 +789,10 @@ bool EyeConstants(const Instance& instance, u64 stage_hash, u32 buffer_index, vk
         g_eye_constants_next = offset + range;
         u8* dst = g_eye_constants->mapped_data.data() + offset;
         std::memset(dst, 0, binding.adjust);
-        std::memcpy(dst + binding.adjust, reinterpret_cast<const void*>(binding.address), binding.size);
+        std::memcpy(dst + binding.adjust,
+                    binding.ring_data ? binding.ring_data : reinterpret_cast<const void*>(binding.address), binding.size);
         auto* f = reinterpret_cast<float*>(dst + binding.adjust);
-        const float ex = sign * (eye == 0 ? -half : half); // the left eye at -x
+        const float ex = sign * (eye == 0 ? -half : half); // the left eye's u z less
         for (u32 c = 0; c < ShadowCascades; ++c) {
             for (u32 row = 1; row <= 3; ++row) {
                 float* r = f + c * ShadowCascadeFloats + row * 4;

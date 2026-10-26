@@ -3094,7 +3094,7 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, const PreparedStage* pre
                 push_data.AddOffset(binding.buffer, 0);
             }
             buffer_infos.emplace_back(constant_ring->Handle(), ring->offset, ring->size);
-            Vr::Multiview::NoteRingBuffer(ring->address, ring->size); // VR: development audit
+            Vr::Multiview::NoteRingBuffer(ring->address, ring->size, constant_ring->Data(ring->offset)); // VR
         } else if (desc.IsSpecial()) {
             if (desc.buffer_type == Shader::BufferType::GdsBuffer) {
                 const auto* gds_buf = buffer_cache.GetGdsBuffer();

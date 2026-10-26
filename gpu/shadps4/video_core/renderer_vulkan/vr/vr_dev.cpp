@@ -293,6 +293,13 @@ void Poll() {
     if (Take("FSIMG", &fs_vs)) {
         Stereo::WatchFragmentImages(std::strtoull(fs_vs.c_str(), nullptr, 16));
     }
+    std::string value;
+    if (Take("IPD", &value)) {
+        SetIpdOverride(value.empty() ? -1.f : float(std::atof(value.c_str())));
+    }
+    if (Take("SHSCALE", &value)) {
+        Multiview::SetShadowEyeScale(value.empty() ? 1.f : float(std::atof(value.c_str())));
+    }
     if (Take("RECENTER")) {
         Recenter();
     }
