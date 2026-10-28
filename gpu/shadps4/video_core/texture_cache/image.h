@@ -10,6 +10,7 @@
 #include "video_core/texture_cache/image_info.h"
 #include "video_core/texture_cache/image_view.h"
 
+#include <atomic>
 #include <deque>
 #include <optional>
 #include <boost/container/small_vector.hpp>
@@ -162,6 +163,14 @@ public:
     /// bbport: gc tick of the last LRU touch; skips the LRU list (a cache miss) when current.
     mutable u64 lru_touched_tick = ~0ULL;
     u64 tick_accessed_last{};
+    /// bbport VR: a serial of the GPU's last write (unique across images: slot indices are reused).
+    /// The buffer cache copies an image into a texel buffer over its memory once per write, not at
+    /// every binding (U1 reads its depth that way between lighting passes that only test it).
+    u64 gpu_write_serial{};
+    void NoteGpuWrite() noexcept {
+        static std::atomic<u64> next{1};
+        gpu_write_serial = next.fetch_add(1, std::memory_order_relaxed);
+    }
     ImageId depth_id{};
     u64 depth_uid{};
     u64 image_uid{};

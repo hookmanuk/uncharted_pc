@@ -594,6 +594,7 @@ void Runtime::CopyDepthStencil(VideoCore::Image* src, VideoCore::Image* dst,
     });
 
     dst->flags |= VideoCore::ImageFlagBits::GpuModified;
+    dst->NoteGpuWrite();
     dst->flags &= ~VideoCore::ImageFlagBits::Dirty;
 }
 
@@ -666,6 +667,7 @@ void Runtime::ResolveImage(VideoCore::Image* src, VideoCore::Image* dst,
     }
 
     dst->flags |= VideoCore::ImageFlagBits::GpuModified;
+    dst->NoteGpuWrite();
     dst->flags &= ~VideoCore::ImageFlagBits::Dirty;
 }
 
@@ -693,6 +695,7 @@ void Runtime::ClearImage(VideoCore::Image* dst, const VideoCore::SubresourceRang
     });
 
     dst->flags |= VideoCore::ImageFlagBits::GpuModified;
+    dst->NoteGpuWrite();
     dst->flags &= ~VideoCore::ImageFlagBits::Dirty;
 }
 

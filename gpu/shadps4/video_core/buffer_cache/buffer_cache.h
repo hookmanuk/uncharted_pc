@@ -210,6 +210,8 @@ private:
         u64 generation = ~0ULL;
     };
     std::array<ImageMiss, 256> image_miss_cache{};
+    /// bbport VR: the image (slot index) and write each texel-buffer address was last copied from.
+    std::unordered_map<VAddr, std::pair<u32, u64>> texel_image_syncs;
     Vulkan::Runtime& runtime;
     Vulkan::StagingBufferPool& staging_pool;
     AmdGpu::Liverpool* liverpool;

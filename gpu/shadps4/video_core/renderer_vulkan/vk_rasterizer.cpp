@@ -3873,6 +3873,18 @@ RenderState Rasterizer::BeginRendering(const GraphicsPipeline* pipeline) {
         }
         if (usable) {
             ++begin_memo_hits;
+            // bbport VR: this draw writes the colour targets, and the depth when it writes depth
+            // or stencil (texel-buffer copies of an image are made once per write).
+            for (u32 i = 0; i < AmdGpu::NUM_COLOR_BUFFERS; ++i) {
+                if (signature.ids[i]) {
+                    texture_cache.GetImage(signature.ids[i]).NoteGpuWrite();
+                }
+            }
+            if (const auto depth = signature.ids[AmdGpu::NUM_COLOR_BUFFERS];
+                depth && (regs.depth_control.stencil_enable ||
+                          (regs.depth_control.depth_enable && regs.depth_control.depth_write_enable))) {
+                texture_cache.GetImage(depth).NoteGpuWrite();
+            }
             attachment_feedback_loop = false;
             push_data.scene_size = begin_memo.scene_size;
             target_scale = begin_memo.target_scale;
@@ -4065,6 +4077,10 @@ RenderState Rasterizer::BeginRenderingFull(const GraphicsPipeline* pipeline) {
              regs.depth_control.depth_write_enable) ||
             texture_cache.IsMetaCleared(htile_address, slice);
         const bool is_stencil_clear = regs.depth_render_control.stencil_clear_enable;
+        if (is_depth_clear || is_stencil_clear || regs.depth_control.stencil_enable ||
+            (regs.depth_control.depth_enable && regs.depth_control.depth_write_enable)) {
+            image.NoteGpuWrite();  // bbport VR (texel-buffer copies once per write)
+        }
         texture_cache.TouchMeta(htile_address, slice, false);
         ASSERT(desc.view_info.range.extent.levels == 1 && !image.binding.needs_rebind);
 

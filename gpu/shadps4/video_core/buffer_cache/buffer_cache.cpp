@@ -1858,6 +1858,16 @@ bool BufferCache::SynchronizeMemoryFromImage(const Buffer* arena, VAddr device_a
         return false;
     }
     auto& tile_manager = texture_cache.GetTileManager();
+    // bbport VR: the image is copied into the buffer once per GPU write, not at every binding: U1's
+    // depth (3584x3584 at a VR eye size) was copied 4 times a frame, 1.8 ms. The address remembers
+    // which image and write it holds (a colour and a depth image share some). BB_TEXEL_SYNC_MEMO=0: off.
+    static const bool memo = !(std::getenv("BB_TEXEL_SYNC_MEMO") && std::getenv("BB_TEXEL_SYNC_MEMO")[0] == '0');
+    auto& synced = texel_image_syncs[device_addr];
+    if (memo && image.gpu_write_serial && synced.first == image_id.index &&
+        synced.second == image.gpu_write_serial) {
+        return true;
+    }
+    synced = {image_id.index, image.gpu_write_serial};
     tile_manager.TileImage(image, buffer_copies, arena, arena_offset);
     return true;
 }
