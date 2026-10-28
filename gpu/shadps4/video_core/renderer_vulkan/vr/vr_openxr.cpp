@@ -176,7 +176,7 @@ struct State {
         u32 index = 0;
         VkFormat format = VK_FORMAT_UNDEFINED;
     };
-    Chain eye_chains[2], hud_chain;
+    Chain eye_chains[2], hud_chain, far_chain; // far: the reticle layer (Stereo::ReticleDistance)
     int frames_since_stereo = 1000; // the presenter: frames since the last stereo frame
     // The headset's thread: when the flat screen took over (a loading screen); stereo again after a long one is a new
     // race (or menu) beginning, and the seat is recentred there.
@@ -769,10 +769,13 @@ bool Show(const State::Published& p) {
             g.part_max[i] = std::max(g.part_max[i], ms);
             since = now;
         };
+        const bool reticle = Stereo::ReticleDistance() > 0.f;
         if (!MakeChain(g.eye_chains[0], stereo.width, stereo.height, stereo.rgba) ||
             !MakeChain(g.eye_chains[1], stereo.width, stereo.height, stereo.rgba) ||
-            !MakeChain(g.hud_chain, stereo.width, stereo.height, stereo.rgba) || !AcquireChain(g.eye_chains[0]) ||
-            !AcquireChain(g.eye_chains[1]) || !AcquireChain(g.hud_chain)) {
+            !MakeChain(g.hud_chain, stereo.width, stereo.height, stereo.rgba) ||
+            (reticle && !MakeChain(g.far_chain, stereo.width, stereo.height, stereo.rgba)) ||
+            !AcquireChain(g.eye_chains[0]) || !AcquireChain(g.eye_chains[1]) || !AcquireChain(g.hud_chain) ||
+            (reticle && !AcquireChain(g.far_chain))) {
             return false;
         }
         part(0);
@@ -784,13 +787,17 @@ bool Show(const State::Published& p) {
                                  g.eye_chains[1].images[g.eye_chains[1].index].image};
         const VkCommandBuffer cmd = NextCommand();
         part(1);
-        Stereo::RecordEyes(cmd, stereo, eyes, k, g.hud_chain.images[g.hud_chain.index].image);
+        Stereo::RecordEyes(cmd, stereo, eyes, k, g.hud_chain.images[g.hud_chain.index].image,
+                           reticle ? g.far_chain.images[g.far_chain.index].image : VK_NULL_HANDLE);
         part(2);
         SubmitCommand(cmd, p);
         part(4);
         Release(g.eye_chains[0].swapchain);
         Release(g.eye_chains[1].swapchain);
         Release(g.hud_chain.swapchain);
+        if (reticle) {
+            Release(g.far_chain.swapchain);
+        }
         part(3);
         std::memcpy(g.frame_layer_pose, p.layer_pose, sizeof(g.frame_layer_pose));
         std::memcpy(g.frame_tangents, p.tangents, sizeof(g.frame_tangents));
@@ -857,12 +864,13 @@ void EndFrame() {
     // A movie is fitted into the render's shape (Fixes::MovieCanvas): the screen at that shape. The menus are laid out
     // for 16:9 whatever the render's shape (Matt 2026-10-26: a round button tall in a square render): 16:9.
     quad.size = {3.f, 3.f / (g.shown_movie ? Camera::ScreenAspect() : 16.f / 9.f)};
-    const XrCompositionLayerBaseHeader* layers[2] = {reinterpret_cast<XrCompositionLayerBaseHeader*>(&quad), nullptr};
+    const XrCompositionLayerBaseHeader* layers[3] = {reinterpret_cast<XrCompositionLayerBaseHeader*>(&quad), nullptr,
+                                                     nullptr};
     float layer_pose[7], tangents[4];
     XrCompositionLayerProjection projection{XR_TYPE_COMPOSITION_LAYER_PROJECTION};
     XrCompositionLayerProjectionView views[2] = {{XR_TYPE_COMPOSITION_LAYER_PROJECTION_VIEW},
                                                  {XR_TYPE_COMPOSITION_LAYER_PROJECTION_VIEW}};
-    XrCompositionLayerQuad hud{XR_TYPE_COMPOSITION_LAYER_QUAD};
+    XrCompositionLayerQuad hud{XR_TYPE_COMPOSITION_LAYER_QUAD}, reticle_layer{XR_TYPE_COMPOSITION_LAYER_QUAD};
     u32 layer_count = g.content == State::Content::Screen ? 1 : 0;
     const bool stereo = g.content == State::Content::Stereo;
     if (stereo) {
@@ -899,9 +907,28 @@ void EndFrame() {
             hud.pose.orientation = {0.f, std::sin(yaw * 0.5f), 0.f, std::cos(yaw * 0.5f)};
             hud.pose.position = {g.reference_position.x - 1.1f * std::sin(yaw), g.reference_position.y,
                                  g.reference_position.z - 1.1f * std::cos(yaw)};
-            hud.size = {1.4f, 1.4f / Camera::ScreenAspect()}; // the HUD's canvas, whatever the render's shape
+            // The game lays its HUD out for 16:9 whatever the render's shape (a square eye size: the reticle a tall
+            // ellipse in the canvas; Matt 2026-10-28: "the in game HUD is stretched vertically"), as the menus do.
+            hud.size = {1.4f, 1.4f * 9.f / 16.f};
             layers[1] = reinterpret_cast<XrCompositionLayerBaseHeader*>(&hud);
             layer_count = 2;
+            const float reticle_distance = Stereo::ReticleDistance();
+            if (reticle_distance > 0.f && g.far_chain.swapchain) {
+                // The reticle layer: the HUD's centre box on its own quad, reticle_distance ahead, at the same angular
+                // size (so aiming converges in the scene; the HUD holds transparent black there).
+                u32 x, y, bw, bh;
+                Stereo::ReticleBox(g.far_chain.width, g.far_chain.height, x, y, bw, bh);
+                reticle_layer = hud;
+                reticle_layer.subImage.swapchain = g.far_chain.swapchain;
+                reticle_layer.subImage.imageRect = {{s32(x), s32(y)}, {s32(bw), s32(bh)}};
+                const float scale = reticle_distance / 1.1f;
+                reticle_layer.size = {hud.size.width * scale * float(bw) / float(g.far_chain.width),
+                            hud.size.height * scale * float(bh) / float(g.far_chain.height)};
+                reticle_layer.pose.position = {g.reference_position.x - reticle_distance * std::sin(yaw), g.reference_position.y,
+                                     g.reference_position.z - reticle_distance * std::cos(yaw)};
+                layers[2] = reinterpret_cast<XrCompositionLayerBaseHeader*>(&reticle_layer);
+                layer_count = 3;
+            }
         }
     }
     XrFrameEndInfo end{XR_TYPE_FRAME_END_INFO};

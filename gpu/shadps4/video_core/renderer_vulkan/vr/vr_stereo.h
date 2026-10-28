@@ -117,7 +117,16 @@ bool TakeFrame(Frame& frame);
 /// The headset's thread (its own queue): both eyes into `eyes` (sRGB swapchain images of the scene's size, any layout)
 /// and the frame's HUD into `hud` (sRGB, the scene's size). k: pixels of shift per unit of reversed depth for each eye
 /// (the depth reprojection, see vr_stereo.comp).
-void RecordEyes(vk::CommandBuffer cmd, const Frame& frame, const VkImage (&eyes)[2], const float (&k)[2], VkImage hud);
+/// `reticle` (may be null): the reticle layer's image (sRGB, the scene's size): the HUD's centre box (ReticleBox) copied
+/// into it and cleared in `hud`.
+void RecordEyes(vk::CommandBuffer cmd, const Frame& frame, const VkImage (&eyes)[2], const float (&k)[2], VkImage hud,
+                VkImage reticle);
+
+/// The reticle layer: the centre box of the HUD canvas on a quad of its own, BB_VR_RETICLE_M metres ahead (default
+/// 10; 0: off, the HUD whole), so aiming converges in the scene (Matt 2026-10-28); the box is BB_VR_RETICLE_BOX of
+/// the canvas's width and height (default 0.12).
+float ReticleDistance();
+void ReticleBox(u32 width, u32 height, u32& x, u32& y, u32& box_width, u32& box_height);
 
 /// Presenter: the desktop window's image (`window`, TRANSFER_DST): the frame's scene with its HUD, fitted.
 void RecordMirror(vk::CommandBuffer cmd, const Frame& frame, VkImage window, u32 window_width, u32 window_height);

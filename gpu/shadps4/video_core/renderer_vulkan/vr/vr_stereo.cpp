@@ -58,7 +58,7 @@ struct Image {
 struct Slot {
     Image scene; // RGBA8 UNORM: the bits of the game's scene (gamma-encoded)
     Image depth; // the scene depth's format (sampled through its depth aspect)
-    Image hud;   // RGBA8 UNORM: the HUD over transparent black
+    Image hud;   // RGBA8 UNORM: the HUD over transparent black (its centre box moves to the reticle layer, RecordEyes)
     Image scene_right; // multiview: the right eye's scene (layer 1 of the display buffer)
     bool has_right = false;
     bool rgba = false; // the display buffer's bytes are RGBA (Uncharted), not BGRA (Driveclub)
@@ -85,6 +85,7 @@ struct State {
     std::mutex mutex;
 
     Image keys[2], eyes[2], mirror;
+    Image blank; // transparent black (the reticle box cleared in the HUD, RecordEyes)
     VkSampler sampler{};
     VkDescriptorSetLayout splat_layout{}, resolve_layout{}, mirror_layout{};
     VkPipelineLayout splat_pipeline_layout{}, resolve_pipeline_layout{}, mirror_pipeline_layout{};
@@ -175,6 +176,17 @@ void Copy(VkCommandBuffer cmd, VkImage src, VkImageLayout src_layout, VkImage ds
     VkImageCopy copy{};
     copy.srcSubresource = {aspect, 0, src_layer, 1};
     copy.dstSubresource = {aspect, 0, 0, 1};
+    copy.extent = {width, height, 1};
+    VKD.vkCmdCopyImage(cmd, src, src_layout, dst, dst_layout, 1, &copy);
+}
+
+// The same rectangle of two colour images.
+void CopyBox(VkCommandBuffer cmd, VkImage src, VkImageLayout src_layout, VkImage dst, VkImageLayout dst_layout, u32 x,
+             u32 y, u32 width, u32 height) {
+    VkImageCopy copy{};
+    copy.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+    copy.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+    copy.srcOffset = copy.dstOffset = {s32(x), s32(y), 0};
     copy.extent = {width, height, 1};
     VKD.vkCmdCopyImage(cmd, src, src_layout, dst, dst_layout, 1, &copy);
 }
@@ -1279,8 +1291,27 @@ void FrameLog(VkCommandBuffer cmd, VkImage scene, VkImageLayout layout, u32 w, u
     }
 }
 
+float ReticleDistance() {
+    static const float metres = [] {
+        const char* v = std::getenv("BB_VR_RETICLE_M");
+        return v ? std::clamp(float(std::atof(v)), 0.f, 100.f) : 10.f;
+    }();
+    return metres;
+}
+
+void ReticleBox(u32 width, u32 height, u32& x, u32& y, u32& box_width, u32& box_height) {
+    static const float fraction = [] {
+        const char* v = std::getenv("BB_VR_RETICLE_BOX");
+        return v ? std::clamp(float(std::atof(v)), 0.02f, 1.f) : 0.12f;
+    }();
+    box_width = std::max(2u, u32(float(width) * fraction) & ~1u);
+    box_height = std::max(2u, u32(float(height) * fraction) & ~1u);
+    x = (width - box_width) / 2;
+    y = (height - box_height) / 2;
+}
+
 void RecordEyes(vk::CommandBuffer command_buffer, const Frame& frame, const VkImage (&eyes)[2], const float (&k)[2],
-                VkImage hud) {
+                VkImage hud, VkImage reticle) {
     const VkCommandBuffer cmd = VkCommandBuffer(command_buffer);
     Slot& slot = g.slots[frame.slot];
     const u32 w = frame.width, h = frame.height;
@@ -1421,12 +1452,31 @@ void RecordEyes(vk::CommandBuffer command_buffer, const Frame& frame, const VkIm
         Barrier(cmd, eyes[eye], VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
     }
     if (hud) {
+        const VkClearColorValue clear{};
         Barrier(cmd, hud, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
         if (slot.has_hud) {
             Copy(cmd, slot.hud.image, VK_IMAGE_LAYOUT_GENERAL, hud, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, w, h);
         } else {
-            const VkClearColorValue clear{};
             VKD.vkCmdClearColorImage(cmd, hud, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &clear, 1, &range);
+        }
+        if (reticle) {
+            // The reticle layer: the HUD's centre box, and transparent black in its place in the HUD (copied from a
+            // cleared image: a clear takes no rectangle).
+            Barrier(cmd, reticle, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+            VKD.vkCmdClearColorImage(cmd, reticle, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &clear, 1, &range);
+            if (slot.has_hud && Make(g.blank, VK_FORMAT_R8G8B8A8_UNORM, w, h,
+                                     VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT)) {
+                u32 x, y, bw, bh;
+                ReticleBox(w, h, x, y, bw, bh);
+                CopyBox(cmd, slot.hud.image, VK_IMAGE_LAYOUT_GENERAL, reticle, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, x, y, bw,
+                        bh);
+                Barrier(cmd, g.blank.image, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+                VKD.vkCmdClearColorImage(cmd, g.blank.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &clear, 1, &range);
+                Barrier(cmd, g.blank.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
+                CopyBox(cmd, g.blank.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, hud, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                        x, y, bw, bh);
+            }
+            Barrier(cmd, reticle, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
         }
         Barrier(cmd, hud, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
     }
