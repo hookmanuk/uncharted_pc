@@ -131,6 +131,7 @@ bool g_head_enabled = true;
 bool g_camlog = false;
 int g_fov_mode = 2; // BB_VR_FOV: 0 the game's projection, 1 symmetric headset field of view, 2 the headset's (asymmetric)
 std::atomic<int> g_log_next{0};
+std::atomic<float> g_game_xscale{0.f}; // the main view's x scale as the game set it (GameXScale)
 std::atomic<float> g_near{0.f};
 
 void Multiply(const float* a, const float* b, float* out) {
@@ -346,6 +347,7 @@ extern "C" void ProjectionHandler(u64* regs) {
         params[2] = g_near_original; // the game did not set it again this frame
     }
     g_near = params[2];
+    g_game_xscale = params[1];
     if (g_log_next.load(std::memory_order_relaxed) > 0 && g_log_next.fetch_sub(1) > 0) {
         std::printf("VR camera: view %#llx pos %.3f %.3f %.3f fwd %.3f %.3f %.3f aspect %.4f xscale %.4f near %.4f "
                     "far %.1f\n",
@@ -576,6 +578,10 @@ void Install() {
 
 float Near() {
     return g_near.load();
+}
+
+float GameXScale() {
+    return g_game_xscale.load();
 }
 
 void LogNext(int count) {

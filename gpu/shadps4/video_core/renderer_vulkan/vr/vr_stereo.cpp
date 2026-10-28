@@ -1291,6 +1291,14 @@ void FrameLog(VkCommandBuffer cmd, VkImage scene, VkImageLayout layout, u32 w, u
     }
 }
 
+bool ReticleAiming() {
+    static const float threshold = [] {
+        const char* v = std::getenv("BB_VR_RETICLE_XSCALE");
+        return v ? float(std::atof(v)) : 1.8f;
+    }();
+    return ReticleDistance() > 0.f && Camera::GameXScale() > threshold;
+}
+
 float ReticleDistance() {
     static const float metres = [] {
         const char* v = std::getenv("BB_VR_RETICLE_M");

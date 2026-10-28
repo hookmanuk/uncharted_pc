@@ -167,6 +167,7 @@ struct State {
     u64 shown_serial = 0;       // the headset's thread: the last publication shown
     Content content = Content::None; // the headset's thread: what the swapchains hold
     bool shown_movie = false;          // the headset's thread: the shown screen frame has a movie
+    bool reticle_shown = false;        // the headset's thread: the shown stereo frame has the reticle layer
 
     // Stereo: an eye swapchain each and the HUD's (sRGB, the scene's size).
     struct Chain {
@@ -769,7 +770,8 @@ bool Show(const State::Published& p) {
             g.part_max[i] = std::max(g.part_max[i], ms);
             since = now;
         };
-        const bool reticle = Stereo::ReticleDistance() > 0.f;
+        const bool reticle = Stereo::ReticleAiming();
+        g.reticle_shown = reticle;
         if (!MakeChain(g.eye_chains[0], stereo.width, stereo.height, stereo.rgba) ||
             !MakeChain(g.eye_chains[1], stereo.width, stereo.height, stereo.rgba) ||
             !MakeChain(g.hud_chain, stereo.width, stereo.height, stereo.rgba) ||
@@ -913,7 +915,7 @@ void EndFrame() {
             layers[1] = reinterpret_cast<XrCompositionLayerBaseHeader*>(&hud);
             layer_count = 2;
             const float reticle_distance = Stereo::ReticleDistance();
-            if (reticle_distance > 0.f && g.far_chain.swapchain) {
+            if (g.reticle_shown && g.far_chain.swapchain) {
                 // The reticle layer: the HUD's centre box on its own quad, reticle_distance ahead, at the same angular
                 // size (so aiming converges in the scene; the HUD holds transparent black there).
                 u32 x, y, bw, bh;

@@ -126,6 +126,9 @@ void RecordEyes(vk::CommandBuffer cmd, const Frame& frame, const VkImage (&eyes)
 /// 10; 0: off, the HUD whole), so aiming converges in the scene (Matt 2026-10-28); the box is BB_VR_RETICLE_BOX of
 /// the canvas's width and height (default 0.12).
 float ReticleDistance();
+/// Whether the reticle layer shows this frame: the game is aiming (its x scale above BB_VR_RETICLE_XSCALE, default
+/// 1.8: U1 zooms from 1.30 to 2.41 aiming; the pause menu, in the HUD's centre too, stays 1.30 and on the near HUD).
+bool ReticleAiming();
 void ReticleBox(u32 width, u32 height, u32& x, u32& y, u32& box_width, u32& box_height);
 
 /// Presenter: the desktop window's image (`window`, TRANSFER_DST): the frame's scene with its HUD, fitted.

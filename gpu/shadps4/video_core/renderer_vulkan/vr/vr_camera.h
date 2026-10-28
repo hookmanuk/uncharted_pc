@@ -29,6 +29,9 @@ u32 RecentPositions(float (*positions)[3], u32 max);
 
 /// The game's screen aspect (the HUD's canvas; the render size may differ: a square render keeps 16:9 here).
 float ScreenAspect();
+/// The game's own horizontal projection scale of the main view this frame (U1: 1.30 in play and the pause menu,
+/// 2.41 aiming): the aim zoom tells aiming (the reticle layer). 0 before the first view.
+float GameXScale();
 
 /// The pose and field of view the last player view was rendered with (for the headset layer).
 bool LastRendered(float (&layer_pose)[7], float (&tangents)[4]);
