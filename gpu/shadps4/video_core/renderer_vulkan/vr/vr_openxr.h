@@ -90,6 +90,15 @@ std::chrono::nanoseconds FramePeriod(std::chrono::nanoseconds limit);
 /// The present thread: a flip may go now (uncapped, or the headset began a frame since the last flip).
 bool FlipAllowed();
 
+/// The present thread in VR (BB_VR_IMMEDIATE_FLIPS=0 off): a flip goes when the headset's frame allows it, between
+/// vblank ticks, not at the next tick (the ticks put flips on the vblank grid: at 240 Hz a 90 Hz frame alternated 2 and
+/// 3 vblanks, 8.3 and 12.5 ms of game time shown 11.1 ms apart). U3 at 90 Hz: flip interval stddev 1.99 -> 0.04 ms,
+/// 1% low 74 -> 84; U1 at 120 Hz: 1% low 73 -> 97, late 1.1% -> 0.
+bool ImmediateFlips();
+
+/// Waits until a flip may go (FlipAllowed), at most until the deadline.
+bool WaitFlipAllowed(std::chrono::steady_clock::time_point deadline);
+
 /// After the presenter's submit: hands the layer to the runtime (xrEndFrame).
 void SubmitFrame(VkSemaphore semaphore, u64 tick);
 

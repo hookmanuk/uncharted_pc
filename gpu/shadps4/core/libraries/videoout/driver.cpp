@@ -824,7 +824,7 @@ void VideoOutDriver::PresentThread(std::stop_token token) {
             main_port.vblank_cv.notify_all();
         }
 
-        if (!immediate_flips || main_port.flip_rate != 0 || movie) {
+        if ((!immediate_flips && !Vulkan::Vr::ImmediateFlips()) || main_port.flip_rate != 0 || movie) { // VR
             timer.End();
             continue;
         }
@@ -842,7 +842,8 @@ void VideoOutDriver::PresentThread(std::stop_token token) {
                 }
                 std::this_thread::sleep_until(next_flip);
             }
-            if (!Vulkan::Vr::FlipAllowed()) {
+            if (Vulkan::Vr::ImmediateFlips() ? !Vulkan::Vr::WaitFlipAllowed(tick_deadline)
+                                              : !Vulkan::Vr::FlipAllowed()) {
                 break; // VR: the headset's next frame (the next vblank tick looks again)
             }
             const auto now = std::chrono::steady_clock::now();

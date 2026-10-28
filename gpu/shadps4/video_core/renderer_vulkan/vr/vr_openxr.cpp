@@ -199,6 +199,8 @@ struct State {
 };
 
 State g;
+std::mutex g_flip_token_mutex; // the present thread waits on the headset's frame token (WaitFlipAllowed)
+std::condition_variable g_flip_token_cv;
 
 bool Check(XrResult result, const char* what) {
     if (XR_SUCCEEDED(result)) {
@@ -1013,7 +1015,11 @@ void FrameLoop() {
                 }
             }
         }
-        g.flip_token.store(true, std::memory_order_relaxed); // one game flip per headset frame (while capped)
+        {
+            std::scoped_lock lock{g_flip_token_mutex};
+            g.flip_token.store(true, std::memory_order_relaxed); // one game flip per headset frame (while capped)
+        }
+        g_flip_token_cv.notify_all();
         // VR fork: the head for this frame's display time before the wait, so the game's next frame renders with it.
         UpdateHead();
         if (float pose[7], tangents[4]; Multiview::Enabled() && Camera::LastRendered(pose, tangents)) {
@@ -1258,6 +1264,19 @@ std::chrono::nanoseconds FramePeriod(std::chrono::nanoseconds limit) {
 
 bool FlipAllowed() {
     return !g.capped.load(std::memory_order_relaxed) || g.flip_token.load(std::memory_order_relaxed);
+}
+
+bool ImmediateFlips() {
+    static const bool on = [] {
+        const char* v = std::getenv("BB_VR_IMMEDIATE_FLIPS");
+        return !(v && v[0] == '0');
+    }();
+    return on && Active();
+}
+
+bool WaitFlipAllowed(std::chrono::steady_clock::time_point deadline) {
+    std::unique_lock lock{g_flip_token_mutex};
+    return g_flip_token_cv.wait_until(lock, deadline, [] { return FlipAllowed(); });
 }
 
 // The presenter, each game flip in VR: the adaptive cap's flip rate over 2 s windows.
