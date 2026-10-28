@@ -26,6 +26,7 @@ class TileManager {
         u32 num_bits;
         u32 num_samples;
         bool is_tiler;
+        bool from_image = false;
 
         bool operator==(const TilingKey&) const = default;
 
@@ -36,6 +37,7 @@ class TileManager {
                 boost::hash_combine(hash, key.num_bits);
                 boost::hash_combine(hash, key.num_samples);
                 boost::hash_combine(hash, key.is_tiler);
+                boost::hash_combine(hash, key.from_image);
                 return hash;
             }
         };
@@ -57,7 +59,12 @@ private:
                               const vk::DescriptorBufferInfo& linear,
                               const vk::DescriptorBufferInfo& params, u32 dim_x);
 
-    vk::Pipeline GetTilingPipeline(const ImageInfo& info, bool is_tiler);
+    vk::Pipeline GetTilingPipeline(const ImageInfo& info, bool is_tiler, bool from_image = false);
+
+    /// bbport VR: a single-level 32 bpp depth image tiled straight into the buffer (no staging
+    /// copy); false when the image is not one.
+    bool TileDepthFromImage(Image& image, const VideoCore::Buffer* out_buffer, u64 out_offset,
+                            const vk::DescriptorBufferInfo& params);
 
 private:
     const Vulkan::Instance& instance;
@@ -66,6 +73,9 @@ private:
     StreamBuffer& stream_buffer;
     vk::UniqueDescriptorSetLayout desc_layout;
     vk::UniquePipelineLayout pl_layout;
+    vk::UniqueDescriptorSetLayout image_desc_layout; ///< bbport VR: binding 1 a sampled image
+    vk::UniquePipelineLayout image_pl_layout;
+    vk::UniqueSampler image_sampler;
     std::unordered_map<TilingKey, vk::UniquePipeline, TilingKey::Hash> tiling_pipelines;
 };
 

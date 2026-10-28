@@ -159,6 +159,9 @@ foreach(BPP IN ITEMS 8 16 32 64 96 128)
     add_host_shader(tiling.comp tiling_micro_${BPP}_comp BITS_PER_PIXEL=${BPP} IS_MACRO_TILED=0)
     add_host_shader(tiling.comp tiling_macro_${BPP}_comp BITS_PER_PIXEL=${BPP} IS_MACRO_TILED=1)
 endforeach()
+# VR: 32 bpp tilers that read a depth image directly (no staging copy; tile_manager.cpp).
+add_host_shader(tiling.comp tiling_micro_32_image_comp BITS_PER_PIXEL=32 IS_MACRO_TILED=0 FROM_IMAGE=1)
+add_host_shader(tiling.comp tiling_macro_32_image_comp BITS_PER_PIXEL=32 IS_MACRO_TILED=1 FROM_IMAGE=1)
 add_custom_target(host_shaders DEPENDS ${SHADER_HEADERS})
 
 file(GLOB_RECURSE VIDEO_CORE CONFIGURE_DEPENDS shadps4/video_core/*.cpp)

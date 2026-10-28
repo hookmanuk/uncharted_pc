@@ -22,6 +22,8 @@
 #include "video_core/host_shaders/tiling_micro_64_comp.h"
 #include "video_core/host_shaders/tiling_micro_8_comp.h"
 #include "video_core/host_shaders/tiling_micro_96_comp.h"
+#include "video_core/host_shaders/tiling_macro_32_image_comp.h"
+#include "video_core/host_shaders/tiling_micro_32_image_comp.h"
 
 #include <magic_enum/magic_enum.hpp>
 #include <vk_mem_alloc.h>
@@ -82,16 +84,43 @@ TileManager::TileManager(const Vulkan::Instance& instance_, Vulkan::Scheduler& s
     ASSERT_MSG(layout_result == vk::Result::eSuccess, "Failed to create pipeline layout: {}",
                vk::to_string(layout_result));
     pl_layout = std::move(layout);
+
+    // bbport VR: the same with binding 1 a sampled image (TileDepthFromImage).
+    auto image_bindings = bindings;
+    image_bindings[1].descriptorType = vk::DescriptorType::eCombinedImageSampler;
+    const vk::DescriptorSetLayoutCreateInfo image_desc_layout_ci = {
+        .flags = vk::DescriptorSetLayoutCreateFlagBits::ePushDescriptorKHR,
+        .bindingCount = static_cast<u32>(image_bindings.size()),
+        .pBindings = image_bindings.data(),
+    };
+    image_desc_layout = device.createDescriptorSetLayoutUnique(image_desc_layout_ci).value;
+    const vk::DescriptorSetLayout image_set_layout = *image_desc_layout;
+    image_pl_layout = device
+                          .createPipelineLayoutUnique(vk::PipelineLayoutCreateInfo{
+                              .setLayoutCount = 1U,
+                              .pSetLayouts = &image_set_layout,
+                          })
+                          .value;
+    image_sampler = device
+                        .createSamplerUnique(vk::SamplerCreateInfo{
+                            .magFilter = vk::Filter::eNearest,
+                            .minFilter = vk::Filter::eNearest,
+                            .addressModeU = vk::SamplerAddressMode::eClampToEdge,
+                            .addressModeV = vk::SamplerAddressMode::eClampToEdge,
+                            .addressModeW = vk::SamplerAddressMode::eClampToEdge,
+                        })
+                        .value;
 }
 
 TileManager::~TileManager() = default;
 
-vk::Pipeline TileManager::GetTilingPipeline(const ImageInfo& info, bool is_tiler) {
+vk::Pipeline TileManager::GetTilingPipeline(const ImageInfo& info, bool is_tiler, bool from_image) {
     const TilingKey key{
         .tile_mode = info.tile_mode,
         .num_bits = info.num_bits,
         .num_samples = info.num_samples,
         .is_tiler = is_tiler,
+        .from_image = from_image,
     };
     if (const auto it = tiling_pipelines.find(key); it != tiling_pipelines.end()) {
         return *it->second;
@@ -131,6 +160,11 @@ vk::Pipeline TileManager::GetTilingPipeline(const ImageInfo& info, bool is_tiler
                         : std::span<const u32>{TILING_MICRO_16_COMP};
         break;
     case 32:
+        if (from_image) {
+            code = is_macro ? std::span<const u32>{TILING_MACRO_32_IMAGE_COMP}
+                            : std::span<const u32>{TILING_MICRO_32_IMAGE_COMP};
+            break;
+        }
         code = is_macro ? std::span<const u32>{TILING_MACRO_32_COMP}
                         : std::span<const u32>{TILING_MICRO_32_COMP};
         break;
@@ -180,7 +214,7 @@ vk::Pipeline TileManager::GetTilingPipeline(const ImageInfo& info, bool is_tiler
     };
     const vk::ComputePipelineCreateInfo compute_pipeline_ci = {
         .stage = shader_ci,
-        .layout = *pl_layout,
+        .layout = from_image ? *image_pl_layout : *pl_layout,
     };
 
     auto [result, pipeline] =
@@ -309,6 +343,11 @@ void TileManager::TileImage(Image& in_image, std::span<vk::BufferImageCopy> buff
         .range = sizeof(params),
     };
 
+    if (buffer_copies.size() == 1 &&
+        TileDepthFromImage(in_image, out_buffer, out_offset, params_buffer_info)) {
+        return;
+    }
+
     const auto staging = runtime.GetStagingPool().Request(info.guest_size, MemoryType::DeviceLocal);
     for (auto& copy : buffer_copies) {
         copy.bufferOffset += staging.offset;
@@ -335,6 +374,88 @@ void TileManager::TileImage(Image& in_image, std::span<vk::BufferImageCopy> buff
     runtime.AccessBuffer(out_buffer, out_offset, info.guest_size,
                          vk::PipelineStageFlagBits2::eComputeShader,
                          vk::AccessFlagBits2::eShaderWrite);
+}
+
+// bbport VR: U1 reads its depth through texel buffers; at a VR eye size (3584x3584) each copy into
+// the buffer went through a 51 MB staging buffer (copyImageToBuffer, then the tiler). A 32 bpp
+// depth image with one level and layer is now read by the tiler itself. BB_DEPTH_TILE_DIRECT=0: off.
+bool TileManager::TileDepthFromImage(Image& image, const VideoCore::Buffer* out_buffer,
+                                     u64 out_offset, const vk::DescriptorBufferInfo& params) {
+    static const bool enabled = [] {
+        const char* env = std::getenv("BB_DEPTH_TILE_DIRECT");
+        return !(env && env[0] == '0');
+    }();
+    const auto& info = image.info;
+    const auto format = info.pixel_format;
+    if (!enabled || !info.props.is_tiled || info.num_bits != 32 || info.num_samples != 1 ||
+        info.resources.levels != 1 || info.resources.layers != 1 || info.props.is_volume ||
+        (format != vk::Format::eD32Sfloat && format != vk::Format::eD32SfloatS8Uint)) {
+        return false;
+    }
+    runtime.SetBackingSamples(&image, info.num_samples);
+    scheduler.EndRendering();
+    const Vulkan::Runtime::TransferMark mark{runtime, "image tile (direct)", image};
+    const auto device = instance.GetDevice();
+    const auto view = device
+                          .createImageView(vk::ImageViewCreateInfo{
+                              .image = vk::Image(image.backing->image),
+                              .viewType = vk::ImageViewType::e2D,
+                              .format = format,
+                              .subresourceRange = {vk::ImageAspectFlagBits::eDepth, 0, 1, 0, 1},
+                          })
+                          .value;
+    bool needs_flush =
+        runtime.Transit(&image, vk::ImageLayout::eGeneral, vk::PipelineStageFlagBits2::eComputeShader,
+                        vk::AccessFlagBits2::eShaderRead);
+    needs_flush |= runtime.IsBufferAccessed(out_buffer, out_offset, info.guest_size, true);
+    if (needs_flush) {
+        runtime.FlushBarriers();
+    }
+    const vk::DescriptorBufferInfo tiled{
+        .buffer = out_buffer->Handle(),
+        .offset = out_offset,
+        .range = info.guest_size,
+    };
+    const vk::DescriptorImageInfo source{
+        .sampler = *image_sampler,
+        .imageView = view,
+        .imageLayout = vk::ImageLayout::eGeneral,
+    };
+    const auto pipeline = GetTilingPipeline(info, true, true);
+    const u32 dim_x = static_cast<u32>((info.guest_size / 4) / 64);
+    scheduler.Record([pipeline, layout = *image_pl_layout, tiled, source, params,
+                      dim_x](vk::CommandBuffer cmdbuf) {
+        cmdbuf.bindPipeline(vk::PipelineBindPoint::eCompute, pipeline);
+        const std::array<vk::WriteDescriptorSet, 3> set_writes = {{
+            {
+                .dstBinding = 0,
+                .descriptorCount = 1,
+                .descriptorType = vk::DescriptorType::eStorageBuffer,
+                .pBufferInfo = &tiled,
+            },
+            {
+                .dstBinding = 1,
+                .descriptorCount = 1,
+                .descriptorType = vk::DescriptorType::eCombinedImageSampler,
+                .pImageInfo = &source,
+            },
+            {
+                .dstBinding = 2,
+                .descriptorCount = 1,
+                .descriptorType = vk::DescriptorType::eUniformBuffer,
+                .pBufferInfo = &params,
+            },
+        }};
+        cmdbuf.pushDescriptorSetKHR(vk::PipelineBindPoint::eCompute, layout, 0, set_writes);
+        const u32 groups_x = std::min(dim_x, 32768u);
+        const u32 groups_y = std::max(1u, dim_x / 32768u + u32(dim_x % 32768u != 0));
+        cmdbuf.dispatch(groups_x, groups_y, 1);
+    });
+    scheduler.DeferOperation([device, view] { device.destroyImageView(view); });
+    runtime.AccessBuffer(out_buffer, out_offset, info.guest_size,
+                         vk::PipelineStageFlagBits2::eComputeShader,
+                         vk::AccessFlagBits2::eShaderWrite);
+    return true;
 }
 
 } // namespace VideoCore

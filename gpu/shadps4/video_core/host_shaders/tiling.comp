@@ -95,9 +95,18 @@ layout (set = 0, binding = 0, scalar) buffer InputBuf {
     BLOCK_TYPE tiled_data[];
 };
 
+#ifndef FROM_IMAGE
+#define FROM_IMAGE 0
+#endif
+
+#if FROM_IMAGE
+// bbport VR: a 32 bpp depth image's texels (their float bits), tiled straight into the buffer.
+layout (set = 0, binding = 1) uniform sampler2D source_image;
+#else
 layout (set = 0, binding = 1, scalar) buffer OutputBuf {
     BLOCK_TYPE linear_data[];
 };
+#endif
 
 layout (set = 0, binding = 2, scalar) uniform TilingInfo {
     uint bank_swizzle;
@@ -427,9 +436,15 @@ uint GetMipLevel(inout uint texel) {
 void main() {
     const uint linear_texel = gl_GlobalInvocationID.x +
                               gl_GlobalInvocationID.y * gl_NumWorkGroups.x * gl_WorkGroupSize.x;
+#if FROM_IMAGE
+    if (linear_texel >= info.mips[0].pitch * info.mips[0].height) {
+        return;
+    }
+#else
     if (linear_texel >= linear_data.length()) {
         return;
     }
+#endif
     uint texel = linear_texel;
     uint mip = GetMipLevel(texel);
     uint pitch = info.mips[mip].pitch;
@@ -445,9 +460,17 @@ void main() {
     tiled_offset += ComputeSurfaceAddrFromCoordMicroTiled(x, y, slice, pitch, height, 0);
 #endif
 
+#if FROM_IMAGE
+    const ivec2 size = textureSize(source_image, 0);
+    if (x < uint(size.x) && y < uint(size.y)) {
+        tiled_data[tiled_offset / BYTES_PER_PIXEL] =
+            floatBitsToUint(texelFetch(source_image, ivec2(x, y), 0).r);
+    }
+#else
     if (IS_TILER != 0) {
         tiled_data[tiled_offset / BYTES_PER_PIXEL] = linear_data[linear_texel];
     } else {
         linear_data[linear_texel] = tiled_data[tiled_offset / BYTES_PER_PIXEL];
     }
+#endif
 }
