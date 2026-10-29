@@ -44,7 +44,8 @@ Starting
   are kept in user\trophy\ with the saves, one list per game.
 
 VR (this is the VR edition: vr-0.1)
-- Display page -> "Play in a VR headset (OpenXR)", then PLAY. Needs an OpenXR runtime: SteamVR (set as the
+- "Play in a VR headset (OpenXR)" on the Display page is ticked by default (untick it to play on the screen).
+  Needs an OpenXR runtime: SteamVR (set as the
   active OpenXR runtime), Virtual Desktop, Oculus/Meta Link or Windows Mixed Reality. Start the runtime first.
 - Uncharted 1 is playable: 3D with head tracking (both eyes drawn together), the HUD on its own layer, and the headset's own refresh rate.
   NVIDIA DLSS (GeForce RTX) is optional and off by default: the "NVIDIA DLSS in VR" option. Menus and cutscene videos show on a large screen in front of

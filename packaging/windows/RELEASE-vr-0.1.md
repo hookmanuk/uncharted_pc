@@ -6,8 +6,8 @@
 Download `uncharted-windows.zip`, unzip it anywhere and run `Uncharted.exe`. Nothing else to install.
 
 1. Game page: choose the folder with your own decrypted dump of the collection (no game files are included).
-2. Display page: tick **Play in a VR headset (OpenXR)**. Start your OpenXR runtime first (SteamVR, Virtual Desktop,
-   Meta Link, Windows Mixed Reality).
+2. Start your OpenXR runtime first (SteamVR, Virtual Desktop, Meta Link, Windows Mixed Reality). VR is ticked by
+   default (Display page: **Play in a VR headset (OpenXR)**; untick it to play on the screen).
 3. Play page: pick Drake's Fortune and press **PLAY**. F8 recentres.
 
 - Uncharted 1: 3D with head tracking, HUD on its own layer, the headset's own refresh rate.
