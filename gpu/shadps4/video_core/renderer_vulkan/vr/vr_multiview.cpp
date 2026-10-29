@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 // VR (dcport-vr): see vr_multiview.h.
 
+#include <cctype>
 #include <cstdio>
 #include <cstdlib>
 #include <algorithm>
@@ -202,7 +203,18 @@ const char* CacheSuffix() {
     static const std::string suffix = [] {
         const char* res = std::getenv("BB_VR_EYE_RES");
         // _mv5: guest buffers are per-eye arrays in the shaders (EyeBufferInfo); view-dependent outputs move with the eye.
-        return res && res[0] && std::strcmp(res, "2880") != 0 ? std::string("_mv5_") + res : std::string("_mv5");
+        // _mv6: projective samples move with the eye (emit_spirv_vr.cpp ProjectiveSample); their development settings
+        // keep caches of their own.
+        std::string out = "_mv6";
+        for (const char* name : {"BB_VR_PROJECTIVE_SAMPLES", "BB_VR_PROJECTIVE_SCALE"}) {
+            if (const char* v = std::getenv(name); v && *v) {
+                out += "_p";
+                for (const char* c = v; *c; ++c) {
+                    out += std::isalnum(static_cast<unsigned char>(*c)) ? *c : '-';
+                }
+            }
+        }
+        return res && res[0] && std::strcmp(res, "2880") != 0 ? out + "_" + res : out;
     }();
     return Requested() ? suffix.c_str() : "";
 }

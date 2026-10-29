@@ -57,6 +57,71 @@ Id Layer(EmitContext& ctx) {
     return ctx.OpLoad(ctx.U32[1], ctx.vr_view_index);
 }
 
+// Specialisation constant 200: the pipeline is the multiview twin (mono passes keep their positions).
+Id MultiviewSpec(EmitContext& ctx) {
+    if (!Sirit::ValidId(ctx.vr_multiview)) {
+        ctx.vr_multiview = ctx.SpecConstantFalse(ctx.U1[1]);
+        ctx.Decorate(ctx.vr_multiview, spv::Decoration::SpecId, 200U);
+        ctx.Name(ctx.vr_multiview, "vr_multiview");
+    }
+    return ctx.vr_multiview;
+}
+
+// The view's clip x shift (push data vr_shift[view]).
+Id ViewShift(EmitContext& ctx) {
+    const Id pointer = ctx.TypePointer(spv::StorageClass::PushConstant, ctx.F32[1]);
+    return ctx.OpLoad(ctx.F32[1], ctx.OpAccessChain(pointer, ctx.push_data_block, ctx.ConstU32(PushData::VrShiftIndex),
+                                                    ctx.OpLoad(ctx.U32[1], ctx.vr_view_index)));
+}
+
+// Fragment shaders whose sample of one image is a projection the game computes in the pixel shader from the centre
+// camera's constants: U1's river (pgm f2fab535) reads its planar reflection (image 8, rendered per eye at half size)
+// through the reflected view direction. Both eyes read the same place, so each eye's reflection moved with the water's
+// own disparity on top of its own (Matt 2026-10-29: "The difference in each eye looks too big"). The sample moves by
+// the water pixel's own shift between the centre and the eye (scale * vr_shift[view] / w, w from gl_FragCoord): each
+// eye reads its reflection where it sees the surface. BB_VR_PROJECTIVE_SAMPLES "pgm:image,..." (hex pgm, empty: none),
+// BB_VR_PROJECTIVE_SCALE (texture units per clip unit; 0.5: the image spans the view).
+bool ProjectiveSample(const EmitContext& ctx, const EmitContext::TextureDefinition& texture) {
+    struct Entry {
+        u64 pgm;
+        u32 image;
+    };
+    static const std::vector<Entry> entries = [] {
+        std::vector<Entry> out;
+        const char* env = std::getenv("BB_VR_PROJECTIVE_SAMPLES");
+        const char* p = env ? env : "f2fab535:8";
+        while (*p) {
+            char* end = nullptr;
+            const u64 pgm = std::strtoull(p, &end, 16);
+            if (end == p || *end != ':') {
+                break;
+            }
+            p = end + 1;
+            const u32 image = u32(std::strtoul(p, &end, 10));
+            if (end == p) {
+                break;
+            }
+            out.push_back({pgm, image});
+            p = *end ? end + 1 : end;
+        }
+        return out;
+    }();
+    if (ctx.sw_stage != SwStage::Fragment || !Sirit::ValidId(ctx.frag_coord) || ctx.images.empty()) {
+        return false;
+    }
+    const u32 image = u32(&texture - ctx.images.data());
+    return std::any_of(entries.begin(), entries.end(),
+                       [&](const Entry& e) { return e.pgm == ctx.info.pgm_hash && e.image == image; });
+}
+
+float ProjectiveScale() {
+    static const float scale = [] {
+        const char* env = std::getenv("BB_VR_PROJECTIVE_SCALE");
+        return env && *env ? float(std::atof(env)) : 0.5f;
+    }();
+    return scale;
+}
+
 } // namespace
 
 void EyeBuffers(EmitContext& ctx) {
@@ -105,6 +170,15 @@ Id Coords(EmitContext& ctx, const EmitContext::TextureDefinition& texture, Id im
         return coords;
     }
     Id layer = Layer(ctx);
+    if (!integer && ProjectiveSample(ctx, texture)) {
+        const Id inverse_w = ctx.OpCompositeExtract(ctx.F32[1], ctx.OpLoad(ctx.F32[4], ctx.frag_coord), 3);
+        const Id moved = ctx.OpFMul(ctx.F32[1], ctx.OpFMul(ctx.F32[1], ViewShift(ctx), inverse_w),
+                                    ctx.ConstF32(ProjectiveScale()));
+        const Id x = ctx.OpFAdd(ctx.F32[1], ctx.OpCompositeExtract(ctx.F32[1], coords, 0),
+                                ctx.OpSelect(ctx.F32[1], MultiviewSpec(ctx), moved, ctx.f32_zero_value));
+        return ctx.OpCompositeConstruct(ctx.F32[3], x, ctx.OpCompositeExtract(ctx.F32[1], coords, 1),
+                                        ctx.OpConvertUToF(ctx.F32[1], layer));
+    }
     if (!integer) {
         return ctx.OpCompositeConstruct(ctx.F32[3], ctx.OpCompositeExtract(ctx.F32[1], coords, 0),
                                         ctx.OpCompositeExtract(ctx.F32[1], coords, 1),
@@ -710,19 +784,10 @@ void TranslateEye(EmitContext& ctx, Id eye_shift) {
 // The position's x plus vr_shift[view] when w is not 1, in multiview pipelines (specialisation constant 200); outputs
 // holding x / w (ScanScreenParams) plus scale * vr_shift[view] / w. With the eye's translation, those evaluated again.
 void ShiftPosition(EmitContext& ctx) {
-    const Id pointer = ctx.TypePointer(spv::StorageClass::PushConstant, ctx.F32[1]);
-    const Id shift = ctx.OpLoad(ctx.F32[1], ctx.OpAccessChain(pointer, ctx.push_data_block,
-                                                              ctx.ConstU32(PushData::VrShiftIndex),
-                                                              ctx.OpLoad(ctx.U32[1], ctx.vr_view_index)));
+    const Id shift = ViewShift(ctx);
     const Id x_pointer = ctx.OpAccessChain(ctx.output_f32, ctx.output_position, ctx.ConstU32(0U));
     const Id w = ctx.OpLoad(ctx.F32[1], ctx.OpAccessChain(ctx.output_f32, ctx.output_position, ctx.ConstU32(3U)));
-    // Specialisation constant 200: the pipeline is the multiview twin (mono passes keep their positions).
-    if (!Sirit::ValidId(ctx.vr_multiview)) {
-        ctx.vr_multiview = ctx.SpecConstantFalse(ctx.U1[1]);
-        ctx.Decorate(ctx.vr_multiview, spv::Decoration::SpecId, 200U);
-        ctx.Name(ctx.vr_multiview, "vr_multiview");
-    }
-    const Id multiview = ctx.vr_multiview;
+    const Id multiview = MultiviewSpec(ctx);
     const Id perspective =
         ctx.OpLogicalAnd(ctx.U1[1], multiview, ctx.OpFOrdNotEqual(ctx.U1[1], w, ctx.ConstF32(1.f)));
     const Id x = ctx.OpLoad(ctx.F32[1], x_pointer);
