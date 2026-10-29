@@ -527,6 +527,10 @@ def vr_environment(s, env):
         # The headset paces the game: the game runs unpaced and each flip waits for the headset's next frame once it
         # keeps up (vr_openxr.cpp FramePeriod): the game's frame rate is the headset's refresh rate.
         env['BB_VBLANK_HZ'] = '240'
+        # The flat game's frame settings are hidden in VR and must not apply: no frame cap (the headset paces), and the
+        # desktop window never waits for the monitor's refresh.
+        env.pop('BB_FPS_LIMIT', None)
+        env['BB_PRESENT_MODE'] = 'Mailbox'
         # The eye size is the render size (run.py, scripts/vr_resolution.py): the Display page's resolution is for the
         # flat game (both rewrite the same display configuration).
         env.pop('BB_GAME_RES', None)
@@ -1452,6 +1456,7 @@ class Launcher:
     def build_display(self):
         f = self.page('display', _('Display'), '')
         self.build_vr(f)  # VR fork
+        flat_cards = [self.page_cards[f]]  # VR fork: the cards that only apply to the flat game (hidden in VR)
         self.check(f, 'fullscreen', _('Fullscreen'))
         self.row(f, _('Presentation'), self.choice(f, 'present_mode', PRESENT_MODES, 34),
                  _('Mailbox or Immediate for high frame rates.'))
@@ -1463,6 +1468,7 @@ class Launcher:
         self.row(f, _('Frame rate cap'), self.choice(f, 'fps_limit', FPS_LIMITS, 34),
                  _('Doesn\'t change game speed.'))
         self.section(f, _('Resolution'))
+        flat_cards.append(self.page_cards[f])
         self.row(f, _('Render resolution'), self.choice(f, 'render_height', RENDER_HEIGHTS, 34),
                  _('Higher needs more VRAM.'))
         self.row(f, _('Aspect ratio'), self.choice(f, 'aspect', ASPECTS, 34),
@@ -1471,21 +1477,36 @@ class Launcher:
         self.row(f, _('Upscaling'), self.choice(f, 'scaler', SCALERS, 34))
         self.row(f, _('Sharpening'), self.choice(f, 'sharpening', SHARPENING, 34))
         self.section(f, _('Anti-aliasing'))
+        flat_cards.append(self.page_cards[f])
         modes = ANTI_ALIASING + ([FSR411] if fsr411_assets() else []) + ([XESS] if xess_available() else [])
         self.row(f, _('Anti-aliasing'), self.choice(f, 'anti_aliasing', modes, 34),
                  _('FSR 4 prefers RX 7000/9000 or RTX 40/50.'))
         self.row(f, _('Anti-aliasing sharpness'), self.choice(f, 'aa_sharpness', AA_SHARPNESS, 34))
         self.section(f, _('Frame generation'))
+        flat_cards.append(self.page_cards[f])
         hint = _('Adds input latency. Pauses above about 165 FPS.')
         if refresh:
             hint += ' ' + _('Display: {} Hz.').format(refresh)
         self.row(f, _('Frame generation'), self.choice(f, 'frame_generation', FRAME_GENERATION, 34), hint)
         self.row(f, _('Multiplier'), self.choice(f, 'frame_gen_multiplier', FRAME_GEN_MULTIPLIERS, 34),
                  _('FSR 3 and RTX 40: 2× only.'))
+        self.new_card(f, None)  # VR fork: the FPS counter in a card of its own (shown in VR too)
         self.check(f, 'show_fps', _('Show the FPS counter'))
         self.section(f, _('Audio'))
         self.row(f, _('Speakers'), self.choice(f, 'speakers', SPEAKERS, 34),
                  _('Pick 5.1 or 7.1 if you only get stereo.'))
+
+        # VR fork: in VR the headset sets the frame rate and the eye size the resolution, DLSS (or the game's own)
+        # does the anti-aliasing and frame generation is off (vr_environment): those cards are hidden.
+        def show_flat_cards(*_args):
+            vr = bool(self.var('vr').get())
+            for card in flat_cards:
+                if vr:
+                    card.canvas.grid_remove()
+                else:
+                    card.canvas.grid()
+        self.var('vr').trace_add('write', show_flat_cards)
+        show_flat_cards()
 
     def build_vr(self, f):
         """VR fork: the VR card, first on the Display page."""
@@ -1493,7 +1514,8 @@ class Launcher:
         self.check(f, 'vr', _('Play in a VR headset (OpenXR)'),
                    _('Starts your OpenXR runtime (SteamVR, Virtual Desktop, ...) with the game. Uncharted 1 plays in 3D '
                      'with head tracking; Uncharted 2 and 3 show on a large screen in front of you for now, as do '
-                     'menus and cutscene videos. Frame generation stays off in VR. F8 recentres.'))
+                     'menus and cutscene videos. Frame generation stays off in VR. F8 recentres. The flat-screen '
+                     'display settings are hidden while this is on: the headset sets the frame rate.'))
         self.check(f, 'vr_dlss', _('NVIDIA DLSS in VR (DLAA, GeForce RTX)'),
                    _("Smooths edges with DLSS in each eye at the size below. Off, or on a GPU without DLSS: the game's "
                      'own anti-aliasing.'))
