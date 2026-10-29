@@ -219,7 +219,7 @@ APP_DEFAULTS = {'game_dir': '', 'game_dir_u1': '', 'game_dir_u2': '', 'game_dir_
                 'pad_invert_y': False, 'art_banner': '', 'art_u1': '', 'art_u2': '', 'art_u3': '', 'steam_art': '', 'art_crops': {},
                 'shortcut_name': 'Uncharted: The Nathan Drake Collection', 'shortcut_icon': '', 'trophy_game': 'u1',
                 'pad_vibration': True, 'pad_vibration_strength': '100', 'button_prompts': 'auto', 'key_bindings': {}, 'pad_bindings': {}, 'check_updates': True,
-                'vr': False, 'vr_eye_size': '2160', 'vr_dlss': True,  # VR fork: the VR card (Display page)
+                'vr': False, 'vr_eye_size': '2160', 'vr_dlss': False,  # VR fork: the VR card (Display page)
                 **{key: 'auto' for key in FIXES},
                 **{f'{game}_infinite_{cheat}': False for game, _t, _s, _e in GAMES for cheat in ('health', 'ammo')}}
 
@@ -522,7 +522,7 @@ def vr_environment(s, env):
         env['BB_VR_EYE_RES'] = str(s.get('vr_eye_size') or '2160')
         env['BB_FRAME_GEN'] = 'off'
         # DLSS (DLAA: each eye at its own size, its own history) or the game's own anti-aliasing; nothing else in stereo.
-        env['BB_UPSCALER'] = 'dlss' if s.get('vr_dlss', True) else 'off'
+        env['BB_UPSCALER'] = 'dlss' if s.get('vr_dlss', False) else 'off'
         env['BB_UPSCALE_PRESET'] = '0'
         # The headset paces the game: the game runs unpaced and each flip waits for the headset's next frame once it
         # keeps up (vr_openxr.cpp FramePeriod): the game's frame rate is the headset's refresh rate.

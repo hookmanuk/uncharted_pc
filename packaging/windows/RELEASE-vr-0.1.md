@@ -10,7 +10,8 @@ Download `uncharted-windows.zip`, unzip it anywhere and run `Uncharted.exe`. Not
    Meta Link, Windows Mixed Reality).
 3. Play page: pick Drake's Fortune and press **PLAY**. F8 recentres.
 
-- Uncharted 1: 3D with head tracking, HUD on its own layer, NVIDIA DLSS on GeForce RTX, the headset's own refresh rate.
+- Uncharted 1: 3D with head tracking, HUD on its own layer, the headset's own refresh rate.
+  NVIDIA DLSS (GeForce RTX) is optional and off by default.
   Resolution per eye on the Display page (start at 2160).
 - Menus and cutscene videos show on a large screen in front of you.
 - The first run builds shaders and can stutter or glitch; run again.

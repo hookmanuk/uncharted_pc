@@ -46,8 +46,8 @@ Starting
 VR (this is the VR edition: vr-0.1)
 - Display page -> "Play in a VR headset (OpenXR)", then PLAY. Needs an OpenXR runtime: SteamVR (set as the
   active OpenXR runtime), Virtual Desktop, Oculus/Meta Link or Windows Mixed Reality. Start the runtime first.
-- Uncharted 1 is playable: 3D with head tracking (both eyes drawn together), the HUD on its own layer, DLSS on
-  GeForce RTX, and the headset's own refresh rate. Menus and cutscene videos show on a large screen in front of
+- Uncharted 1 is playable: 3D with head tracking (both eyes drawn together), the HUD on its own layer, and the headset's own refresh rate.
+  NVIDIA DLSS (GeForce RTX) is optional and off by default: the "NVIDIA DLSS in VR" option. Menus and cutscene videos show on a large screen in front of
   you. F8 recentres.
 - Uncharted 2 and 3 are untested and likely broken in VR.
 - "Resolution per eye": lower is faster, higher is sharper. Start at 2160; 3584 needs a fast GPU.
