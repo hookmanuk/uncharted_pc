@@ -70,6 +70,8 @@ void AdjustBlend(AmdGpu::BlendControl& control, u64 target_address);
 
 /// Development (DRAWLOG trigger): log the next 5000 single-target draws.
 void LogDraws();
+/// The draw log (LogDraws) is running.
+bool LoggingDraws();
 /// Development (DRAWLOG): compute dispatches are logged too (their shader).
 void LogDispatch(u64 cs_hash);
 

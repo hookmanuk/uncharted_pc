@@ -678,6 +678,10 @@ std::mutex g_skip_mutex;
 std::vector<u64> g_skip;
 std::atomic<bool> g_skip_any{false};
 
+bool LoggingDraws() {
+    return g_log_draws.load(std::memory_order_relaxed) > 0;
+}
+
 void SetSkippedShaders(const std::string& list) {
     std::vector<u64> hashes;
     std::string token;

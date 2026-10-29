@@ -22,6 +22,7 @@
 #include "video_core/renderer_vulkan/vk_scheduler.h"
 #include "video_core/renderer_vulkan/vr/vr_fixes.h"
 #include "video_core/renderer_vulkan/vr/vr_multiview.h"
+#include "video_core/renderer_vulkan/vr/vr_stereo.h"
 #include "video_core/renderer_vulkan/vr/vr_openxr.h"
 #include "video_core/texture_cache/image.h"
 #include "video_core/texture_cache/image_view.h"
@@ -554,9 +555,17 @@ void SetShift(float shift) {
     g_shift = shift;
 }
 
+extern u64 g_dispatch_hash;
+
 void NoteImage(const VideoCore::Image& image, bool storage) {
     if (storage && Stereo(image)) {
         g_writes_stereo = true;
+    }
+    if (storage && g_dispatch_hash && Stereo::LoggingDraws()) { // the draw log: what each compute writes
+        std::printf("VR dispatch writes: cs %#llx image %#llx %ux%u layers %u\n", (unsigned long long)g_dispatch_hash,
+                    (unsigned long long)image.info.guest_address, image.info.size.width, image.info.size.height,
+                    Stereo(image) ? 2u : 1u);
+        std::fflush(stdout);
     }
     if (g_audit) {
         std::scoped_lock lock{g_audit_mutex};
