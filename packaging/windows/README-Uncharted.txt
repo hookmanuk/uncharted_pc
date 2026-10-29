@@ -15,8 +15,8 @@ Requirements
 Starting
 - Uncharted.exe opens the launcher. On the Game page choose your game folder, pick
   Drake's Fortune, Among Thieves or Drake's Deception on the Play page and press PLAY.
-- Play Uncharted.exe starts the game straight away with the settings saved in the
-  launcher, without opening it (for shortcuts and Steam). Uncharted.exe --play does the same.
+- Uncharted.exe --play starts the game straight away with the settings saved in the
+  launcher, without opening it (for shortcuts and Steam).
 - Play page -> "Add to Steam" adds the collection to your Steam library, with its cover
   from your game folder. "Desktop shortcut" puts it on the desktop.
 - Your own covers: put u1.jpg, u2.jpg and u3.jpg (and a wide collection_banner.jpg for the
@@ -42,6 +42,19 @@ Starting
   folder. A trophy the game awards shows as a notice at the top of the screen and on the launcher's
   Trophies page (BB_TROPHY_POPUP=0 in Advanced -> Environment hides the notice). Earned trophies
   are kept in user\trophy\ with the saves, one list per game.
+
+VR (this is the VR edition: vr-0.1)
+- Display page -> "Play in a VR headset (OpenXR)", then PLAY. Needs an OpenXR runtime: SteamVR (set as the
+  active OpenXR runtime), Virtual Desktop, Oculus/Meta Link or Windows Mixed Reality. Start the runtime first.
+- Uncharted 1 is playable: 3D with head tracking (both eyes drawn together), the HUD on its own layer, DLSS on
+  GeForce RTX, and the headset's own refresh rate. Menus and cutscene videos show on a large screen in front of
+  you. F8 recentres.
+- Uncharted 2 and 3 are untested and likely broken in VR.
+- "Resolution per eye": lower is faster, higher is sharper. Start at 2160; 3584 needs a fast GPU.
+- With VR on, the flat-screen display options (resolution, frame rate, anti-aliasing, frame generation) are hidden:
+  the headset sets them.
+- The first run builds shaders and can stutter and show glitches; run again, the second run is the real one.
+- Report problems with the log (user\last_run.log).
 
 Data
 - Saves and shader caches: user\ next to Uncharted.exe (the launcher can pick another folder).

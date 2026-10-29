@@ -1,13 +1,13 @@
 #!/usr/bin/env bash
 # Builds dist/uncharted-windows/ (and dist/uncharted-windows.zip): Uncharted.exe (the launcher,
-# frozen with PyInstaller so players need no Python), Play Uncharted.exe, bb-probe.exe with the
+# frozen with PyInstaller so players need no Python), bb-probe.exe with the
 # MSYS2 CLANG64 DLLs it needs, the preparation scripts and run.py. Run from an MSYS2 CLANG64
 # shell after `bash build.sh`. Freezing uses a Windows Python 3.10+ (python.org; WINPYTHON
 # overrides) and a private venv in out/pyenv with PyInstaller and Pillow.
 set -euo pipefail
 cd -- "$(dirname -- "$0")/../.."
 source ./msys2-env.sh
-[[ -f out/bb-probe.exe && -f out/bb-gpu-capabilities.exe && -f out/bb-play.exe ]] || { echo 'Build first: bash build.sh' >&2; exit 1; }
+[[ -f out/bb-probe.exe && -f out/bb-gpu-capabilities.exe ]] || { echo 'Build first: bash build.sh' >&2; exit 1; }
 
 # A Windows Python (not MSYS2's) for PyInstaller.
 python=${WINPYTHON:-}
@@ -44,7 +44,7 @@ dest=out/stage/uncharted-windows
 rm -rf -- out/stage
 mkdir -p "$dest/bin" "$dest/launcher" "$dest/scripts" "$dest/patches"
 cp -r out/pyi-dist/Uncharted/. "$dest/"
-llvm-strip -o "$dest/Play Uncharted.exe" out/bb-play.exe
+# VR fork: no "Play Uncharted.exe": one launcher, Uncharted.exe (--play starts the game without the window).
 cp launcher/uncharted.ico launcher/uncharted.png "$dest/launcher/"
 # The executables without debug information (out/ keeps the symbols for crash reports).
 for exe in bb-probe.exe bb-gpu-capabilities.exe; do

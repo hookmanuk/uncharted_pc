@@ -1513,8 +1513,8 @@ class Launcher:
         self.section(f, _('VR'), top=6)
         self.check(f, 'vr', _('Play in a VR headset (OpenXR)'),
                    _('Starts your OpenXR runtime (SteamVR, Virtual Desktop, ...) with the game. Uncharted 1 plays in 3D '
-                     'with head tracking; Uncharted 2 and 3 show on a large screen in front of you for now, as do '
-                     'menus and cutscene videos. Frame generation stays off in VR. F8 recentres. The flat-screen '
+                     'with head tracking; Uncharted 2 and 3 are untested and likely broken in VR. Menus and '
+                     'cutscene videos show on a large screen in front of you. Frame generation stays off in VR. F8 recentres. The flat-screen '
                      'display settings are hidden while this is on: the headset sets the frame rate.'))
         self.check(f, 'vr_dlss', _('NVIDIA DLSS in VR (DLAA, GeForce RTX)'),
                    _("Smooths edges with DLSS in each eye at the size below. Off, or on a GPU without DLSS: the game's "
