@@ -655,7 +655,11 @@ void UpdateHead() {
     const float ex = views[1].pose.position.x - views[0].pose.position.x,
                 ey = views[1].pose.position.y - views[0].pose.position.y,
                 ez = views[1].pose.position.z - views[0].pose.position.z;
-    g.ipd = std::sqrt(ex * ex + ey * ey + ez * ez);
+    // An eye distance under a centimetre is a pose the runtime could not give (both eyes at the origin): the last one
+    // stays (a shift of 0 for one frame left grey shards, Multiview::SetShift).
+    if (const float ipd = std::sqrt(ex * ex + ey * ey + ez * ez); std::isfinite(ipd) && ipd >= 0.01f) {
+        g.ipd = ipd;
+    }
     if (const float ipd = g_ipd_override.load(std::memory_order_relaxed); ipd >= 0.f) {
         g.ipd = ipd;
     }

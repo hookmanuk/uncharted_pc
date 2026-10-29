@@ -523,10 +523,27 @@ bool EyeSceneConstants(const u32* scene, u32 bytes, const float* camera, std::ar
     return true;
 }
 
+// The headset thread sets the shift each headset frame while the game's draws read it as they are recorded: a change
+// between a frame's depth pass and its colour pass made the two disagree (the colour pass's depth test missed the
+// depth pass's near geometry by the difference / w, and the G-buffer kept its clear grey there: one-frame grey shards
+// on SteamVR, Matt 2026-10-29 in the jungle; IPD 0, a constant shift, had none). The shift now changes only when it
+// really does (the eye distance or the field of view: by more than 0.1%), and never to a value that is not finite.
 void SetShift(float shift) {
+    if (!std::isfinite(shift) || shift < 0.f) {
+        static int bad = 0;
+        if (bad++ < 20) {
+            std::printf("VR multiview: eye clip shift %g ignored\n", shift);
+            std::fflush(stdout);
+        }
+        return;
+    }
+    const float current = g_shift;
+    if (std::abs(shift - current) <= 1e-3f * std::max(std::abs(current), 1e-6f) && !(current == 0.f && shift > 0.f)) {
+        return;
+    }
     static int logged = 0;
-    if (logged++ % 900 == 0) {
-        std::printf("VR multiview: eye clip shift %.4f\n", shift);
+    if (logged++ < 200) {
+        std::printf("VR multiview: eye clip shift %.6f (was %.6f)\n", shift, current);
         std::fflush(stdout);
     }
     g_shift = shift;
