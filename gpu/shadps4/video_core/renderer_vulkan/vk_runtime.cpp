@@ -687,7 +687,9 @@ void Runtime::ClearImage(VideoCore::Image* dst, const VideoCore::SubresourceRang
         .baseMipLevel = range.base.level,
         .levelCount = range.extent.levels,
         .baseArrayLayer = range.base.layer,
-        .layerCount = range.extent.layers,
+        // VR: a stereo image's right eye is its second layer, which the guest's range never names: cleared only in
+        // the left eye, the right kept old frames wherever the next pass draws nothing (the jungle's sun shadows).
+        .layerCount = range.extent.layers + (Vr::Multiview::Stereo(*dst) && range.base.layer == 0 ? 1u : 0u),
     };
     scheduler.Record([image = dst->GetImage(), color = clear_value.color,
                       vk_range](vk::CommandBuffer cmdbuf) {
