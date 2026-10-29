@@ -4,6 +4,7 @@
 //   WATCH     "<hex address> [length 1|2|4|8] [w|rw]": hardware data watch (DR0) on every thread; each hit logs the
 //             instruction after the access (absolute, and relative to its allocation: the game image) for 300 hits.
 //             An empty WATCH file removes the watch.
+//   FLASHRING the flash ring (F10, BB_VR_FLASH_RING=1) written to flashring.raw, as F9 does
 
 #include <algorithm>
 #include <atomic>
@@ -266,6 +267,9 @@ void Poll() {
     }
     if (Take("EYES")) {
         Stereo::DumpEyes();
+    }
+    if (Take("FLASHRING")) { // the flash ring (F10) saved, as F9 does
+        Stereo::SaveFlashRing();
     }
     if (Take("DRAWLOG")) {
         Stereo::LogDraws();

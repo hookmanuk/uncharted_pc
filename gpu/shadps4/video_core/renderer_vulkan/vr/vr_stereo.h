@@ -91,6 +91,15 @@ void StartFrameLog(u32 frames);
 /// The headset thread: a shown frame for the frame log (the stereo scene, or the flat screen: menus, videos).
 void FrameLog(VkCommandBuffer cmd, VkImage image, VkImageLayout layout, u32 width, u32 height);
 
+/// Flash ring (Matt 2026-10-29: one-frame grey flashes in the jungle, too quick for F9): while on, both eyes of every
+/// frame shown in stereo go into a ring of BB_VR_FLASH_RING_FRAMES (default 300, ~3.3 s at 90 Hz) thumbnails,
+/// BB_VR_FLASH_RING_SIZE per eye (default 384), side by side, in host memory; no GPU sync. F10 turns it on and off
+/// (BB_VR_FLASH_RING=1: on from the start); F9 while it is on writes the ring, oldest first, to
+/// %TEMP%\dcvr\flashring.raw (u32 width, height, count; the RGBA frames; a u64 steady-clock microsecond time each).
+void ToggleFlashRing();
+bool FlashRingOn();
+void SaveFlashRing();
+
 /// Dev hook at the TAA resolve (once per rendered frame, before its scene copy): the camera's world position the GPU
 /// renders this frame with. Picks the head pose that view was made with (Camera::RenderedAt) for the frame's layer.
 void OnFrameCamera(const float* position);

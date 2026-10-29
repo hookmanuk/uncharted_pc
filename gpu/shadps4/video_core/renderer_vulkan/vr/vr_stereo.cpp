@@ -12,8 +12,10 @@
 #include <cstdlib>
 #include <cstring>
 #include <deque>
+#include <memory>
 #include <mutex>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include "video_core/host_shaders/vr_luma_sharpen_comp.h"
@@ -1292,6 +1294,200 @@ void FrameLog(VkCommandBuffer cmd, VkImage scene, VkImageLayout layout, u32 w, u
     }
 }
 
+namespace {
+
+// The flash ring (vr_stereo.h): state on the headset thread; requests from the key poll.
+const u32 FlashRingSize = [] {
+    const char* v = std::getenv("BB_VR_FLASH_RING_SIZE");
+    return v ? std::clamp<u32>(u32(std::atoi(v)), 64, 1024) : 384u;
+}();
+const u32 FlashRingFrames = [] {
+    const char* v = std::getenv("BB_VR_FLASH_RING_FRAMES");
+    return v ? std::clamp<u32>(u32(std::atoi(v)), 10, 2000) : 300u;
+}();
+std::atomic<bool> g_ring_wanted{[] {
+    const char* v = std::getenv("BB_VR_FLASH_RING");
+    return v && v[0] == '1';
+}()};
+std::atomic<bool> g_ring_save{false};
+struct FlashRingState {
+    VkBuffer buffer{};
+    VkDeviceMemory memory{};
+    void* mapped = nullptr;
+    bool coherent = true;
+    Image thumb;
+    u32 next = 0;    // the slot the next frame goes to
+    u32 filled = 0;  // slots holding a frame
+    u32 save_in = 0; // frames until the save (its last copies done), recording paused
+    std::vector<u64> times;
+} g_ring;
+
+VkDeviceSize FlashRingFrameBytes() {
+    return VkDeviceSize(FlashRingSize) * 2 * FlashRingSize * 4;
+}
+
+// Host-visible memory, cached if there is any (the save reads it all back on the CPU).
+bool MakeFlashRing() {
+    VkBufferCreateInfo info{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
+    info.size = FlashRingFrameBytes() * FlashRingFrames;
+    info.usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+    if (VKD.vkCreateBuffer(g.device, &info, nullptr, &g_ring.buffer) != VK_SUCCESS) {
+        g_ring.buffer = VK_NULL_HANDLE;
+        return false;
+    }
+    VkMemoryRequirements req{};
+    VKD.vkGetBufferMemoryRequirements(g.device, g_ring.buffer, &req);
+    VkPhysicalDeviceMemoryProperties memory{};
+    VKD.vkGetPhysicalDeviceMemoryProperties(g.physical_device, &memory);
+    u32 type = memory.memoryTypeCount;
+    for (const VkMemoryPropertyFlags want :
+         {VkMemoryPropertyFlags(VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_CACHED_BIT),
+          VkMemoryPropertyFlags(VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT)}) {
+        for (u32 t = 0; t < memory.memoryTypeCount && type == memory.memoryTypeCount; ++t) {
+            if ((req.memoryTypeBits & (1u << t)) && (memory.memoryTypes[t].propertyFlags & want) == want) {
+                type = t;
+            }
+        }
+    }
+    VkMemoryAllocateInfo alloc{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
+    alloc.allocationSize = req.size;
+    alloc.memoryTypeIndex = type;
+    if (type == memory.memoryTypeCount ||
+        VKD.vkAllocateMemory(g.device, &alloc, nullptr, &g_ring.memory) != VK_SUCCESS) {
+        g_ring.memory = VK_NULL_HANDLE;
+        return false;
+    }
+    g_ring.coherent = (memory.memoryTypes[type].propertyFlags & VK_MEMORY_PROPERTY_HOST_COHERENT_BIT) != 0;
+    VKD.vkBindBufferMemory(g.device, g_ring.buffer, g_ring.memory, 0);
+    VKD.vkMapMemory(g.device, g_ring.memory, 0, VK_WHOLE_SIZE, 0, &g_ring.mapped);
+    g_ring.times.assign(FlashRingFrames, 0);
+    g_ring.next = g_ring.filled = g_ring.save_in = 0;
+    return g_ring.mapped != nullptr;
+}
+
+void FreeFlashRing() {
+    if (g_ring.mapped) {
+        VKD.vkUnmapMemory(g.device, g_ring.memory);
+    }
+    if (g_ring.memory) {
+        VKD.vkFreeMemory(g.device, g_ring.memory, nullptr);
+    }
+    if (g_ring.buffer) {
+        VKD.vkDestroyBuffer(g.device, g_ring.buffer, nullptr);
+    }
+    g_ring.buffer = VK_NULL_HANDLE;
+    g_ring.memory = VK_NULL_HANDLE;
+    g_ring.mapped = nullptr;
+}
+
+// The ring, oldest first, to %TEMP%\dcvr\flashring.raw (copied out here, written on a thread of its own).
+void WriteFlashRing() {
+    if (!g_ring.coherent) {
+        VkMappedMemoryRange range{VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE};
+        range.memory = g_ring.memory;
+        range.size = VK_WHOLE_SIZE;
+        VKD.vkInvalidateMappedMemoryRanges(g.device, 1, &range);
+    }
+    const size_t frame_bytes = size_t(FlashRingFrameBytes());
+    const u32 count = g_ring.filled;
+    const u32 first = count < FlashRingFrames ? 0 : g_ring.next;
+    auto pixels = std::make_shared<std::vector<u8>>(frame_bytes * count);
+    auto times = std::make_shared<std::vector<u64>>(count);
+    for (u32 i = 0; i < count; ++i) {
+        const u32 slot = (first + i) % FlashRingFrames;
+        std::memcpy(pixels->data() + frame_bytes * i, static_cast<const u8*>(g_ring.mapped) + frame_bytes * slot,
+                    frame_bytes);
+        (*times)[i] = g_ring.times[slot];
+    }
+    std::thread([pixels, times, count] {
+        const char* temp = std::getenv("TEMP");
+        char path[512];
+        std::snprintf(path, sizeof(path), "%s\\dcvr\\flashring.raw", temp ? temp : ".");
+        if (FILE* f = std::fopen(path, "wb")) {
+            const u32 header[3] = {FlashRingSize * 2, FlashRingSize, count};
+            std::fwrite(header, 4, 3, f);
+            std::fwrite(pixels->data(), 1, pixels->size(), f);
+            std::fwrite(times->data(), 8, times->size(), f);
+            std::fclose(f);
+        }
+        Log("flash ring written (%TEMP%\\dcvr\\flashring.raw)");
+    }).detach();
+}
+
+// The headset thread, each stereo frame: both eyes into the ring (left `scene`, right `right`, or the left twice).
+void FlashRing(VkCommandBuffer cmd, VkImage scene, VkImageLayout scene_layout, VkImage right,
+               VkImageLayout right_layout, u32 w, u32 h) {
+    if (!g_ring_wanted.load(std::memory_order_relaxed)) {
+        if (g_ring.buffer) {
+            FreeFlashRing();
+            Log("flash ring off");
+        }
+        return;
+    }
+    if (!g_ring.buffer) {
+        if (!MakeFlashRing() ||
+            !Make(g_ring.thumb, VK_FORMAT_R8G8B8A8_UNORM, FlashRingSize * 2, FlashRingSize,
+                  VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT)) {
+            FreeFlashRing();
+            g_ring_wanted = false;
+            Log("flash ring: no memory for it");
+            return;
+        }
+        char text[96];
+        std::snprintf(text, sizeof(text), "flash ring on: %u frames of %ux%u, F9 saves them", FlashRingFrames,
+                      FlashRingSize * 2, FlashRingSize);
+        Log(text);
+    }
+    if (g_ring.save_in > 0) {
+        if (--g_ring.save_in == 0) {
+            WriteFlashRing();
+            g_ring.next = g_ring.filled = 0;
+        }
+        return;
+    }
+    if (g_ring_save.exchange(false)) {
+        g_ring.save_in = 8; // the last copies are done by then
+        return;
+    }
+    Barrier(cmd, g_ring.thumb.image, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+    for (int eye = 0; eye < 2; ++eye) {
+        VkImageBlit blit{};
+        blit.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+        blit.srcOffsets[1] = {s32(w), s32(h), 1};
+        blit.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+        blit.dstOffsets[0] = {s32(FlashRingSize) * eye, 0, 0};
+        blit.dstOffsets[1] = {s32(FlashRingSize) * (eye + 1), s32(FlashRingSize), 1};
+        VKD.vkCmdBlitImage(cmd, eye && right ? right : scene, eye && right ? right_layout : scene_layout,
+                           g_ring.thumb.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &blit, VK_FILTER_LINEAR);
+    }
+    Barrier(cmd, g_ring.thumb.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
+    VkBufferImageCopy region{};
+    region.bufferOffset = FlashRingFrameBytes() * g_ring.next;
+    region.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+    region.imageExtent = {FlashRingSize * 2, FlashRingSize, 1};
+    VKD.vkCmdCopyImageToBuffer(cmd, g_ring.thumb.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, g_ring.buffer, 1,
+                               &region);
+    g_ring.times[g_ring.next] = u64(std::chrono::duration_cast<std::chrono::microseconds>(
+                                        std::chrono::steady_clock::now().time_since_epoch())
+                                        .count());
+    g_ring.next = (g_ring.next + 1) % FlashRingFrames;
+    g_ring.filled = std::min(g_ring.filled + 1, FlashRingFrames);
+}
+
+} // namespace
+
+void ToggleFlashRing() {
+    g_ring_wanted = !g_ring_wanted.load();
+}
+
+bool FlashRingOn() {
+    return g_ring_wanted.load();
+}
+
+void SaveFlashRing() {
+    g_ring_save = true;
+}
+
 bool ReticleAiming() {
     static const float threshold = [] {
         const char* v = std::getenv("BB_VR_RETICLE_XSCALE");
@@ -1335,6 +1531,8 @@ void RecordEyes(vk::CommandBuffer command_buffer, const Frame& frame, const VkIm
         Log("eyes written");
     }
     FrameLog(cmd, slot.scene.image, VK_IMAGE_LAYOUT_GENERAL, w, h);
+    FlashRing(cmd, slot.scene.image, VK_IMAGE_LAYOUT_GENERAL, slot.has_right ? slot.scene_right.image : VK_NULL_HANDLE,
+              VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, w, h);
     const bool dump = g_eye_dump_frames == 0 && g_eye_dump_requested.exchange(false) &&
                       MakeReadback(g_eye_dump, VkDeviceSize(w) * h * 4 * 4);
     if (dump) {

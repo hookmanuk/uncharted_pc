@@ -1221,12 +1221,25 @@ void RecordFrame(vk::CommandBuffer cmd, vk::Image frame, u32 width, u32 height, 
         std::error_code ec;
         const char* temp = std::getenv("TEMP");
         std::filesystem::create_directories(std::filesystem::path(temp ? temp : ".") / "dcvr", ec);
-        Stereo::DumpEyes();
-        Stereo::LogDraws();
-        Camera::LogNext(40);
-        Log("capture (F9): eyes to %%TEMP%%/dcvr/eye_0..3.raw, the frame's draws below");
+        if (Stereo::FlashRingOn()) { // F10's ring: the last seconds, for a flash already gone
+            Stereo::SaveFlashRing();
+            Log("capture (F9): the flash ring to %%TEMP%%/dcvr/flashring.raw");
+        } else {
+            Stereo::DumpEyes();
+            Stereo::LogDraws();
+            Camera::LogNext(40);
+            Log("capture (F9): eyes to %%TEMP%%/dcvr/eye_0..3.raw, the frame's draws below");
+        }
     }
     f9_down = f9;
+    // F10: the flash ring on or off (Stereo::ToggleFlashRing: both eyes of the last seconds, for F9).
+    static bool f10_down = false;
+    const bool f10 = (GetAsyncKeyState(VK_F10) & 0x8000) != 0;
+    if (f10 && !f10_down) {
+        Stereo::ToggleFlashRing();
+        Log("flash ring (F10): %s", Stereo::FlashRingOn() ? "on" : "off");
+    }
+    f10_down = f10;
 #endif
     g.pending = {};
     ++g.count_flips; // development: the VR report's game flips
