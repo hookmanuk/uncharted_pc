@@ -881,8 +881,9 @@ void OnDraw(Scheduler& scheduler, Runtime& runtime, VideoCore::TextureCache& tex
     // DRAWLOG: multi-target draws too (the G-buffer passes), marked "mrt N".
     if (targets >= 2 && g_log_draws.load(std::memory_order_relaxed) > 0 && g_log_draws.fetch_sub(1) > 0 && color_id) {
         const auto& image = texture_cache.GetImage(color_id);
-        std::printf("VR draws: vs %#llx ps %#llx target %ux%u format %d at %#llx mrt %d idx %u inst %u\n",
-                    (unsigned long long)vs_hash, (unsigned long long)key.stage_hashes[0], image.info.size.width,
+        std::printf("VR draws: vs %#llx ps %#llx (pgm %#llx) target %ux%u format %d at %#llx mrt %d idx %u inst %u\n",
+                    (unsigned long long)vs_hash, (unsigned long long)key.stage_hashes[0],
+                    (unsigned long long)(fs ? fs->pgm_hash : 0), image.info.size.width,
                     image.info.size.height, int(image.info.pixel_format), (unsigned long long)image.info.guest_address,
                     targets, g_log_indices, g_log_instances);
     }

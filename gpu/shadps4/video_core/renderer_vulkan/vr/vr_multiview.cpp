@@ -791,6 +791,46 @@ void SetShadowEyeScale(float scale) {
 std::unique_ptr<VideoCore::Buffer> g_eye_constants; // the per-eye copies, a ring (a few KB a frame, 256 KB)
 u64 g_eye_constants_next = 0;
 
+// Full-screen light passes that rebuild a pixel's view position from the centre camera and the eye's depth: x =
+// (c[ray] u + c[ray + 2]) z (u the pixel's texture coordinate), then world = rows (x, y, z, 1) with the rows at
+// c[row], c[row + 4], c[row + 8] (their translation at + 3). U1's torch shadows (pgm 8a04b99b, buffer 0: ray c12/c14,
+// rows c16, c20, c24; then the torch's shadow matrix; also pgm fe99f21a, the same layout): every point sat the eye's offset sideways, so the torch's
+// shadows behind the timbers were offset per eye (Matt 2026-10-29: "The shadow offset per eye is just too far apart").
+// The eye sits at Δ = s c14 in the centre's view space (s its clip shift, c14 = -1 / P00), so each eye's copy moves the
+// rows' translation by row.x Δ. BB_VR_EYE_RAY_PS "pgm:buffer:ray:row,...;..." (hex pgm; empty: none).
+struct EyeRayPass {
+    u64 pgm;
+    u32 buffer, ray, row;
+};
+const std::vector<EyeRayPass>& EyeRayPasses() {
+    static const std::vector<EyeRayPass> list = [] {
+        std::vector<EyeRayPass> out;
+        const char* env = std::getenv("BB_VR_EYE_RAY_PS");
+        const char* p = env ? env : "8a04b99b:0:14:16;fe99f21a:0:14:16";
+        while (*p) {
+            EyeRayPass e{};
+            char* end = nullptr;
+            e.pgm = std::strtoull(p, &end, 16);
+            if (end == p || *end != ':') {
+                break;
+            }
+            e.buffer = u32(std::strtoul(end + 1, &end, 10));
+            if (*end != ':') {
+                break;
+            }
+            e.ray = u32(std::strtoul(end + 1, &end, 10));
+            if (*end != ':') {
+                break;
+            }
+            e.row = u32(std::strtoul(end + 1, &end, 10));
+            out.push_back(e);
+            p = *end ? end + 1 : end;
+        }
+        return out;
+    }();
+    return list;
+}
+
 bool EyeConstants(const Instance& instance, u64 stage_hash, u32 buffer_index, vk::DescriptorBufferInfo& left,
                   vk::DescriptorBufferInfo& right) {
     static const bool on = [] {
@@ -803,19 +843,38 @@ bool EyeConstants(const Instance& instance, u64 stage_hash, u32 buffer_index, vk
     }();
     const auto binding = t_eye_binding;
     constexpr u32 bytes = ShadowCascades * ShadowCascadeFloats * 4;
-    if (!on || !g_enabled || stage_hash != ShadowResolvePs || buffer_index != 2) {
-        return false;
+    const EyeRayPass* ray_pass = nullptr;
+    for (const EyeRayPass& e : EyeRayPasses()) {
+        if (e.pgm == stage_hash && e.buffer == buffer_index) {
+            ray_pass = &e;
+        }
     }
-    // Counted in the log (applied / skipped), so a run shows the correction ran.
-    static u32 applied = 0, skipped = 0;
-    const bool usable = binding.valid && binding.size >= bytes && binding.adjust <= 256 && binding.address;
-    if ((usable ? applied++ : skipped++) % 10000 == 0) {
-        std::printf("VR shadows per eye: applied %u, skipped %u (u z moved by -+%g)\n", applied, skipped,
-                    0.5 * g_shift * g_shadow_eye_scale.load(std::memory_order_relaxed));
-        std::fflush(stdout);
-    }
-    if (!usable) {
+    if (ray_pass) {
+        static u32 applied = 0, skipped = 0;
+        const bool usable = g_enabled && binding.valid && binding.size >= (ray_pass->row + 12) * 4 &&
+                            binding.adjust <= 256 && binding.address;
+        if ((usable ? applied++ : skipped++) % 10000 == 0) {
+            std::printf("VR light rays per eye: pgm %#llx applied %u, skipped %u\n", (unsigned long long)stage_hash,
+                        applied, skipped);
+            std::fflush(stdout);
+        }
+        if (!usable) {
+            return false;
+        }
+    } else if (!on || !g_enabled || stage_hash != ShadowResolvePs || buffer_index != 2) {
         return false;
+    } else {
+        // Counted in the log (applied / skipped), so a run shows the correction ran.
+        static u32 applied = 0, skipped = 0;
+        const bool usable = binding.valid && binding.size >= bytes && binding.adjust <= 256 && binding.address;
+        if ((usable ? applied++ : skipped++) % 10000 == 0) {
+            std::printf("VR shadows per eye: applied %u, skipped %u (u z moved by -+%g)\n", applied, skipped,
+                        0.5 * g_shift * g_shadow_eye_scale.load(std::memory_order_relaxed));
+            std::fflush(stdout);
+        }
+        if (!usable) {
+            return false;
+        }
     }
     const float half = 0.5f * g_shift * g_shadow_eye_scale.load(std::memory_order_relaxed);
     std::scoped_lock lock{g_eye_mutex};
@@ -841,6 +900,16 @@ bool EyeConstants(const Instance& instance, u64 stage_hash, u32 buffer_index, vk
         std::memcpy(dst + binding.adjust,
                     binding.ring_data ? binding.ring_data : reinterpret_cast<const void*>(binding.address), binding.size);
         auto* f = reinterpret_cast<float*>(dst + binding.adjust);
+        if (ray_pass) {
+            const float scale = g_light_eye_scale.load(std::memory_order_relaxed);
+            const float delta = (eye == 0 ? g_shift : -g_shift) * scale * f[ray_pass->ray];
+            for (u32 k = 0; k < 3; ++k) {
+                float* r = f + ray_pass->row + k * 4;
+                r[3] += r[0] * delta;
+            }
+            *infos[eye] = vk::DescriptorBufferInfo{g_eye_constants->Handle(), offset, range};
+            continue;
+        }
         const float ex = sign * (eye == 0 ? -half : half); // the left eye's u z less
         for (u32 c = 0; c < ShadowCascades; ++c) {
             for (u32 row = 1; row <= 3; ++row) {
