@@ -8,6 +8,7 @@
 #include <cstdarg>
 #include <cstdio>
 #include <cstdlib>
+#include <filesystem>
 #include <cstring>
 #include <atomic>
 #include <condition_variable>
@@ -1212,6 +1213,20 @@ void RecordFrame(vk::CommandBuffer cmd, vk::Image frame, u32 width, u32 height, 
         Recenter();
     }
     f8_down = f8;
+    // F9: a capture for a report (Matt 2026-10-29, the jungle's right-eye light): both eyes, the scene and the HUD as
+    // sent to the headset (%TEMP%\dcvr\eye_0..3.raw), the next frames' draws and the camera into the log.
+    static bool f9_down = false;
+    const bool f9 = (GetAsyncKeyState(VK_F9) & 0x8000) != 0;
+    if (f9 && !f9_down) {
+        std::error_code ec;
+        const char* temp = std::getenv("TEMP");
+        std::filesystem::create_directories(std::filesystem::path(temp ? temp : ".") / "dcvr", ec);
+        Stereo::DumpEyes();
+        Stereo::LogDraws();
+        Camera::LogNext(40);
+        Log("capture (F9): eyes to %%TEMP%%/dcvr/eye_0..3.raw, the frame's draws below");
+    }
+    f9_down = f9;
 #endif
     g.pending = {};
     ++g.count_flips; // development: the VR report's game flips

@@ -925,8 +925,9 @@ void OnDraw(Scheduler& scheduler, Runtime& runtime, VideoCore::TextureCache& tex
         const auto& image = texture_cache.GetImage(color_id);
         u32 blend = 0;
         std::memcpy(&blend, &key.blend_controls[0], sizeof(blend));
-        std::printf("VR draws: vs %#llx ps %#llx target %ux%u format %d at %#llx blend %#x mask %#x idx %u inst %u%s%s\n",
-                    (unsigned long long)vs_hash, (unsigned long long)key.stage_hashes[0], image.info.size.width,
+        std::printf("VR draws: vs %#llx ps %#llx (pgm %#llx) target %ux%u format %d at %#llx blend %#x mask %#x idx %u inst %u%s%s\n",
+                    (unsigned long long)vs_hash, (unsigned long long)key.stage_hashes[0],
+                    (unsigned long long)(fs ? fs->pgm_hash : 0), image.info.size.width,
                     image.info.size.height, int(image.info.pixel_format), (unsigned long long)image.info.guest_address,
                     blend, u32(key.write_masks[0]), g_log_indices, g_log_instances,
                     FrameCapture::IsDisplayBuffer(image.info.guest_address) ? " (display)" : "",
