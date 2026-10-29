@@ -4,6 +4,7 @@
 #include "common/assert.h"
 #include "core/emulator_settings.h"
 #include "shader_recompiler/backend/spirv/emit_spirv_instructions.h"
+#include "shader_recompiler/backend/spirv/emit_spirv_vr.h" // VR
 #include "bbport_nan_guard.h"
 #include "shader_recompiler/backend/spirv/spirv_emit_context.h"
 #include "shader_recompiler/ir/attribute.h"
@@ -68,12 +69,12 @@ Id EmitReadConst(EmitContext& ctx, IR::Inst* inst, Id addr, Id offset) {
             ctx.OpIAdd(ctx.U32[1], ctx.ConstU32(flatbuf_off_dw & 0xFFFFu), index));
     }
     if (!EmulatorSettings.IsDirectMemoryAccessEnabled()) {
-        return ctx.EmitFlatbufferLoad(ctx.ConstU32(flatbuf_off_dw));
+        return Vr::EyeConst(ctx, flatbuf_off_dw, ctx.EmitFlatbufferLoad(ctx.ConstU32(flatbuf_off_dw))); // VR
     }
     if (flatbuf_off_dw == 0) {
         return ctx.OpFunctionCall(ctx.U32[1], ctx.read_const_dynamic, addr, offset);
     } else {
-        return ctx.EmitFlatbufferLoad(ctx.ConstU32(flatbuf_off_dw));
+        return Vr::EyeConst(ctx, flatbuf_off_dw, ctx.EmitFlatbufferLoad(ctx.ConstU32(flatbuf_off_dw))); // VR
     }
 }
 

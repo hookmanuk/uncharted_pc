@@ -165,6 +165,75 @@ void EyeBuffers(EmitContext& ctx) {
     }
 }
 
+// Computes that light each pixel from its view position rebuilt as the centre camera's ray times the eye's depth
+// (U1's light pass 43b8ee5e: p = (u z, v z, z), u = c26 (x + 1/2) + c28, then the world position M p + T with the rows
+// at c30, c34, c38 and their translation at c33, c37, c41, against the light at c22-24: the torch). An eye whose clip
+// is shifted by s sees a pixel's point at (u z - s / P00, v z, z) in the centre's view space, so each eye's points sat
+// its offset away and the torch's shadows and light fell differently in each eye (Matt 2026-10-29: "shadows from my
+// torch light here are misaligned in each eye"). The translation T + M (e, 0, 0), e = -s / P00 = s c28 (c28: the ray at
+// the frame's left edge, -1 / P00), with s the eye's shift from the push data (Multiview::Adjust gives computes theirs).
+// BB_VR_EYE_LIGHT_CS "pgm:ray:row0,row1,row2;..." (hex pgm, dwords; empty: none).
+struct EyeLightCompute {
+    u64 pgm;
+    u32 ray;
+    u32 rows[3];
+};
+
+const std::vector<EyeLightCompute>& EyeLightComputes() {
+    static const std::vector<EyeLightCompute> list = [] {
+        std::vector<EyeLightCompute> out;
+        const char* env = std::getenv("BB_VR_EYE_LIGHT_CS");
+        const char* p = env ? env : "43b8ee5e:28:30,34,38";
+        while (*p) {
+            EyeLightCompute e{};
+            char* end = nullptr;
+            e.pgm = std::strtoull(p, &end, 16);
+            if (end == p || *end != ':') {
+                break;
+            }
+            e.ray = u32(std::strtoul(end + 1, &end, 10));
+            bool ok = *end == ':';
+            for (int k = 0; k < 3 && ok; ++k) {
+                e.rows[k] = u32(std::strtoul(end + 1, &end, 10));
+                ok = k == 2 || *end == ',';
+            }
+            if (!ok) {
+                break;
+            }
+            out.push_back(e);
+            p = *end ? end + 1 : end;
+        }
+        return out;
+    }();
+    return list;
+}
+
+Id EyeConst(EmitContext& ctx, u32 offset, Id value) {
+    if (!MultiviewShaders() || ctx.sw_stage != SwStage::Compute) {
+        return value;
+    }
+    for (const EyeLightCompute& e : EyeLightComputes()) {
+        if (e.pgm != ctx.info.pgm_hash) {
+            continue;
+        }
+        for (const u32 row : e.rows) {
+            if (offset != row + 3) {
+                continue;
+            }
+            const Id pointer = ctx.TypePointer(spv::StorageClass::PushConstant, ctx.F32[1]);
+            const Id shift = ctx.OpLoad(ctx.F32[1], ctx.OpAccessChain(pointer, ctx.push_data_block,
+                                                                      ctx.ConstU32(PushData::VrShiftIndex),
+                                                                      Layer(ctx)));
+            const Id ray = ctx.OpBitcast(ctx.F32[1], ctx.EmitFlatbufferLoad(ctx.ConstU32(e.ray)));
+            const Id coefficient = ctx.OpBitcast(ctx.F32[1], ctx.EmitFlatbufferLoad(ctx.ConstU32(row)));
+            const Id moved = ctx.OpFAdd(ctx.F32[1], ctx.OpBitcast(ctx.F32[1], value),
+                                        ctx.OpFMul(ctx.F32[1], coefficient, ctx.OpFMul(ctx.F32[1], shift, ray)));
+            return ctx.OpBitcast(ctx.U32[1], moved);
+        }
+    }
+    return value;
+}
+
 Id Coords(EmitContext& ctx, const EmitContext::TextureDefinition& texture, Id image, Id coords, bool integer) {
     if (!texture.vr_array) {
         return coords;

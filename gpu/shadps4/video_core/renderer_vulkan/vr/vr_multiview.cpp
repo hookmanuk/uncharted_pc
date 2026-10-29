@@ -44,6 +44,11 @@ std::mutex g_pipelines_mutex;
 std::unordered_map<VkPipeline, VkPipeline> g_twins; // pipeline -> its multiview twin
 
 float g_shift = 0.f;     // the eyes' clip shift (left +, right -)
+// The eye-light computes' correction scale (EyeConst; 1 normal, 0 off; development: the dev trigger LIGHTEYE).
+std::atomic<float> g_light_eye_scale{[] {
+    const char* v = std::getenv("BB_VR_LIGHT_EYE_SCALE");
+    return v && *v ? float(std::atof(v)) : 1.f;
+}()};
 bool g_writes_stereo = false; // the bindings so far write a two-layer image
 // Development audit (BB_VR_AUDIT=1): which passes make one picture for both eyes out of per-eye pictures. Every
 // draw and dispatch's inputs and outputs (images by guest range, storage buffers by range) are noted; a pass that runs
@@ -205,7 +210,7 @@ const char* CacheSuffix() {
         // _mv5: guest buffers are per-eye arrays in the shaders (EyeBufferInfo); view-dependent outputs move with the eye.
         // _mv6: projective samples move with the eye (emit_spirv_vr.cpp ProjectiveSample); their development settings
         // keep caches of their own.
-        std::string out = "_mv6";
+        std::string out = "_mv7"; // _mv7: the eye-light computes (EyeConst)
         for (const char* name : {"BB_VR_PROJECTIVE_SAMPLES", "BB_VR_PROJECTIVE_SCALE"}) {
             if (const char* v = std::getenv(name); v && *v) {
                 out += "_p";
@@ -764,6 +769,12 @@ std::atomic<float> g_shadow_eye_scale{[] {
     return v ? float(std::atof(v)) : 1.f;
 }()};
 
+void SetLightEyeScale(float scale) {
+    g_light_eye_scale.store(scale, std::memory_order_relaxed);
+    std::printf("VR multiview: eye-light correction x%g\n", scale);
+    std::fflush(stdout);
+}
+
 void SetShadowEyeScale(float scale) {
     g_shadow_eye_scale.store(scale, std::memory_order_relaxed);
 }
@@ -858,7 +869,9 @@ Shader::PushData Adjust(const Shader::PushData& push_data, bool compute) {
     }
     out.vr_eye = 0;
     if (compute) {
-        out.vr_shift = {0.f, 0.f};
+        // Only the eye-light computes read it (emit_spirv_vr.cpp EyeConst): vr_shift[vr_eye] is the dispatch's eye's.
+        const float k = g_light_eye_scale.load(std::memory_order_relaxed);
+        out.vr_shift = {g_shift * k, -g_shift * k};
         g_second_eye = g_writes_stereo || g_eye_dispatch; // a per-eye buffer: the right eye's dispatch writes its copy
         if (g_audit) {
             std::scoped_lock lock{g_audit_mutex};
@@ -889,7 +902,10 @@ void SecondEye(Scheduler& scheduler, vk::PipelineLayout layout, const Shader::Pu
         return;
     }
     Shader::PushData right = push_data;
-    right.vr_shift = {0.f, 0.f};
+    {
+        const float k = g_light_eye_scale.load(std::memory_order_relaxed);
+        right.vr_shift = {g_shift * k, -g_shift * k}; // as Adjust: the eye-light computes (EyeConst)
+    }
     right.vr_eye = 1;
     // The right eye's copies of per-eye buffers are not tracked by the buffer cache: their reads before and after.
     const bool eye_buffers = std::exchange(g_eye_dispatch, false);

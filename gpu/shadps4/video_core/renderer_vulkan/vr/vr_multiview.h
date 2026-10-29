@@ -89,6 +89,7 @@ vk::Pipeline Variant(vk::Pipeline pipeline, u16 view_mask);
 
 /// Each frame: the eyes' clip x shift (left eye +shift, right eye -shift; P00 x half the eye distance).
 void SetShift(float shift);
+void SetLightEyeScale(float scale);  // development: the eye-light computes' correction (1 normal, 0 off)
 void SetShadowEyeScale(float scale); // development: the per-eye shadow correction's scale (1 normal, 0 off)
 /// Deferred spot lights (vs 0xf719615a with pixel shaders 0xd80f041b, 0x7b2b16ed): the pixel shader rebuilds the lit
 /// point as light constants plus the view ray times the depth (light-relative: dwords 40-42 minus the ray; light

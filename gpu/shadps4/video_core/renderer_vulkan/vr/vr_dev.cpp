@@ -301,6 +301,9 @@ void Poll() {
     if (Take("IPD", &value)) {
         SetIpdOverride(value.empty() ? -1.f : float(std::atof(value.c_str())));
     }
+    if (Take("LIGHTEYE", &value)) { // the eye-light computes' correction (1 normal, 0 off)
+        Multiview::SetLightEyeScale(value.empty() ? 1.f : float(std::atof(value.c_str())));
+    }
     if (Take("SHSCALE", &value)) {
         Multiview::SetShadowEyeScale(value.empty() ? 1.f : float(std::atof(value.c_str())));
     }

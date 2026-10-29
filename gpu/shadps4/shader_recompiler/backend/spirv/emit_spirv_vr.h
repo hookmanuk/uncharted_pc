@@ -35,6 +35,11 @@ void EyeBuffers(EmitContext& ctx);
 /// After the interfaces: the MultiView capability and the view index input (graphics stages).
 void Define(EmitContext& ctx);
 
+/// A flat-buffer constant `value` read at dword `offset`: in the listed computes that rebuild a pixel's position from
+/// the centre camera's ray and the eye's depth (U1's light 43b8ee5e: the torch), the view-to-world translation moved by
+/// the eye's offset (emit_spirv_vr.cpp EyeConst). Otherwise `value`.
+Id EyeConst(EmitContext& ctx, u32 offset, Id value);
+
 /// `coords` with the eye's layer appended when the image is a VR array (float for sampling, integer otherwise;
 /// integer layers are clamped to the image's layers, `image` being the loaded image or, for atomics, null).
 Id Coords(EmitContext& ctx, const EmitContext::TextureDefinition& texture, Id image, Id coords, bool integer);
