@@ -11,31 +11,18 @@ virtual addresses): a game or version whose bytes differ gets no patch. FIELDS: 
 (hex offsets, comma-separated, 1000 for all the size pairs; default all of them, the scaled ones too).
 """
 import os
+import re
 import struct
 import sys
 from pathlib import Path
 
-# Uncharted 1 (eboot.bin, CUSA02343 01.00): the display configuration (image +0xd5c2fc) initialisers at
-# +0x3c4d60, +0x3c5050 and +0x3c5300. Fields: +0x08 / +0x18 / +0x24 / +0x38 width and height pairs, +0x20 / +0x2c their
-# aspect (16:9). (+0x30 2560x1216 and +0x40 240x270 are left alone.) Sites: (image offset, register byte, field).
-U1_SITES = [
-    (0x3c4d7c, 0x47, 0x08), (0x3c4d83, 0x47, 0x0c), (0x3c4d91, 0x47, 0x18), (0x3c4d98, 0x47, 0x1c),
-    (0x3c4d9f, 0x47, 0x20), (0x3c4da6, 0x47, 0x24), (0x3c4dad, 0x47, 0x28), (0x3c4db4, 0x47, 0x2c),
-    (0x3c4dec, 0x47, 0x38), (0x3c4df3, 0x47, 0x3c), (0x3c4ef7, 0x47, 0x20), (0x3c4f0c, 0x47, 0x2c),
-    (0x3c4fbf, 0x47, 0x20), (0x3c4fd4, 0x47, 0x2c), (0x3c506d, 0x47, 0x08), (0x3c5074, 0x47, 0x0c),
-    (0x3c5082, 0x47, 0x18), (0x3c5089, 0x47, 0x1c), (0x3c5090, 0x47, 0x20), (0x3c5097, 0x47, 0x24),
-    (0x3c509e, 0x47, 0x28), (0x3c50a5, 0x47, 0x2c), (0x3c5158, 0x47, 0x20), (0x3c516d, 0x47, 0x2c),
-    (0x3c5323, 0x40, 0x08), (0x3c532a, 0x40, 0x0c), (0x3c5338, 0x40, 0x18), (0x3c533f, 0x40, 0x1c),
-    (0x3c5346, 0x40, 0x20), (0x3c534d, 0x40, 0x24), (0x3c5354, 0x40, 0x28), (0x3c535b, 0x40, 0x2c),
-    (0x3c5393, 0x40, 0x38), (0x3c539a, 0x40, 0x3c),
-]
+# Nothing here is an address of one version of a game: locate() finds every site in the executable by its code and data
+# (the 1.00 collection's, for reading: Uncharted 1 eboot.bin, CUSA02343 01.00).
+#
+# The display configuration (image +0xd5c2fc) initialisers (+0x3c4d60, +0x3c5050 and +0x3c5300): stores
+# "mov dword [rdi|rax + field], imm32". Fields: +0x08 / +0x18 / +0x24 / +0x38 width and height pairs, +0x20 / +0x2c
+# their aspect (16:9). (+0x30 2560x1216 and +0x40 240x270 are left alone.) Sites: (image offset, register byte, field).
 # Sizes derived from 1920x1080, scaled with it: (image offset, register byte, field, original value, axis 0 x / 1 y).
-U1_SCALED = [
-    (0x3c4dde, 0x47, 0x30, 2560, 0), (0x3c4de5, 0x47, 0x34, 1216, 1), (0x3c5385, 0x40, 0x30, 2560, 0),
-    (0x3c538c, 0x40, 0x34, 1216, 1), (0x3c4dc2, 0x47, 0x40, 240, 0), (0x3c4dc9, 0x47, 0x44, 270, 1),
-    (0x3c50b3, 0x47, 0x40, 240, 0), (0x3c50ba, 0x47, 0x44, 270, 1), (0x3c5369, 0x40, 0x40, 240, 0),
-    (0x3c5370, 0x40, 0x44, 270, 1),
-]
 # The memory arenas' table (image +0x972100.., 32-byte entries: id, type, size, alignment): entry 0x84 is the render
 # targets' heap ("Render Target", 0x8bc4000 = 140 MB for 1920x1080); it grows with the pixel count (2880x2880 ran out:
 # "HeapArena::Allocate: out of memory ... Render Target"). (image offset of the u64 size, original size)
@@ -45,8 +32,6 @@ U1_SCALED = [
 # Entry 0x85 is the second ("Render Target Heap", 0x1f10bc00 = 497 MB), full at 2880x2880 too. Entry 0xe is the
 # context's spare ("ALLOCATION_APP_GPU_FREE", 0xd0b0400 = 209 MB): checked, left alone (context 7's arenas need it:
 # taking it, their 144 MB arena no longer fitted).
-U1_HEAPS = [(0x9721d8, 0x8bc4000), (0x9721f8, 0x1f10bc00)]
-U1_SPARE = (0x9722d8, 0xd0b0400)
 # The GPU context must stay below 4 GB: the game keeps its "GPU Mem" arena's size in 32 bits (5028 MB came out as
 # 932 MB, and the heaps no longer fitted). Growth past that is not given (larger eyes: an upscaler from a smaller
 # render).
@@ -58,18 +43,12 @@ GPU_CONTEXT_LIMIT = (4096 - 2) << 20
 # frame ([rbp-0x40], free; the stack protector's store gives the bytes, its check goes). Other arenas (the caller
 # whose arena is at +0x10 of its owner) keep their 32-bit sizes: a mismatch, the passed size.
 # (image offset of the size spill, of its reload, of the stack protector check's jne)
-U1_ARENA_INIT = (0x35c8e1, 0x35c945, 0x35c998)
 # The memory table (contexts first, then the arenas: 32-byte entries id, type, size, alignment) of each game, read by
 # id: the CPU context (2, kAllocAppCpu) holds the "screenshoot buffer" arena, three full-screen RGBA buffers
 # (3840 per eye: two of 56 MB took 112 of its 128 MB, the third failed).
-U1_TABLE = 0x9713b0
-U2_TABLE = 0xe6af10
-U3_TABLE = 0x13a9ec0
 CPU_CONTEXT_ID = 2
 SCREENSHOT_ID = 0x80  # (0x81, the 128 MB before it, is another: growing it only moved this one along)
 SCREENSHOT_BUFFERS = 3
-U2_ARENA_INIT = (0x4e1f01, 0x4e1f65, 0x4e1fb8)
-U3_ARENA_INIT = (0x4957c1, 0x495825, 0x495878)
 ARENA_SPILL = (bytes.fromhex('8955c4 4989f6 4989fd 48'), bytes.fromhex('05'), 4, bytes.fromhex('488b00 488945d0'))
 ARENA_SPILL_NEW = bytes.fromhex('4989f6 4989fd 89d0 488b4f78 39d1 480f44c1 488945c0 90')
 ARENA_RELOAD = bytes.fromhex('8b45c4 498b4d18 488d148500000000')
@@ -110,64 +89,18 @@ BLUR_CHECK = (rb'\x48\x8d\x05(....)\x80\xb8\xba\x01\x00\x00\x00\x4c\x8b\xa5....\
 GPU_CONTEXT_LIMIT_64 = (12288 - 2) << 20
 if os.environ.get('VR_GPU_CONTEXT_MB'):  # development: another limit
     GPU_CONTEXT_LIMIT = GPU_CONTEXT_LIMIT_64 = int(os.environ['VR_GPU_CONTEXT_MB']) << 20
-U1_CONTEXT = (0x9713f8, 0xbac00000)
 # (Entries 1 + 2 + 3 make the system context, 4.5 GB; entry 2 is kAllocAppCpu, 1600 MB.)
 # The system direct memory context that holds it (4.5 GB): an immediate, movabs rdx, 0x120000000 at image +0xcb.
-U1_SYSTEM = (0xcb, 0x120000000)
 DMEM_MB = 5056  # the retail PS4's direct memory (src/runtime_memory.c)
 # Uncharted 2 (big2-ps4_Shipping.elf): the same configuration and tables at other addresses (the initialisers at
 # +0x5525da, +0x5528c8 and +0x552b7e; arenas 0x84 / 0x85 at +0xe6bd30 / +0xe6bd50, spare 0xe 177 MB; the GPU
 # context at +0xe6af50; the system context's movabs at +0xcb). Sites from tools/vr/res_sites.py.
-U2_SITES = [
-    (0x5525ec, 0x47, 0x08), (0x5525f3, 0x47, 0x0c), (0x552601, 0x47, 0x18), (0x552608, 0x47, 0x1c),
-    (0x55260f, 0x47, 0x20), (0x552616, 0x47, 0x24), (0x55261d, 0x47, 0x28), (0x552624, 0x47, 0x2c),
-    (0x55265c, 0x47, 0x38), (0x552663, 0x47, 0x3c), (0x552767, 0x47, 0x20), (0x55277c, 0x47, 0x2c),
-    (0x55282f, 0x47, 0x20), (0x552844, 0x47, 0x2c), (0x5528dd, 0x47, 0x08), (0x5528e4, 0x47, 0x0c),
-    (0x5528f2, 0x47, 0x18), (0x5528f9, 0x47, 0x1c), (0x552900, 0x47, 0x20), (0x552907, 0x47, 0x24),
-    (0x55290e, 0x47, 0x28), (0x552915, 0x47, 0x2c), (0x5529c8, 0x47, 0x20), (0x5529dd, 0x47, 0x2c),
-    (0x552b93, 0x40, 0x08), (0x552b9a, 0x40, 0x0c), (0x552ba8, 0x40, 0x18), (0x552baf, 0x40, 0x1c),
-    (0x552bb6, 0x40, 0x20), (0x552bbd, 0x40, 0x24), (0x552bc4, 0x40, 0x28), (0x552bcb, 0x40, 0x2c),
-    (0x552c03, 0x40, 0x38), (0x552c0a, 0x40, 0x3c),
-]
-U2_SCALED = [
-    (0x552632, 0x47, 0x40, 240, 0), (0x552639, 0x47, 0x44, 270, 1), (0x55264e, 0x47, 0x30, 2560, 0),
-    (0x552655, 0x47, 0x34, 1216, 1), (0x552923, 0x47, 0x40, 240, 0), (0x55292a, 0x47, 0x44, 270, 1),
-    (0x552bd9, 0x40, 0x40, 240, 0), (0x552be0, 0x40, 0x44, 270, 1), (0x552bf5, 0x40, 0x30, 2560, 0),
-    (0x552bfc, 0x40, 0x34, 1216, 1),
-]
-U2_HEAPS = [(0xe6bd38, 0x8bc4000), (0xe6bd58, 0x1f10bc00)]
-U2_SPARE = (0xe6be38, 0xb0b0400)
-U2_CONTEXT = (0xe6af58, 0xbac00000)
-U2_SYSTEM = (0xcb, 0x120000000)
 # Uncharted 3 (big3-ps4_Shipping.elf): the initialisers at +0x502f60, +0x503251 and +0x503597 (U2's, 0x4f660
 # lower); the arenas in the RELRO segment (0x84 140 MB at +0x13aad20, 0x85 561 MB at +0x13aad40, spare 0xe 209 MB);
 # the GPU context 3052 MB (+0x13a9f00); the system context's movabs at +0xcb.
-U3_SITES = [
-    (0x502f7c, 0x47, 0x08), (0x502f83, 0x47, 0x0c), (0x502f91, 0x47, 0x18), (0x502f98, 0x47, 0x1c),
-    (0x502f9f, 0x47, 0x20), (0x502fa6, 0x47, 0x24), (0x502fad, 0x47, 0x28), (0x502fb4, 0x47, 0x2c),
-    (0x502fec, 0x47, 0x38), (0x502ff3, 0x47, 0x3c), (0x5030f7, 0x47, 0x20), (0x50310c, 0x47, 0x2c),
-    (0x5031bf, 0x47, 0x20), (0x5031d4, 0x47, 0x2c), (0x50326d, 0x47, 0x08), (0x503274, 0x47, 0x0c),
-    (0x503282, 0x47, 0x18), (0x503289, 0x47, 0x1c), (0x503290, 0x47, 0x20), (0x503297, 0x47, 0x24),
-    (0x50329e, 0x47, 0x28), (0x5032a5, 0x47, 0x2c), (0x503358, 0x47, 0x20), (0x50336d, 0x47, 0x2c),
-    (0x5035b3, 0x40, 0x08), (0x5035ba, 0x40, 0x0c), (0x5035c8, 0x40, 0x18), (0x5035cf, 0x40, 0x1c),
-    (0x5035d6, 0x40, 0x20), (0x5035dd, 0x40, 0x24), (0x5035e4, 0x40, 0x28), (0x5035eb, 0x40, 0x2c),
-    (0x503623, 0x40, 0x38), (0x50362a, 0x40, 0x3c),
-]
-U3_SCALED = [
-    (0x502fc2, 0x47, 0x40, 240, 0), (0x502fc9, 0x47, 0x44, 270, 1), (0x502fde, 0x47, 0x30, 2560, 0), (0x502fe5, 0x47, 0x34, 1216, 1),
-    (0x5032b3, 0x47, 0x40, 240, 0), (0x5032ba, 0x47, 0x44, 270, 1), (0x5035f9, 0x40, 0x40, 240, 0), (0x503600, 0x40, 0x44, 270, 1),
-    (0x503615, 0x40, 0x30, 2560, 0), (0x50361c, 0x40, 0x34, 1216, 1),
-]
-U3_HEAPS = [(0x13aad28, 0x8bc4000), (0x13aad48, 0x2310bc00)]
-U3_SPARE = (0x13aae28, 0xd0b0400)
-U3_CONTEXT = (0x13a9f08, 0xbec00000)
-U3_SYSTEM = (0xcb, 0x120000000)
-SITES = {'eboot.bin': (U1_SITES, U1_SCALED, (U1_HEAPS, U1_SPARE), (U1_CONTEXT,), U1_SYSTEM, U1_ARENA_INIT, U1_TABLE),
-         'big2-ps4_Shipping.elf': (U2_SITES, U2_SCALED, (U2_HEAPS, U2_SPARE), (U2_CONTEXT,), U2_SYSTEM, U2_ARENA_INIT, U2_TABLE),
-         'big3-ps4_Shipping.elf': (U3_SITES, U3_SCALED, (U3_HEAPS, U3_SPARE), (U3_CONTEXT,), U3_SYSTEM, U3_ARENA_INIT, U3_TABLE)}
+EXES = ('eboot.bin', 'big2-ps4_Shipping.elf', 'big3-ps4_Shipping.elf')
 ASPECT_16_9 = 0x3fe38e39
 WIDTH_FIELDS = {0x08, 0x18, 0x24, 0x38}
-
 
 def segments(elf):
     if elf[:4] != b'\x7fELF':
@@ -268,17 +201,70 @@ def motion_blur_patch(elf):
     return vaddr + checks[0].start(2), b'\xe9\xc4\x00\x00\x00\x90'  # jmp to the je's target (one byte shorter)
 
 
-def patches(elf, sites, size, fields):
-    sites, scaled, (heaps, spare), context, system, arena, table = sites
+ARENA_SPILL_FIND = rb'\x89\x55\xc4\x49\x89\xf6\x49\x89\xfd\x48[\x8b\x8d]\x05....\x48\x8b\x00\x48\x89\x45\xd0'
+ARENA_CHECK_FIND = rb'\x48\x8b\x00\x48\x3b\x45\xd0\x75\x0f'
+# The memory table's first two entries (id 1 and 2, type 2, 1 MB alignment).
+TABLE_FIND = rb'\x01\x00\x00\x00\x02\x00\x00\x00.{8}\x00\x00\x10\x00\x00\x00\x00\x00.{8}\x02\x00\x00\x00\x02\x00\x00\x00'
+HEAP_IDS = (0x84, 0x85)  # the render target heaps
+CONTEXT_ID = 3  # kAllocAppGpu
+
+
+def locate(elf):
+    """(sites, scaled, heaps, context, system, arena, table) of a game executable, found by its code and data
+    (see the top), or None when it is not the display configuration this patch knows."""
+    vaddr, code = code_segment(elf)
+    if not code:
+        return None
+    sites, scaled = [], []
+    for m in re.finditer(rb'(?=\xc7[\x40\x47](.)(....))', code, re.S):
+        i = m.start()
+        reg, field = code[i + 1], code[i + 2]
+        imm, = struct.unpack_from('<I', code, i + 3)
+        if (imm == 0x780 and field in WIDTH_FIELDS) or (imm == 0x438 and field - 4 in WIDTH_FIELDS) or \
+                (imm == ASPECT_16_9 and field in (0x20, 0x2c)):
+            sites.append((vaddr + i, reg, field))
+        elif (field, imm) in ((0x30, 2560), (0x34, 1216), (0x40, 240), (0x44, 270)):
+            scaled.append((vaddr + i, reg, field, imm, 0 if field in (0x30, 0x40) else 1))
+    if not WIDTH_FIELDS <= {field for _a, _r, field in sites}:
+        return None
+    # The memory table: contexts, then arenas (32-byte entries); the heaps and the GPU context are read from it.
+    tables = []
+    for seg, offset, filesz in segments(elf):
+        for m in re.finditer(TABLE_FIND, elf[offset:offset + filesz], re.S):
+            if m.start() % 8 == 0:
+                tables.append(seg + m.start())
+    if len(tables) != 1:
+        return None
+    table = tables[0]
+    heaps = [table_entry(elf, table, ident) for ident in HEAP_IDS]
+    context = [table_entry(elf, table, CONTEXT_ID)]
+    if None in heaps or None in context or not all(0x1000000 <= size <= 0x80000000 for _a, size in heaps):
+        return None
+    # The system context's size: the one "movabs rdx, imm64" of 4..16 GB in the entry point's neighbourhood.
+    system = [(vaddr + m.start(), struct.unpack_from('<Q', code, m.start() + 2)[0])
+              for m in re.finditer(rb'\x48\xba(.{8})', code[:0x400], re.S)
+              if 4 << 30 <= struct.unpack('<Q', m.group(1))[0] < 16 << 30]
+    if len(system) != 1:
+        return None
+    # HeapArena::Init's size spill, reload and stack protector check (arena_patches), or None.
+    arena = None
+    reloads = [m.start() for m in re.finditer(re.escape(ARENA_RELOAD), code)]
+    if len(reloads) == 1:
+        spills = [m.start() for m in re.finditer(ARENA_SPILL_FIND, code[max(0, reloads[0] - 0x200):reloads[0]], re.S)]
+        checks = [m.start() for m in re.finditer(ARENA_CHECK_FIND, code[reloads[0]:reloads[0] + 0x100], re.S)]
+        if spills and len(checks) == 1:
+            arena = (vaddr + max(0, reloads[0] - 0x200) + spills[-1], vaddr + reloads[0],
+                     vaddr + reloads[0] + checks[0] + 7)
+    return sites, scaled, heaps, context, system[0], arena, table
+
+
+def patches(elf, found, size, fields):
+    sites, scaled, heaps, context, system, arena, table = found
     out = []
-    for address, original in [*heaps, spare, *context]:
-        at = file_offset(elf, address, 8)
-        if at is None or struct.unpack_from('<Q', elf, at)[0] != original:
-            return None
     # The heaps' growth comes with the context's (below 4 GB without the arena fix). Whole 2 MB: the game
     # asserts its memory contexts are (+0x36a430: megabytes, +0x36a8c3: even ones).
     pixels = size * size / (1920 * 1080)
-    arena_fix = arena_patches(elf, arena)
+    arena_fix = arena_patches(elf, arena) if arena else None
     budget = (GPU_CONTEXT_LIMIT_64 if arena_fix else GPU_CONTEXT_LIMIT) - context[0][1]
     patches.capped = False
     growths = []
@@ -346,15 +332,16 @@ def main():
     target = out_dir / 'vr_patches.bin'
     target.unlink(missing_ok=True)
     (out_dir / 'vr_patches.dmem').unlink(missing_ok=True)
-    sites = SITES.get(exe)
     elf_path = out_dir / 'eboot.elf'
-    if not size or not sites or not elf_path.is_file():
+    if not size or exe not in EXES or not elf_path.is_file():
         return 0
-    found = patches(elf_path.read_bytes(), sites, size, fields)
+    elf = elf_path.read_bytes()
+    located = locate(elf)
+    found = patches(elf, located, size, fields) if located else None
     if found is None:
         print(f'VR: {exe} is not the version the render size patch knows: 1920x1080 kept')
         return 0
-    blur = motion_blur_patch(elf_path.read_bytes())
+    blur = motion_blur_patch(elf)
     if blur:
         found.append(blur)
     with target.open('wb') as f:

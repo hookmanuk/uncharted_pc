@@ -14,11 +14,13 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <mutex>
+#include <string>
 #include <vector>
 
 #include <xbyak/xbyak.h>
@@ -41,58 +43,91 @@ extern "C" void ViewHandler(u64* regs);
 extern "C" void CameraSetHandler(u64* regs);
 extern "C" void ProjectionHandler(u64* regs);
 
-struct Site {
-    u64 offset;
-    std::vector<u8> bytes; // the displaced instructions (position-independent), at least 12 bytes
-    void (*handler)(u64*);
+// A byte pattern with wildcards ("??": the operands that move with the code, call and jump targets and rip-relative
+// displacements), so a game version that only shifts its code is found all the same.
+struct Sig {
+    std::vector<int> bytes; // -1: any
+    explicit Sig(const char* text) {
+        for (const char* at = text; *at;) {
+            if (*at == ' ') {
+                ++at;
+            } else if (*at == '?') {
+                bytes.push_back(-1);
+                at += 2;
+            } else {
+                bytes.push_back(int(std::strtoul(std::string(at, 2).c_str(), nullptr, 16)));
+                at += 2;
+            }
+        }
+    }
+    bool At(const u8* code) const {
+        for (size_t i = 0; i < bytes.size(); ++i) {
+            if (bytes[i] >= 0 && code[i] != u8(bytes[i])) {
+                return false;
+            }
+        }
+        return true;
+    }
 };
 
-// The game's camera setters to hook. Driveclub's were Camera::Set (+0x72d9e0, CameraSetHandler), Scene::SetCamera
-// (+0x5e7a20, SceneHandler) and its two view setters (+0x736650, +0x7376e0, ViewHandler): see the Driveclub recomp's
-// vr branch.
-//
-// Uncharted 1 (eboot.bin, CUSA02343 01.00): a view's projection update (image +0x2c8dd0, rdi = the view). It builds the
+// Every place in [code, code + size) where the pattern matches (at most `limit`).
+std::vector<u64> Find(const u8* code, u64 size, const Sig& sig, size_t limit = 16) {
+    std::vector<u64> out;
+    for (u64 i = 0; i + sig.bytes.size() <= size && out.size() < limit; ++i) {
+        if ((sig.bytes[0] < 0 || code[i] == u8(sig.bytes[0])) && sig.At(code + i)) {
+            out.push_back(i);
+        }
+    }
+    return out;
+}
+
+struct Site {
+    u64 address = 0; // found by the game's pattern (Locate)
+    std::vector<u8> bytes; // the displaced instructions (position-independent), read from the game: at least 12 bytes
+    void (*handler)(u64*) = nullptr;
+};
+
+// Uncharted 1 (1.00 offsets, for reading): a view's projection update (image +0x2c8dd0, rdi = the view). It builds the
 // projection from the view's aspect (+0x290, the field of view's height / width), x scale (+0x294), near (+0x298) and
-// far (+0x29c), then (+0x2c9070) every matrix of the view from its camera-to-world input: three rows at +0x250 (the
-// camera's x: left, y: up, z: forward) and the position at +0x280 (row vectors, metres). The render camera object is
-// the image's +0xa86b30 (position, orientation, field of view in degrees at +0x20); its view is at +0x30. The camera
-// update (+0xa6f.. +0xa7178) writes the input and the field of view every frame, then calls this. The outputs: +0x10
-// camera to world, +0x50 world to camera, +0x90 projection (P00 negative: x mirrored), +0xd0 view-projection.
+// far (+0x29c), then every matrix of the view from its camera-to-world input: three rows at +0x250 (the camera's x:
+// left, y: up, z: forward) and the position at +0x280 (row vectors, metres). The camera update (+0xa6f.. +0xa7178)
+// writes the input and the field of view every frame, then calls this. The outputs: +0x10 camera to world, +0x50 world
+// to camera, +0x90 projection (P00 negative: x mirrored), +0xd0 view-projection.
 //
 // Uncharted 2 (big2-ps4_Shipping.elf): the same view, its fields 0x40 lower (input +0x210, position +0x240, aspect,
 // x scale, near, far at +0x250), built in one function (image +0x3e2c50). Each frame's render views are copies in GPU
-// memory, built from the call at +0x61194f (also the shadow cascades: x scale 0, near 2.5 and more); the static view in
-// the image (+0xeb81e0, from +0x16605d) is a wide (100 degree) one, not the one drawn. The shaders get the near plane
-// as it is (U1's get half of it).
+// memory, built from the call at +0x61194a (also the shadow cascades: x scale 0, near 2.5 and more); the static view in
+// the image (+0xeb81e0) is a wide (100 degree) one, not the one drawn. The shaders get the near plane as it is (U1's
+// get half of it). Uncharted 3: the same, +0x80a2f0 and the call at +0x5b153a.
+//
+// The game's camera is found by its code, not by addresses, so every version of a game is the same entry: the
+// projection update by its opening instructions (func) and the camera update's call to it (caller: the main view's
+// return address), both masked where the code is relocated.
 struct Game {
     const char* name;
-    std::vector<Site> sites; // the first one identifies the game (its bytes in the image)
-    u64 main_view;   // image offset of the player's view, or 0: any camera-like view from main_caller
-    u64 main_caller; // image offset of the call's return address (main_view 0)
-    u32 input;       // the camera-to-world input: three rows and the position (row vectors)
-    u32 params;      // aspect, x scale, near, far
-    float shader_near; // the near plane in the shaders' constants, per unit of the view's
+    const char* func;   // the projection update (identifies the game: one match in the code)
+    u32 displaced;      // bytes of whole instructions from its start that the hook replaces (12 or more)
+    const char* caller; // the main camera's call to it, ending with the call (e8 ?? ?? ?? ??)
+    u32 input;          // the camera-to-world input: three rows and the position (row vectors)
+    u32 params;         // aspect, x scale, near, far
+    float shader_near;  // the near plane in the shaders' constants, per unit of the view's
 };
+// (tools/vr/sigmake.py makes the patterns from a plaintext ELF.)
 const std::vector<Game> Games = {
     {"Uncharted 1",
-     {{0x2c8dd0, {0x55, 0x48, 0x89, 0xe5, 0x41, 0x56, 0x53, 0x48, 0x81, 0xec, 0xa0, 0x00, 0x00, 0x00}, &ProjectionHandler}},
-     0xa86b60, 0, 0x250, 0x290, 0.5f},
-    // Uncharted 1, CUSA02320 (US) 01.02: the same function 0x1800 later (found by a user's static analysis, untested
-    // here). Its only caller is the camera update (+0xa8310, rdi = camera + 0x30), which reaches the camera through a
-    // pointer: no fixed view, so the view is taken by the call at +0xa8478 (return address +0xa847d).
-    {"Uncharted 1 (CUSA02320 1.02)",
-     {{0x2ca5d0, {0x55, 0x48, 0x89, 0xe5, 0x41, 0x56, 0x53, 0x48, 0x81, 0xec, 0xa0, 0x00, 0x00, 0x00}, &ProjectionHandler}},
-     0, 0xa847d, 0x250, 0x290, 0.5f},
+     "55 48 89 e5 41 56 53 48 81 ec a0 00 00 00 48 89 fb 4c 8b 35 ?? ?? ?? ?? 49 8b 06 48 89 45 e8 80 bb a4 02 00 00 00",
+     14, "c5 f2 5e c0 c5 fa 11 83 c4 02 00 00 4c 89 ff e8 ?? ?? ?? ??", 0x250, 0x290, 0.5f},
     {"Uncharted 2",
-     {{0x3e2c50, {0x55, 0x48, 0x89, 0xe5, 0x53, 0x48, 0x81, 0xec, 0x28, 0x01, 0x00, 0x00}, &ProjectionHandler}},
-     0, 0x61194f, 0x210, 0x250, 1.0f},
-    // Uncharted 3 (big3-ps4_Shipping.elf): U2's view and builder (image +0x80a2f0, tools/vr/view_find.py), the render
-    // views from the call at +0x5b153a (U2's +0x61194a, the same code around it).
+     "55 48 89 e5 53 48 81 ec 28 01 00 00 48 89 fb 80 bb 82 02 00 00 00 0f 85 ?? ?? ?? ??", 12,
+     "49 89 cf 49 89 d4 48 89 f3 49 89 fe 48 89 df e8 ?? ?? ?? ??", 0x210, 0x250, 1.0f},
+    // Uncharted 3 (big3-ps4_Shipping.elf): U2's view and builder, the same code.
     {"Uncharted 3",
-     {{0x80a2f0, {0x55, 0x48, 0x89, 0xe5, 0x53, 0x48, 0x81, 0xec, 0x08, 0x01, 0x00, 0x00}, &ProjectionHandler}},
-     0, 0x5b153f, 0x210, 0x250, 1.0f},
+     "55 48 89 e5 53 48 81 ec 08 01 00 00 48 89 fb 80 bb 6c 02 00 00 00 0f 85 ?? ?? ?? ??", 12,
+     "49 89 cf 49 89 d4 48 89 f3 49 89 fe 48 89 df e8 ?? ?? ?? ??", 0x210, 0x250, 1.0f},
 };
 const Game* g_game = nullptr;
+std::vector<Site> g_sites; // the hooks of the game found
+u64 g_main_caller = 0;     // the return address of the main camera's call (ProjectionHandler)
 
 struct alignas(16) Mat {
     float m[16];
@@ -344,9 +379,7 @@ extern "C" void ProjectionHandler(u64* regs) {
     const Game& game = *g_game;
     auto* input = reinterpret_cast<float*>(view + game.input);   // rows x, y, z, position (w unused)
     auto* params = reinterpret_cast<float*>(view + game.params); // aspect, x scale, near, far
-    if (game.main_view ? u64(view) != g_image_base + game.main_view
-                       : regs[RegCount] != g_image_base + game.main_caller || !(params[1] > 0.1f) ||
-                             !(params[2] > 0.05f && params[2] < 1.f)) {
+    if (regs[RegCount] != g_main_caller || !(params[1] > 0.1f) || !(params[2] > 0.05f && params[2] < 1.f)) {
         return;
     }
     if (g_near_written != 0.f && params[2] == g_near_written) {
@@ -473,7 +506,7 @@ struct Stub : Xbyak::CodeGenerator {
         pop(rax);
         db(site.bytes.data(), site.bytes.size());
         jmp(ptr[rip]);
-        dq(g_image_base + site.offset + site.bytes.size());
+        dq(site.address + site.bytes.size());
     }
 };
 
@@ -490,26 +523,26 @@ void DoInstall() {
     if (const char* v = std::getenv("BB_VR_FOV")) {
         g_fov_mode = std::atoi(v);
     }
-    for (const Site& site : g_game->sites) {
-        auto* code = reinterpret_cast<u8*>(g_image_base + site.offset);
+    for (const Site& site : g_sites) {
+        auto* code = reinterpret_cast<u8*>(site.address);
         MEMORY_BASIC_INFORMATION mbi{};
         if (!VirtualQuery(code, &mbi, sizeof(mbi)) || mbi.State != MEM_COMMIT ||
             std::memcmp(code, site.bytes.data(), site.bytes.size()) != 0) {
-            std::printf("VR camera: the view setter at +%#llx is not as expected: camera hooks off\n",
-                        (unsigned long long)site.offset);
+            std::printf("VR camera: the view setter at %#llx is not as expected: camera hooks off\n",
+                        (unsigned long long)site.address);
             std::fflush(stdout);
             return;
         }
     }
     const bool cull_head = !(std::getenv("BB_VR_CULL_HEAD") && std::getenv("BB_VR_CULL_HEAD")[0] == '0');
-    for (const Site& site : g_game->sites) {
+    for (const Site& site : g_sites) {
         if (site.handler == &CameraSetHandler && !cull_head) {
             continue;
         }
         auto* stub = new Stub(site);
         stub->ready();
         g_stubs.push_back(stub);
-        auto* code = reinterpret_cast<u8*>(g_image_base + site.offset);
+        auto* code = reinterpret_cast<u8*>(site.address);
         std::vector<u8> patch(site.bytes.size(), 0x90);
         patch[0] = 0x48; // mov rax, imm64
         patch[1] = 0xb8;
@@ -538,12 +571,12 @@ float ScreenAspect() {
     return Fixes::RenderSize(width, height) && height ? float(width) / float(height) : 16.f / 9.f;
 }
 
-// An unsupported game version: where each known game's signature (the first site's bytes) is in the executable
-// allocations, if anywhere, for the launcher's report (the offsets a new Games entry needs).
+// An unsupported game version: where the opening instructions of each known game's projection update are in the
+// executable allocations, if anywhere, for the launcher's report (the start of a new Games entry's pattern).
 void ReportUnknownImage() {
 #ifdef _WIN32
     MEMORY_BASIC_INFORMATION mbi{};
-    int hits = 0;
+    size_t hits = 0;
     for (u64 at = 0x400000; at < 0x80000000ull && VirtualQuery(reinterpret_cast<void*>(at), &mbi, sizeof(mbi));
          at = u64(mbi.BaseAddress) + mbi.RegionSize) {
         const u64 base = u64(mbi.BaseAddress);
@@ -553,26 +586,69 @@ void ReportUnknownImage() {
         }
         std::printf("VR camera: executable image at %#llx, %#llx bytes%c", (unsigned long long)base,
                     (unsigned long long)mbi.RegionSize, 10);
-        const auto* bytes = reinterpret_cast<const u8*>(base);
         for (const Game& game : Games) {
-            const auto& sig = game.sites[0].bytes;
-            for (u64 i = 0; i + sig.size() <= mbi.RegionSize && hits < 24; ++i) {
-                if (bytes[i] == sig[0] && std::memcmp(bytes + i, sig.data(), sig.size()) == 0) {
-                    std::printf("VR camera: signature of %s at image +%#llx%c", game.name, (unsigned long long)i, 10);
-                    ++hits;
-                }
+            Sig opening{game.func};
+            opening.bytes.resize(game.displaced);
+            for (u64 i : Find(reinterpret_cast<const u8*>(base), mbi.RegionSize, opening, 24 - std::min<size_t>(hits, 23))) {
+                std::printf("VR camera: opening of %s's projection update at image +%#llx%c", game.name,
+                            (unsigned long long)i, 10);
+                ++hits;
             }
         }
     }
 #endif
 }
 
+// The game image is mapped before the first frame: the executable allocation holding a known game's projection
+// update (its pattern matching exactly once), then the camera update's call to it (once, calling that function).
+bool Locate(const u8* code, u64 size, const Game& game) {
+    const Sig func{game.func};
+    const auto found = Find(code, size, func, 2);
+    if (found.size() != 1) {
+        return false;
+    }
+    const u64 function = reinterpret_cast<u64>(code) + found[0];
+    u64 caller = 0;
+    const Sig call{game.caller};
+    for (u64 i : Find(code, size, call, 64)) {
+        const u64 at = reinterpret_cast<u64>(code) + i + call.bytes.size() - 5; // the e8
+        int32_t rel;
+        std::memcpy(&rel, reinterpret_cast<const void*>(at + 1), 4);
+        if (at + 5 + rel == function) {
+            if (caller) {
+                caller = 0;
+                break; // more than one: not the pattern of this version
+            }
+            caller = at + 5;
+        }
+    }
+    if (!caller) {
+        std::printf("VR camera: %s's projection update is at %#llx, but its main camera call was not found%c",
+                    game.name, (unsigned long long)function, 10);
+        std::fflush(stdout);
+        return false;
+    }
+    Site site;
+    site.address = function;
+    site.bytes.assign(reinterpret_cast<const u8*>(function), reinterpret_cast<const u8*>(function) + game.displaced);
+    site.handler = &ProjectionHandler;
+    g_sites = {site};
+    g_main_caller = caller;
+    g_game = &game;
+    std::printf("VR camera: %s, projection update at image +%#llx, main camera call at +%#llx%c", game.name,
+                (unsigned long long)(function - reinterpret_cast<u64>(code)),
+                (unsigned long long)(caller - reinterpret_cast<u64>(code)), 10);
+    std::fflush(stdout);
+    return true;
+}
+
 void Install() {
 #ifdef _WIN32
-    // The game image is mapped before the first frame: the executable allocation holding a known game's first site's
-    // bytes, looked for every 60th frame (the game unpaced at boot flips hundreds a second: no deadline).
+    // Looked for every 60th frame (the game unpaced at boot flips hundreds a second: no deadline).
     if (!g_image_base) {
         static int calls = 0;
+        static const auto started = std::chrono::steady_clock::now();
+        static bool reported = false;
         if (calls++ % 60 != 0) {
             return;
         }
@@ -581,25 +657,20 @@ void Install() {
                                 !g_image_base;
              at = u64(mbi.BaseAddress) + mbi.RegionSize) {
             const u64 base = u64(mbi.BaseAddress);
-            if (mbi.State != MEM_COMMIT || u64(mbi.AllocationBase) != base ||
+            if (mbi.State != MEM_COMMIT || u64(mbi.AllocationBase) != base || mbi.RegionSize < 0x100000 ||
                 !(mbi.Protect & (PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE))) {
                 continue;
             }
             for (const Game& game : Games) {
-                const Site& site = game.sites[0];
-                if (site.offset + site.bytes.size() <= mbi.RegionSize &&
-                    std::memcmp(reinterpret_cast<const void*>(base + site.offset), site.bytes.data(),
-                                site.bytes.size()) == 0) {
+                if (Locate(reinterpret_cast<const u8*>(base), mbi.RegionSize, game)) {
                     g_image_base = base;
-                    g_game = &game;
-                    std::printf("VR camera: %s, game image at %#llx%c", game.name, (unsigned long long)base, 10);
-                    std::fflush(stdout);
                     break;
                 }
             }
         }
         if (!g_image_base) {
-            if (calls == 1801) {
+            if (!reported && std::chrono::steady_clock::now() - started > std::chrono::seconds(60)) {
+                reported = true;
                 std::printf("VR camera: no known game image yet (the game on a flat screen until then)%c", 10);
                 ReportUnknownImage();
                 std::fflush(stdout);
