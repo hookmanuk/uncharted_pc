@@ -1,13 +1,10 @@
 """Compile the enabled cheats of one executable into cheats.bin for bb-probe --patches.
 
-Cheats are "health" and "ammo". The executables of the versions listed below (by SHA-256) are patched at their known
-addresses when the bytes there are the expected ones. Any other version is searched for each cheat's code
-(SIGNATURES, made from the 1.00 collection with tools/vr/sigmake.py): a cheat is written only when its pattern is
-found exactly once. Anything else is reported and skipped, never an error.
+Cheats are "health" and "ammo". A patch is written only when the executable's SHA-256 is listed and the bytes at its
+address are the expected ones; anything else is reported and skipped, never an error.
 Addresses are image offsets (virtual addresses of the SELF's load segments).
 """
 import hashlib
-import re
 from pathlib import Path
 import struct
 
@@ -40,53 +37,6 @@ PATCHES = {
 }
 
 
-# Version-independent cheats: exe -> cheat -> (pattern, offset of the patched bytes in it, replacement). A pattern is
-# hex bytes with "??" where the code moves (call targets, rip-relative displacements). The replacement is hex bytes or
-# ('jmp', pattern of the jump's destination, length): a jmp rel32 to where that pattern is, padded with nops.
-SIGNATURES = {
-    'eboot.bin': {
-        'health': ('0a 11 75 35 85 c0 75 31 c4 c1 7a 10 86 28 14 00 00', 2, 'eb35'),
-        'ammo': ('e8 ?? ?? ?? ?? 31 f6 4c 89 f7 e8 ?? ?? ?? ?? 49 8b 04 24 48 3b 45 d8', 10, NOP * 5)},
-    'big2-ps4_Shipping.elf': {
-        'health': ('80 7b 67 00 0f 84 bc 01 00 00 e8 ?? ?? ?? ?? 84 c0', 4,
-                   ('jmp', '48 8b bd c8 58 ff ff 48 8b 07 ff 50 18 88 c3 88 9d c8 58 ff ff', 6)),
-        'ammo': ('74 12 31 f6 4c 89 f7 e8 ?? ?? ?? ?? 4c 89 f7 e8 ?? ?? ?? ??', 7, NOP * 5)},
-    'big3-ps4_Shipping.elf': {
-        'health': ('41 80 bf a7 00 00 00 00 0f 84 ca 02 00 00 e8 ?? ?? ?? ?? 84 c0', 8,
-                   ('jmp', '49 8b 04 24 4c 89 e7 ff 50 18 41 88 c4 41 80 bd e8 0c 00 00 00', 6)),
-        'ammo': ('75 46 4c 8d 3d ?? ?? ?? ?? 66 41 8b 47 62 84 c0', 2, '41b401eb729090')},
-}
-
-
-def find_code(elf, program_headers, pattern):
-    """Virtual addresses of every match of a masked hex pattern in the load segments."""
-    regex = re.compile(b''.join(b'.' if t == '??' else re.escape(bytes.fromhex(t)) for t in pattern.split()), re.S)
-    out = []
-    for p in program_headers:
-        if p['type'] in (1, 0x61000010) and p['filesz']:
-            segment = bytes(elf[p['offset']:p['offset'] + p['filesz']])
-            out += [p['vaddr'] + m.start() for m in regex.finditer(segment)]
-    return out
-
-
-def signature_write(elf, program_headers, name, signature):
-    """(address, replacement) of one cheat found by its pattern, or None."""
-    pattern, offset, replacement = signature
-    found = find_code(elf, program_headers, pattern)
-    if len(found) != 1:
-        return None
-    address = found[0] + offset
-    if isinstance(replacement, tuple):
-        _kind, destination_pattern, length = replacement
-        destination = find_code(elf, program_headers, destination_pattern)
-        if len(destination) != 1:
-            return None
-        replacement = b'\xe9' + struct.pack('<i', destination[0] - (address + 5)) + b'\x90' * (length - 5)
-    else:
-        replacement = bytes.fromhex(replacement)
-    return address, replacement
-
-
 def image_bytes(elf, program_headers, address, size):
     for p in program_headers:
         if p['type'] in (1, 0x61000010) and p['vaddr'] <= address and address + size <= p['vaddr'] + p['filesz']:
@@ -99,20 +49,11 @@ def compile_cheats(path, cheats):
     """[(address, replacement bytes)] for the enabled cheats; reasons go to stdout."""
     data = Path(path).read_bytes()
     table = PATCHES.get(hashlib.sha256(data).hexdigest())
+    if table is None:
+        print(f'Cheats: {Path(path).name} is not a supported version; none applied')
+        return []
     elf, _header, program_headers, _segments, _missing = prepare.parse_self(data)
     writes = []
-    if table is None:  # another version: by the code
-        signatures = SIGNATURES.get(Path(path).name, {})
-        for name in cheats:
-            if name not in signatures:
-                continue
-            write = signature_write(elf, program_headers, name, signatures[name])
-            if write is None:
-                print(f'Cheats: {name} skipped, its code was not found in {Path(path).name}')
-                continue
-            writes.append(write)
-            print(f'Cheats: {name} on (found by its code)')
-        return writes
     for name in cheats:
         if name not in table:
             continue

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""sigmake.py: byte patterns for the VR fork's version-independent hooks (vr_camera.cpp's Games, scripts/cheats.py).
+"""sigmake.py: byte patterns for the VR fork's version-independent hooks (vr_camera.cpp's Games).
 
     sigmake.py func ELF ADDR             the opening of a function (>= 24 bytes), unique in the code
     sigmake.py call ELF ADDR             the instructions before a call at ADDR, ending with the call (>= 14 bytes)
