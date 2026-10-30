@@ -603,13 +603,27 @@ void ReportUnknownImage() {
 // update (its pattern matching exactly once), then the camera update's call to it (once, calling that function).
 bool Locate(const u8* code, u64 size, const Game& game) {
     const Sig func{game.func};
-    const auto found = Find(code, size, func, 2);
-    if (found.size() != 1) {
-        return false;
-    }
-    const u64 function = reinterpret_cast<u64>(code) + found[0];
-    u64 caller = 0;
     const Sig call{game.caller};
+    const auto found = Find(code, size, func, 2);
+    u64 function = found.size() == 1 ? reinterpret_cast<u64>(code) + found[0] : 0;
+    if (!function) {
+        // A version whose function differs past its opening: the camera update's call (unique) gives its address.
+        const auto calls = Find(code, size, call, 2);
+        if (calls.size() != 1) {
+            return false;
+        }
+        const u64 at = reinterpret_cast<u64>(code) + calls[0] + call.bytes.size() - 5;
+        int32_t rel;
+        std::memcpy(&rel, reinterpret_cast<const void*>(at + 1), 4);
+        Sig opening{game.func};
+        opening.bytes.resize(game.displaced);
+        function = at + 5 + rel;
+        if (function < reinterpret_cast<u64>(code) || function + game.displaced > reinterpret_cast<u64>(code) + size ||
+            !opening.At(reinterpret_cast<const u8*>(function))) {
+            return false;
+        }
+    }
+    u64 caller = 0;
     for (u64 i : Find(code, size, call, 64)) {
         const u64 at = reinterpret_cast<u64>(code) + i + call.bytes.size() - 5; // the e8
         int32_t rel;
