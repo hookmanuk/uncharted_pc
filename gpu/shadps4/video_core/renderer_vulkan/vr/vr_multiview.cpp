@@ -782,6 +782,8 @@ u64 g_eye_constants_next = 0;
 // c[row], c[row + 4], c[row + 8] (their translation at + 3). U1's torch shadows (pgm 8a04b99b, buffer 0: ray c12/c14,
 // rows c16, c20, c24; then the torch's shadow matrix; also pgm fe99f21a, the same layout): every point sat the eye's offset sideways, so the torch's
 // shadows behind the timbers were offset per eye (Matt 2026-10-29: "The shadow offset per eye is just too far apart").
+// U3's full-screen light passes on the same vertex shader (pgm 0d90d5b9, 5fb447d7, 5d941826: the pub) read the same
+// layout.
 // The eye sits at Δ = s c14 in the centre's view space (s its clip shift, c14 = -1 / P00), so each eye's copy moves the
 // rows' translation by row.x Δ. BB_VR_EYE_RAY_PS "pgm:buffer:ray:row,...;..." (hex pgm; empty: none).
 struct EyeRayPass {
@@ -792,7 +794,7 @@ const std::vector<EyeRayPass>& EyeRayPasses() {
     static const std::vector<EyeRayPass> list = [] {
         std::vector<EyeRayPass> out;
         const char* env = std::getenv("BB_VR_EYE_RAY_PS");
-        const char* p = env ? env : "8a04b99b:0:14:16;fe99f21a:0:14:16";
+        const char* p = env ? env : "8a04b99b:0:14:16;fe99f21a:0:14:16;0d90d5b9:0:14:16;5fb447d7:0:14:16;5d941826:0:14:16";
         while (*p) {
             EyeRayPass e{};
             char* end = nullptr;

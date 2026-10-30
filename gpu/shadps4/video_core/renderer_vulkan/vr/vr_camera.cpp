@@ -118,6 +118,7 @@ struct Game {
     const char* aim = nullptr;
     u32 aim_displaced = 0;
     u32 aim_direction = 0;
+    bool aim_object_rdi = false; // the camera object in rdi (U2: the update is a plain method), else rsi
 };
 // (tools/vr/sigmake.py makes the patterns from a plaintext ELF.)
 const std::vector<Game> Games = {
@@ -128,11 +129,17 @@ const std::vector<Game> Games = {
      "55 48 89 e5 41 57 41 56 41 55 41 54 53 48 81 ec 68 02 00 00 49 89 d7 48 89 f3 49 89 fe", 13, 0x1830},
     {"Uncharted 2",
      "55 48 89 e5 53 48 81 ec 28 01 00 00 48 89 fb 80 bb 82 02 00 00 00 0f 85 ?? ?? ?? ??", 12,
-     "49 89 cf 49 89 d4 48 89 f3 49 89 fe 48 89 df e8 ?? ?? ?? ??", 0x210, 0x250, 1.0f},
+     "49 89 cf 49 89 d4 48 89 f3 49 89 fe 48 89 df e8 ?? ?? ?? ??", 0x210, 0x250, 1.0f,
+     // CameraControlZoom (its factory registered with the class name; 1.00 vtable +0xe085e0): slot 29 (+0x18c9a0,
+     // this in rdi) turns the aim direction at +0x1f30 by the stick (the helper U1's update calls before its +0x1830)
+     "55 48 89 e5 41 57 41 56 41 55 41 54 53 48 81 ec 38 01 00 00 49 89 f6 49 89 ff", 13, 0x1f30, true},
     // Uncharted 3 (big3-ps4_Shipping.elf): U2's view and builder, the same code.
     {"Uncharted 3",
      "55 48 89 e5 53 48 81 ec 08 01 00 00 48 89 fb 80 bb 6c 02 00 00 00 0f 85 ?? ?? ?? ??", 12,
-     "49 89 cf 49 89 d4 48 89 f3 49 89 fe 48 89 df e8 ?? ?? ?? ??", 0x210, 0x250, 1.0f},
+     "49 89 cf 49 89 d4 48 89 f3 49 89 fe 48 89 df e8 ?? ?? ?? ??", 0x210, 0x250, 1.0f,
+     // CameraControlZoom (1.00 vtable +0x13686c0): slot 36 (+0x135950, U1's shape: result, this in rsi, input) turns
+     // and normalises the aim direction at +0x11e0 (U2's +0x1f30 / +0x1f40 pair is U3's +0x11e0 / +0x11f0)
+     "55 48 89 e5 41 57 41 56 41 55 41 54 53 48 81 ec 08 03 00 00 49 89 d4 49 89 f5", 13, 0x11e0},
 };
 const Game* g_game = nullptr;
 std::vector<Site> g_sites; // the hooks of the game found
@@ -548,7 +555,19 @@ extern "C" void AimHandler(u64* regs) {
         g_aim_written_valid = false;
         return;
     }
-    auto* direction = reinterpret_cast<float*>(regs[RSI] + g_game->aim_direction);
+    auto* direction = reinterpret_cast<float*>(regs[g_game->aim_object_rdi ? RDI : RSI] + g_game->aim_direction);
+    // Only a direction (a unit vector) is replaced: a wrong offset in another version leaves the game alone.
+    const float length2 = direction[0] * direction[0] + direction[1] * direction[1] + direction[2] * direction[2];
+    if (!(length2 > 0.81f && length2 < 1.21f)) {
+        static int told = 0;
+        if (told++ < 4) {
+            std::printf("VR head aim: not a direction at the aim camera's +%#x (length^2 %g): left alone%c",
+                        g_game->aim_direction, length2, 10);
+            std::fflush(stdout);
+        }
+        g_aim_written_valid = false;
+        return;
+    }
     if (g_aim_written_valid) {
         // The sideways turn from what was written to what the update left: about the world's up, right positive.
         const float* a = g_aim_written;
