@@ -43,7 +43,7 @@ Starting
   Trophies page (BB_TROPHY_POPUP=0 in Advanced -> Environment hides the notice). Earned trophies
   are kept in user\trophy\ with the saves, one list per game.
 
-VR (this is the VR edition: vr-0.1)
+VR (this is the VR edition: vr-0.2)
 - "Play in a VR headset (OpenXR)" on the Display page is ticked by default (untick it to play on the screen).
   Needs an OpenXR runtime: SteamVR (set as the
   active OpenXR runtime), Virtual Desktop, Oculus/Meta Link or Windows Mixed Reality. Start the runtime first.
@@ -51,6 +51,8 @@ VR (this is the VR edition: vr-0.1)
   NVIDIA DLSS (GeForce RTX) is optional and off by default: the "NVIDIA DLSS in VR" option. Menus and cutscene videos show on a large screen in front of
   you. F8 recentres.
 - Uncharted 2 and 3 are untested and likely broken in VR.
+- Head aiming (on by default): while Nathan aims he aims where you look; the right stick still turns you. Uncharted 1
+  (2 and 3 untested). "Lock the vertical axis" (Always by default) leaves looking up and down to the headset.
 - "Resolution per eye": lower is faster, higher is sharper. Start at 2160; 3584 needs a fast GPU.
 - With VR on, the flat-screen display options (resolution, frame rate, anti-aliasing, frame generation) are hidden:
   the headset sets them.

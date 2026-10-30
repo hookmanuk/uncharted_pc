@@ -41,7 +41,7 @@ NAME = 'Uncharted'
 AUTHOR = 'SuperMedo'
 COMMUNITY_AUTHOR = 'drakolord'
 # This build; GitHub release tags are v<VERSION> (their digits are compared).
-VERSION = '0.3.8-vr0.1'  # VR fork: <base version>-vr<VR version> (base: drakolordx7/uncharted_pc community)
+VERSION = '0.3.8-vr0.2'  # VR fork: <base version>-vr<VR version> (base: drakolordx7/uncharted_pc community)
 # VR fork: updates come from the VR fork's releases, tags v<base>-vr<n> only (a flat release would replace VR).
 RELEASES_API = 'https://api.github.com/repos/hookmanuk/uncharted_pc/releases'
 RELEASES_PAGE = 'https://github.com/hookmanuk/uncharted_pc/releases'
@@ -1553,7 +1553,7 @@ class Launcher:
                    'its menus and HUD lay themselves out for the square picture.'))
         self.check(f, 'vr_head_aim', _('Head aiming'),
                    _('While Nathan aims, he aims where you look: your head moves the aim and the reticle at once. The '
-                     'right stick still turns you left and right. Uncharted 1.'))
+                     'right stick still turns you left and right. Uncharted 1 (2 and 3 untested).'))
         self.row(f, _('Lock the vertical axis'), self.choice(f, 'vr_lock_vertical', VR_LOCK_VERTICAL, 34),
                  _('Ignores up and down on the right stick: the headset looks up and down. With head aiming on, '
                    'your head still aims up and down.'))
