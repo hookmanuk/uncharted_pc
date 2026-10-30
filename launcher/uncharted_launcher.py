@@ -344,6 +344,29 @@ def game_info(folder):
     return info
 
 
+def vr_report(s, key, log_text):
+    """Text for the developer when VR does not know the game's version: the version, the executable's SHA-256 and the
+    game's VR lines (the offsets of a new vr_camera.cpp entry are in them)."""
+    import hashlib
+    folder = Path(game_folder(s, key))
+    exe = next(e for k, _t, _s, e in GAMES if k == key)
+    path = folder / exe if (folder / exe).is_file() else folder / 'eboot.bin'
+    info = game_info(folder) or {}
+    try:
+        digest = hashlib.sha256()
+        with open(path, 'rb') as f:
+            for block in iter(lambda: f.read(1 << 20), b''):
+                digest.update(block)
+        sha = digest.hexdigest()
+    except OSError:
+        sha = '?'
+    lines = [line.strip() for line in log_text.splitlines()
+             if line.startswith(('VR camera:', 'VR:', 'VR stereo', 'VR runtime'))]
+    return '\n'.join([f'Uncharted launcher {VERSION}: VR does not know this game version.',
+                      f"Game: {key} ({path.name}), {info.get('id', '?')}, APP_VER {info.get('version', '?')}",
+                      f'Executable SHA-256: {sha}', '', 'Log:'] + lines[-40:])
+
+
 def game_folder(s, key):
     """Where one game is: its own folder (Game page, for a game dumped on its own), else the collection folder."""
     return str(s.get(f'game_dir_{key}') or '').strip() or str(s.get('game_dir') or '').strip()
@@ -654,6 +677,8 @@ def set_dark_title_bar(window):
 
 
 class Launcher:
+    vr_unknown_shown = False  # the unsupported-version dialog has been shown this run
+
     def __init__(self, root, tk, ttk, filedialog, messagebox):
         global UI_LANGUAGE
         self.tk, self.ttk, self.filedialog, self.messagebox = tk, ttk, filedialog, messagebox
@@ -1920,6 +1945,8 @@ class Launcher:
         head.pack(fill='x', padx=self.px(26), pady=(self.px(18), self.px(14)))
         tk.Label(head, text=_('Log'), bg=SURFACE, fg=TEXT, font=self.font_title).pack(side='left')
         self.pill(head, _('Copy'), self.copy_log, background=SURFACE, padding=(16, 6)).pack(side='right')
+        self.pill(head, _('Copy VR report'), self.copy_vr_report, background=SURFACE,
+                  padding=(16, 6)).pack(side='right', padx=(0, 8))
         body = tk.Frame(shell, bg=SURFACE)
         body.pack(fill='both', expand=True, padx=self.px(26), pady=(0, self.px(8)))
         self.log = tk.Text(body, bg=CARD, fg='#d9d4ca', insertbackground=TEXT, font=('Cascadia Mono', 9), wrap='none',
@@ -2108,6 +2135,7 @@ class Launcher:
             return
         self.job = GameJob(self.process)
         self.entered, self.last_problem, self.stopping = False, '', False
+        self.vr_unknown_shown = False
         threading.Thread(target=self.read_output, args=(self.process,), daemon=True).start()
         self.play_button.configure(state='disabled')
         self.stop_button.configure(state='normal')
@@ -2160,6 +2188,11 @@ class Launcher:
                 else:
                     stripped = item.strip()
                     self.last_problem = select_run_problem(self.last_problem, stripped)
+                    if 'VR camera: no known game image' in item and not self.vr_unknown_shown:
+                        self.vr_unknown_shown = True
+                        self.status.configure(text=_('VR does not support this version of the game: it is shown '
+                                                     'on a flat screen.'), fg='#e07a4f')
+                        self.root.after(200, self.vr_unknown_dialog)
                     if 'Entering original x86-64 code' in item:
                         self.entered = True
                         self.status.configure(text=_('The game is running.'), fg=GOLD)
@@ -2198,6 +2231,21 @@ class Launcher:
         self.log.delete('1.0', 'end')
         self.log.insert('end', text)
         self.log.configure(state='disabled')
+
+    def vr_report_text(self):
+        s = self.current()
+        return vr_report(s, s['start'], self.log.get('1.0', 'end'))
+
+    def copy_vr_report(self):
+        self.root.clipboard_clear()
+        self.root.clipboard_append(self.vr_report_text())
+
+    def vr_unknown_dialog(self):
+        if self.messagebox.askyesno(
+                NAME, _('VR does not support this version of the game yet, so the headset shows it on a flat '
+                        'screen.\n\nCopy a report for the developers? Paste it into a bug report and it tells '
+                        'us how to add your version.')):
+            self.copy_vr_report()
 
     def copy_log(self):
         self.root.clipboard_clear()

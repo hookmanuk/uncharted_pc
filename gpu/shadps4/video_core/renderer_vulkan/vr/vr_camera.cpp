@@ -538,6 +538,35 @@ float ScreenAspect() {
     return Fixes::RenderSize(width, height) && height ? float(width) / float(height) : 16.f / 9.f;
 }
 
+// An unsupported game version: where each known game's signature (the first site's bytes) is in the executable
+// allocations, if anywhere, for the launcher's report (the offsets a new Games entry needs).
+void ReportUnknownImage() {
+#ifdef _WIN32
+    MEMORY_BASIC_INFORMATION mbi{};
+    int hits = 0;
+    for (u64 at = 0x400000; at < 0x80000000ull && VirtualQuery(reinterpret_cast<void*>(at), &mbi, sizeof(mbi));
+         at = u64(mbi.BaseAddress) + mbi.RegionSize) {
+        const u64 base = u64(mbi.BaseAddress);
+        if (mbi.State != MEM_COMMIT || u64(mbi.AllocationBase) != base || mbi.RegionSize < 0x100000 ||
+            !(mbi.Protect & (PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE))) {
+            continue;
+        }
+        std::printf("VR camera: executable image at %#llx, %#llx bytes%c", (unsigned long long)base,
+                    (unsigned long long)mbi.RegionSize, 10);
+        const auto* bytes = reinterpret_cast<const u8*>(base);
+        for (const Game& game : Games) {
+            const auto& sig = game.sites[0].bytes;
+            for (u64 i = 0; i + sig.size() <= mbi.RegionSize && hits < 24; ++i) {
+                if (bytes[i] == sig[0] && std::memcmp(bytes + i, sig.data(), sig.size()) == 0) {
+                    std::printf("VR camera: signature of %s at image +%#llx%c", game.name, (unsigned long long)i, 10);
+                    ++hits;
+                }
+            }
+        }
+    }
+#endif
+}
+
 void Install() {
 #ifdef _WIN32
     // The game image is mapped before the first frame: the executable allocation holding a known game's first site's
@@ -570,8 +599,9 @@ void Install() {
             }
         }
         if (!g_image_base) {
-            if (calls == 3601) {
+            if (calls == 1801) {
                 std::printf("VR camera: no known game image yet (the game on a flat screen until then)%c", 10);
+                ReportUnknownImage();
                 std::fflush(stdout);
             }
             return;
