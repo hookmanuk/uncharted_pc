@@ -822,34 +822,14 @@ static void rotate_stick(PadData *d, int rotate_dir, uint64_t now) {
     d->left_y=(uint8_t)(y<0.0f ? 0 : y>255.0f ? 255 : (int)(y+0.5f));
 }
 
-/* ---- VR: head aim and the vertical lock -------------------------------------------------------
- * BB_VR_HEAD_AIM=1: while the game aims the head moves the aim. The VR camera hook says where the head looks in the
- * aiming camera's frame (bbgpu_head_aim: degrees right and up), and the right stick turns the camera toward it: a turn
- * rate in proportion to the error, as the stick that gives it through the aiming camera's response (the 1.02 tables:
- * the 1.00 camera is slower in the middle and no faster at full stick). The stick takes the place of the player's right
- * stick while it does. BB_VR_LOCK_VERTICAL=never|always|aiming: the right stick's up and down is ignored (the headset
- * looks up and down), always or while L2 is held; head aim's up and down is not the stick's. */
+/* ---- VR: the vertical lock ---------------------------------------------------------------------
+ * BB_VR_LOCK_VERTICAL=never|always|aiming: the right stick's up and down is ignored (the headset looks up and down),
+ * always or while L2 is held. (Head aim is the VR camera hook's: it sets the aiming camera's direction.) */
 static void vr_sticks(PadData *d) {
-    static int lock=-1, head_aim=-1;
-    static float gain;
+    static int lock=-1;
     if (lock<0) {
         const char *v=getenv("BB_VR_LOCK_VERTICAL");
         lock=v && !strcmp(v,"always") ? 1 : v && !strcmp(v,"aiming") ? 2 : 0;
-        const char *h=getenv("BB_VR_HEAD_AIM");
-        head_aim=h && h[0]=='1';
-        const char *g=getenv("BB_VR_HEAD_AIM_GAIN");
-        gain=g ? (float)atof(g) : 6.0f; /* 1/s: the turn rate asked per degree of error */
-    }
-    float right, up;
-    if (head_aim && bbgpu_head_aim(&right,&up)) {
-        const float dead=0.3f; /* degrees */
-        right=right>dead ? right-dead : right<-dead ? right+dead : 0.0f;
-        up=up>dead ? up-dead : up<-dead ? up+dead : 0.0f;
-        const float x=stick_for_rate(&u1_102_aim.h,gain*right), y=stick_for_rate(&u1_102_aim.v,gain*up);
-        const float bx=127.5f+127.5f*x, by=127.5f-127.5f*y;
-        d->right_x=(uint8_t)(bx<0.0f ? 0 : bx>255.0f ? 255 : (int)(bx+0.5f));
-        d->right_y=(uint8_t)(by<0.0f ? 0 : by>255.0f ? 255 : (int)(by+0.5f));
-        return;
     }
     if (lock==1 || (lock==2 && (d->buttons & BTN_L2))) d->right_y=128;
 }

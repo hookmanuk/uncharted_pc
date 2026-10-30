@@ -42,6 +42,7 @@ extern "C" void SceneHandler(u64* regs);
 extern "C" void ViewHandler(u64* regs);
 extern "C" void CameraSetHandler(u64* regs);
 extern "C" void ProjectionHandler(u64* regs);
+extern "C" void AimHandler(u64* regs);
 
 // A byte pattern with wildcards ("??": the operands that move with the code, call and jump targets and rip-relative
 // displacements), so a game version that only shifts its code is found all the same.
@@ -111,12 +112,20 @@ struct Game {
     u32 input;          // the camera-to-world input: three rows and the position (row vectors)
     u32 params;         // aspect, x scale, near, far
     float shader_near;  // the near plane in the shaders' constants, per unit of the view's
+    // Head aim: the aiming camera's update (rsi: the camera object), whose aim direction (x, y, z: the camera's
+    // forward) at `aim_direction` it turns by the right stick, keeps from frame to frame and the player's aim reads.
+    // Its opening, `aim_displaced` bytes of whole instructions replaced. nullptr: no head aim.
+    const char* aim = nullptr;
+    u32 aim_displaced = 0;
+    u32 aim_direction = 0;
 };
 // (tools/vr/sigmake.py makes the patterns from a plaintext ELF.)
 const std::vector<Game> Games = {
     {"Uncharted 1",
      "55 48 89 e5 41 56 53 48 81 ec a0 00 00 00 48 89 fb 4c 8b 35 ?? ?? ?? ?? 49 8b 06 48 89 45 e8 80 bb a4 02 00 00 00",
-     14, "c5 f2 5e c0 c5 fa 11 83 c4 02 00 00 4c 89 ff e8 ?? ?? ?? ??", 0x250, 0x290, 0.5f},
+     14, "c5 f2 5e c0 c5 fa 11 83 c4 02 00 00 4c 89 ff e8 ?? ?? ?? ??", 0x250, 0x290, 0.5f,
+     // (1.00: +0xc42c0; the direction at +0x1830 found by turning a copy of each candidate, as RPCS3's was)
+     "55 48 89 e5 41 57 41 56 41 55 41 54 53 48 81 ec 68 02 00 00 49 89 d7 48 89 f3 49 89 fe", 13, 0x1830},
     {"Uncharted 2",
      "55 48 89 e5 53 48 81 ec 28 01 00 00 48 89 fb 80 bb 82 02 00 00 00 0f 85 ?? ?? ?? ??", 12,
      "49 89 cf 49 89 d4 48 89 f3 49 89 fe 48 89 df e8 ?? ?? ?? ??", 0x210, 0x250, 1.0f},
@@ -375,12 +384,13 @@ u32 g_tag = 0;
 float g_near_written = 0.f, g_near_original = 0.f;
 
 // Head aim (BB_VR_HEAD_AIM=1): while the game aims (the zoomed view: the same test as the reticle layer), the head
-// moves the aim. The game's aim follows its camera, which the right stick turns; the view is the head's pose on a
-// base orientation B instead of the camera's, and B stands still while aiming (R, the camera's when the aim began),
-// so the head looks where it looks in the world and the camera is turned toward that by the pad layer
-// (bbgpu_head_aim: the head's direction in the camera's frame, as degrees right and up). The camera's own direction
-// in B's frame (AimOffset) is where the reticle goes. When the aim ends B carries on from where it stood (D, the
-// rotation that takes the camera to B), so the view does not jump.
+// moves the aim. The view is the head's pose on a base orientation R that stands still while aiming (the camera's
+// when the aim began), so the head looks where it looks in the world, and the aiming camera's direction is set to
+// the head's at the start of its update each frame (AimHandler): the game turns that by the right stick and aims
+// along it, so the camera, the reticle and Nathan's gun follow the head in the same frame. What the update added to
+// the direction we wrote, sideways, is the stick's turn: R turns with it, so the stick still turns left and right
+// (up and down is the head's; the game's own limit on looking up and down is not taken into R). The camera's
+// direction in R's frame (AimOffset) is where the reticle goes. When the aim ends the view is the camera's again.
 struct Mat3 {
     float m[9];
 };
@@ -406,8 +416,49 @@ float Dot3(const float* a, const float* b) {
     return a[0] * b[0] + a[1] * b[1] + a[2] * b[2];
 }
 constexpr Mat3 Identity3{{1, 0, 0, 0, 1, 0, 0, 0, 1}};
-Mat3 g_aim_offset = Identity3; // D
 Mat3 g_aim_still = Identity3;  // R
+float g_stick_total = 0.f; // development: the stick yaw given to the held view (BB_VR_HEAD_AIM_LOG)
+std::atomic<float> g_stick_yaw{0.f}; // degrees the stick turned the aim (AimHandler) not yet in R
+float g_aim_written[3] = {};          // the direction AimHandler wrote last (the update's turn is measured from it)
+bool g_aim_written_valid = false;
+
+// Rotation of the still base by the stick's turn: yaw to the right about the world's vertical (the aiming camera turns
+// about it, whatever its pitch), pitch up in its own frame (x left, y up, z forward), then the rows made orthonormal
+// again.
+Mat3 TurnBase(const Mat3& base, float yaw_degrees, float pitch_degrees) {
+    const float y = yaw_degrees * 0.0174533f, p = pitch_degrees * 0.0174533f;
+    const float cp = std::cos(p), sp = std::sin(p);
+    const Mat3 pitch{{1, 0, 0, 0, cp, -sp, 0, sp, cp}};
+    Mat3 r = Mul3(pitch, base);
+    // About the world's up (+Y), in the direction that turns the forward row toward the right (minus the left row).
+    const float forward_x = r.m[6], forward_z = r.m[8];
+    const float toward_right = -r.m[0] * forward_z + r.m[2] * forward_x; // (up x forward) . right, up = +Y
+    const float angle = toward_right >= 0.f ? y : -y;
+    const float ca = std::cos(angle), sa = std::sin(angle);
+    for (int row = 0; row < 3; ++row) {
+        float* v = r.m + row * 3;
+        // v' = v cos + (up x v) sin + up (up . v)(1 - cos): up x v = (v.z, 0, -v.x)
+        const float x = v[0] * ca + v[2] * sa, z = v[2] * ca - v[0] * sa;
+        v[0] = x;
+        v[2] = z;
+    }
+    auto normalize = [](float* v) {
+        const float n = 1.f / std::sqrt(Dot3(v, v));
+        v[0] *= n, v[1] *= n, v[2] *= n;
+    };
+    normalize(r.m + 6);
+    for (int axis = 1; axis >= 0; --axis) {
+        float* v = r.m + axis * 3;
+        for (int other = axis + 1; other < 3; ++other) {
+            const float d = Dot3(v, r.m + other * 3);
+            for (int k = 0; k < 3; ++k) {
+                v[k] -= d * r.m[other * 3 + k];
+            }
+        }
+        normalize(v);
+    }
+    return r;
+}
 bool g_aim_engaged = false;
 std::atomic<float> g_aim_error_right{0.f}, g_aim_error_up{0.f}, g_aim_offset_right{0.f}, g_aim_offset_up{0.f};
 std::atomic<long long> g_aim_stamp{0}; // steady clock ms of the last frame engaged, 0 when not
@@ -438,14 +489,20 @@ void HeadAim(const float* h, float* in, float xscale) {
         }
     }
     if (aiming && !g_aim_engaged) {
-        g_aim_still = Mul3(g_aim_offset, camera);
+        g_aim_still = camera;
         g_aim_engaged = true;
+        g_stick_yaw = 0.f;
+        g_aim_written_valid = false;
     } else if (!aiming && g_aim_engaged) {
-        g_aim_offset = Mul3(g_aim_still, Transpose3(camera));
         g_aim_engaged = false;
         g_aim_stamp = 0;
     }
-    const Mat3 base = g_aim_engaged ? g_aim_still : Mul3(g_aim_offset, camera);
+    if (g_aim_engaged) {
+        const float turn_yaw = g_stick_yaw.exchange(0.f);
+        g_aim_still = TurnBase(g_aim_still, turn_yaw, 0.f);
+        g_stick_total += turn_yaw;
+    }
+    const Mat3 base = g_aim_engaged ? g_aim_still : camera;
     for (int r = 0; r < 3; ++r) {
         for (int c = 0; c < 3; ++c) {
             in[r * 4 + c] = base.m[r * 3 + c];
@@ -475,12 +532,62 @@ void HeadAim(const float* h, float* in, float xscale) {
     g_aim_stamp = NowMs();
     static const bool log = std::getenv("BB_VR_HEAD_AIM_LOG") != nullptr;
     static int frames = 0;
-    if (log && frames++ % 10 == 0) {
-        std::printf("VR head aim: gaze %.2f right %.2f up of the camera, reticle %.2f right %.2f up of the view\n",
-                    g_aim_error_right.load(), g_aim_error_up.load(), g_aim_offset_right.load(),
+    static const int interval = std::max(1, std::atoi(std::getenv("BB_VR_HEAD_AIM_LOG") ? std::getenv("BB_VR_HEAD_AIM_LOG") : "1"));
+    if (log && frames++ % interval == 0) {
+        std::printf("VR head aim: stick %.2f gaze %.2f right %.2f up of the camera, reticle %.2f right %.2f up of the view\n",
+                    g_stick_total, g_aim_error_right.load(), g_aim_error_up.load(), g_aim_offset_right.load(),
                     g_aim_offset_up.load());
         std::fflush(stdout);
     }
+}
+
+// The aiming camera's update begins: the head's direction goes in (see HeadAim), after the turn the last update
+// gave the direction written then is taken into R.
+extern "C" void AimHandler(u64* regs) {
+    if (!g_aim_engaged || !g_game) {
+        g_aim_written_valid = false;
+        return;
+    }
+    auto* direction = reinterpret_cast<float*>(regs[RSI] + g_game->aim_direction);
+    if (g_aim_written_valid) {
+        // The sideways turn from what was written to what the update left: about the world's up, right positive.
+        const float* a = g_aim_written;
+        const float* b = direction;
+        float ax = a[0], az = a[2];
+        const float an = std::hypot(ax, az);
+        if (an > 1e-4f) {
+            ax /= an, az /= an;
+            float rx = -g_aim_still.m[0], rz = -g_aim_still.m[2]; // R's right, level
+            const float along = rx * ax + rz * az;
+            rx -= along * ax, rz -= along * az;
+            const float rn = std::hypot(rx, rz);
+            if (rn > 1e-4f) {
+                rx /= rn, rz /= rn;
+                g_stick_yaw.fetch_add(std::atan2(b[0] * rx + b[2] * rz, b[0] * ax + b[2] * az) * 57.29578f);
+            }
+        }
+    }
+    // The head's direction: its pose on R (rows: the head's axes in the game's frame, z forward).
+    Head head;
+    {
+        std::scoped_lock lock{g_head_mutex};
+        if (!g_head_valid) {
+            return;
+        }
+        head = g_head;
+    }
+    constexpr float axes[3] = {-1.f, 1.f, -1.f};
+    const Mat3 still = TurnBase(g_aim_still, g_stick_yaw.load(), 0.f);
+    float forward[3];
+    for (int c = 0; c < 3; ++c) {
+        forward[c] = 0.f;
+        for (int k = 0; k < 3; ++k) {
+            forward[c] += head.pose[2 * 4 + k] * axes[2] * axes[k] * still.m[k * 3 + c];
+        }
+    }
+    std::memcpy(direction, forward, sizeof(forward));
+    std::memcpy(g_aim_written, forward, sizeof(forward));
+    g_aim_written_valid = true;
 }
 
 extern "C" void ProjectionHandler(u64* regs) {
@@ -757,6 +864,19 @@ bool Locate(const u8* code, u64 size, const Game& game) {
     site.bytes.assign(reinterpret_cast<const u8*>(function), reinterpret_cast<const u8*>(function) + game.displaced);
     site.handler = &ProjectionHandler;
     g_sites = {site};
+    if (game.aim) {
+        const auto aim = Find(code, size, Sig{game.aim}, 2);
+        if (aim.size() == 1) {
+            Site update;
+            update.address = reinterpret_cast<u64>(code) + aim[0];
+            update.bytes.assign(reinterpret_cast<const u8*>(update.address),
+                                reinterpret_cast<const u8*>(update.address) + game.aim_displaced);
+            update.handler = &AimHandler;
+            g_sites.push_back(update);
+        } else {
+            std::printf("VR camera: the aiming camera's update was not found: no head aim%c", 10);
+        }
+    }
     g_main_caller = caller;
     g_game = &game;
     std::printf("VR camera: %s, projection update at image +%#llx, main camera call at +%#llx%c", game.name,
@@ -809,16 +929,6 @@ void Install() {
 
 float Near() {
     return g_near.load();
-}
-
-bool HeadAimError(float& right, float& up) {
-    const long long stamp = g_aim_stamp.load();
-    if (!stamp || NowMs() - stamp > 250) {
-        return false;
-    }
-    right = g_aim_error_right.load();
-    up = g_aim_error_up.load();
-    return true;
 }
 
 bool AimOffset(float& right, float& up) {
@@ -945,6 +1055,4 @@ bool RenderedAt(const float* position, float (&layer_pose)[7], float (&tangents)
 
 } // namespace Vulkan::Vr::Camera
 
-extern "C" int bbgpu_head_aim(float* right_degrees, float* up_degrees) {
-    return Vulkan::Vr::Camera::HeadAimError(*right_degrees, *up_degrees) ? 1 : 0;
-}
+

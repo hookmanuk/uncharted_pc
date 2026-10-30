@@ -1552,8 +1552,8 @@ class Launcher:
                  _('The size each eye is drawn at: lower is faster, higher is sharper. Uncharted 1 renders at it; '
                    'its menus and HUD lay themselves out for the square picture.'))
         self.check(f, 'vr_head_aim', _('Head aiming'),
-                   _('While Nathan aims, your head moves the aim and the reticle (the right stick is not used). The '
-                     'aim turns as fast as the aiming camera allows, so a quick head turn is followed a moment later.'))
+                   _('While Nathan aims, he aims where you look: your head moves the aim and the reticle at once. The '
+                     'right stick still turns you left and right. Uncharted 1.'))
         self.row(f, _('Lock the vertical axis'), self.choice(f, 'vr_lock_vertical', VR_LOCK_VERTICAL, 34),
                  _('Ignores up and down on the right stick: the headset looks up and down. With head aiming on, '
                    'your head still aims up and down.'))

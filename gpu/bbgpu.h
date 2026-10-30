@@ -43,9 +43,6 @@ void bbgpu_mouse_configure(int look);
 /* Heading (degrees, about the vertical axis) of the camera the game last rendered with and how old
  * it is; 0 before the first frame with a known camera. */
 int bbgpu_camera_yaw(float *yaw_degrees, double *age_seconds);
-/* VR head aim (BB_VR_HEAD_AIM=1): 1 while the game aims and the head is moving the aim, with the head's direction in
- * the aiming camera's frame, degrees to the right and up; the pad turns the camera toward it. */
-int bbgpu_head_aim(float *right_degrees, float *up_degrees);
 int bbgpu_mouse_sample(float *dx, float *dy, uint32_t *buttons, int *wheel);
 /* In-game trophy notice (the overlay draws it for a few seconds, one at a time): grade 1 platinum,
  * 2 gold, 3 silver, 4 bronze; png is the trophy's icon (a PNG file) or empty. */

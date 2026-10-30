@@ -13,7 +13,6 @@ int bbgpu_mouse_sample(float *dx, float *dy, uint32_t *buttons, int *wheel) {
     return 0;
 }
 int bbgpu_camera_yaw(float *yaw_degrees, double *age_seconds) { (void)yaw_degrees; (void)age_seconds; return 0; }
-int bbgpu_head_aim(float *right_degrees, float *up_degrees) { (void)right_degrees; (void)up_degrees; return 0; }
 void bbgpu_prompts_controller(int device) { (void)device; }
 uintptr_t runtime_lookup(const RuntimeExport *table, size_t count, const char *name) {
     (void)table; (void)count; (void)name;
