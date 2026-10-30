@@ -374,6 +374,115 @@ constexpr u32 TagCount = 16;
 u32 g_tag = 0;
 float g_near_written = 0.f, g_near_original = 0.f;
 
+// Head aim (BB_VR_HEAD_AIM=1): while the game aims (the zoomed view: the same test as the reticle layer), the head
+// moves the aim. The game's aim follows its camera, which the right stick turns; the view is the head's pose on a
+// base orientation B instead of the camera's, and B stands still while aiming (R, the camera's when the aim began),
+// so the head looks where it looks in the world and the camera is turned toward that by the pad layer
+// (bbgpu_head_aim: the head's direction in the camera's frame, as degrees right and up). The camera's own direction
+// in B's frame (AimOffset) is where the reticle goes. When the aim ends B carries on from where it stood (D, the
+// rotation that takes the camera to B), so the view does not jump.
+struct Mat3 {
+    float m[9];
+};
+Mat3 Mul3(const Mat3& a, const Mat3& b) {
+    Mat3 r{};
+    for (int i = 0; i < 3; ++i) {
+        for (int j = 0; j < 3; ++j) {
+            r.m[i * 3 + j] = a.m[i * 3] * b.m[j] + a.m[i * 3 + 1] * b.m[3 + j] + a.m[i * 3 + 2] * b.m[6 + j];
+        }
+    }
+    return r;
+}
+Mat3 Transpose3(const Mat3& a) {
+    Mat3 r{};
+    for (int i = 0; i < 3; ++i) {
+        for (int j = 0; j < 3; ++j) {
+            r.m[i * 3 + j] = a.m[j * 3 + i];
+        }
+    }
+    return r;
+}
+float Dot3(const float* a, const float* b) {
+    return a[0] * b[0] + a[1] * b[1] + a[2] * b[2];
+}
+constexpr Mat3 Identity3{{1, 0, 0, 0, 1, 0, 0, 0, 1}};
+Mat3 g_aim_offset = Identity3; // D
+Mat3 g_aim_still = Identity3;  // R
+bool g_aim_engaged = false;
+std::atomic<float> g_aim_error_right{0.f}, g_aim_error_up{0.f}, g_aim_offset_right{0.f}, g_aim_offset_up{0.f};
+std::atomic<long long> g_aim_stamp{0}; // steady clock ms of the last frame engaged, 0 when not
+
+long long NowMs() {
+    return std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch())
+        .count();
+}
+
+// The base orientation for this frame, written into the rows of `in` (the camera-to-world input).
+void HeadAim(const float* h, float* in, float xscale) {
+    static const bool enabled = [] {
+        const char* v = std::getenv("BB_VR_HEAD_AIM");
+        return v && v[0] == '1';
+    }();
+    if (!enabled) {
+        return;
+    }
+    static const float threshold = [] {
+        const char* v = std::getenv("BB_VR_RETICLE_XSCALE");
+        return v ? float(std::atof(v)) : 1.8f;
+    }();
+    const bool aiming = xscale > threshold;
+    Mat3 camera{};
+    for (int r = 0; r < 3; ++r) {
+        for (int c = 0; c < 3; ++c) {
+            camera.m[r * 3 + c] = in[r * 4 + c];
+        }
+    }
+    if (aiming && !g_aim_engaged) {
+        g_aim_still = Mul3(g_aim_offset, camera);
+        g_aim_engaged = true;
+    } else if (!aiming && g_aim_engaged) {
+        g_aim_offset = Mul3(g_aim_still, Transpose3(camera));
+        g_aim_engaged = false;
+        g_aim_stamp = 0;
+    }
+    const Mat3 base = g_aim_engaged ? g_aim_still : Mul3(g_aim_offset, camera);
+    for (int r = 0; r < 3; ++r) {
+        for (int c = 0; c < 3; ++c) {
+            in[r * 4 + c] = base.m[r * 3 + c];
+        }
+    }
+    if (!g_aim_engaged) {
+        return;
+    }
+    Mat3 head{};
+    for (int r = 0; r < 3; ++r) {
+        for (int c = 0; c < 3; ++c) {
+            head.m[r * 3 + c] = h[r * 4 + c];
+        }
+    }
+    constexpr float Degrees = 57.29578f;
+    const Mat3 gaze = Mul3(head, base); // the view's axes in the world; z is forward
+    // The head's direction in the camera's frame (x: left, y: up, z: forward).
+    const float* g = gaze.m + 6;
+    const float gx = Dot3(g, camera.m), gy = Dot3(g, camera.m + 3), gz = Dot3(g, camera.m + 6);
+    g_aim_error_right = std::atan2(-gx, gz) * Degrees;
+    g_aim_error_up = std::atan2(gy, std::hypot(gx, gz)) * Degrees;
+    // The camera's direction in the still base's frame: where the reticle is.
+    const float* a = camera.m + 6;
+    const float ax = Dot3(a, base.m), ay = Dot3(a, base.m + 3), az = Dot3(a, base.m + 6);
+    g_aim_offset_right = std::atan2(-ax, az) * Degrees;
+    g_aim_offset_up = std::atan2(ay, std::hypot(ax, az)) * Degrees;
+    g_aim_stamp = NowMs();
+    static const bool log = std::getenv("BB_VR_HEAD_AIM_LOG") != nullptr;
+    static int frames = 0;
+    if (log && frames++ % 10 == 0) {
+        std::printf("VR head aim: gaze %.2f right %.2f up of the camera, reticle %.2f right %.2f up of the view\n",
+                    g_aim_error_right.load(), g_aim_error_up.load(), g_aim_offset_right.load(),
+                    g_aim_offset_up.load());
+        std::fflush(stdout);
+    }
+}
+
 extern "C" void ProjectionHandler(u64* regs) {
     auto* view = reinterpret_cast<u8*>(regs[RDI]);
     const Game& game = *g_game;
@@ -426,6 +535,7 @@ extern "C" void ProjectionHandler(u64* regs) {
     std::memcpy(in, input, sizeof(in));
     in[3] = in[7] = in[11] = 0.f;
     in[15] = 1.f;
+    HeadAim(h, in, params[1]);
     Multiply(h, in, out);
     for (int r = 0; r < 4; ++r) {
         for (int c = 0; c < 3; ++c) {
@@ -701,6 +811,26 @@ float Near() {
     return g_near.load();
 }
 
+bool HeadAimError(float& right, float& up) {
+    const long long stamp = g_aim_stamp.load();
+    if (!stamp || NowMs() - stamp > 250) {
+        return false;
+    }
+    right = g_aim_error_right.load();
+    up = g_aim_error_up.load();
+    return true;
+}
+
+bool AimOffset(float& right, float& up) {
+    const long long stamp = g_aim_stamp.load();
+    if (!stamp || NowMs() - stamp > 250) {
+        return false;
+    }
+    right = g_aim_offset_right.load();
+    up = g_aim_offset_up.load();
+    return true;
+}
+
 float GameXScale() {
     return g_game_xscale.load();
 }
@@ -814,3 +944,7 @@ bool RenderedAt(const float* position, float (&layer_pose)[7], float (&tangents)
 }
 
 } // namespace Vulkan::Vr::Camera
+
+extern "C" int bbgpu_head_aim(float* right_degrees, float* up_degrees) {
+    return Vulkan::Vr::Camera::HeadAimError(*right_degrees, *up_degrees) ? 1 : 0;
+}

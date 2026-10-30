@@ -33,6 +33,13 @@ float ScreenAspect();
 /// 2.41 aiming): the aim zoom tells aiming (the reticle layer). 0 before the first view.
 float GameXScale();
 
+/// Head aim (BB_VR_HEAD_AIM=1), while the game aims: the head's direction in the aiming camera's frame, degrees to the
+/// right and up (the pad layer turns the camera toward it). False when head aim is off or the game is not aiming.
+bool HeadAimError(float& right, float& up);
+/// While head aim holds the view still: the aim camera's direction in the view's reference frame (degrees right, up),
+/// where the reticle goes. False as above.
+bool AimOffset(float& right, float& up);
+
 /// The pose and field of view the last player view was rendered with (for the headset layer).
 bool LastRendered(float (&layer_pose)[7], float (&tangents)[4]);
 

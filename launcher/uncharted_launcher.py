@@ -113,6 +113,8 @@ VR_EYE_SIZES = [(size, f'{size} × {size}' + note) for size, note in (
     ('1440', " (the games' own pixel count)"), ('1600', ''), ('1800', ''), ('2048', ''), ('2160', ' (recommended)'),
     ('2400', ''), ('2560', ''), ('2880', ''), ('3200', ''), ('3584', ''), ('3840', ''), ('4320', ''), ('4800', ''),
     ('5120', ' (the most)'))]
+# VR fork: right stick up and down ignored (BB_VR_LOCK_VERTICAL, src/runtime_pad.c).
+VR_LOCK_VERTICAL = [('never', 'Never'), ('always', 'Always'), ('aiming', 'When aiming')]
 # Controls (input.ini, read by the game: src/runtime_pad.c). Actions with their PS4 names, the
 # default keys ("A|B": two bindings) and the default controller buttons (SDL names).
 BUTTON_ACTIONS = [
@@ -219,7 +221,7 @@ APP_DEFAULTS = {'game_dir': '', 'game_dir_u1': '', 'game_dir_u2': '', 'game_dir_
                 'pad_invert_y': False, 'art_banner': '', 'art_u1': '', 'art_u2': '', 'art_u3': '', 'steam_art': '', 'art_crops': {},
                 'shortcut_name': 'Uncharted: The Nathan Drake Collection', 'shortcut_icon': '', 'trophy_game': 'u1',
                 'pad_vibration': True, 'pad_vibration_strength': '100', 'button_prompts': 'auto', 'key_bindings': {}, 'pad_bindings': {}, 'check_updates': True,
-                'vr': True, 'vr_eye_size': '2160', 'vr_dlss': False,  # VR fork: the VR card (Display page)
+                'vr': True, 'vr_eye_size': '2160', 'vr_dlss': False, 'vr_head_aim': False, 'vr_lock_vertical': 'never',  # VR fork: the VR card (Display page)
                 **{key: 'auto' for key in FIXES},
                 **{f'{game}_infinite_{cheat}': False for game, _t, _s, _e in GAMES for cheat in ('health', 'ammo')}}
 
@@ -547,6 +549,8 @@ def vr_environment(s, env):
         # DLSS (DLAA: each eye at its own size, its own history) or the game's own anti-aliasing; nothing else in stereo.
         env['BB_UPSCALER'] = 'dlss' if s.get('vr_dlss', False) else 'off'
         env['BB_UPSCALE_PRESET'] = '0'
+        env['BB_VR_HEAD_AIM'] = '1' if s.get('vr_head_aim') else '0'
+        env['BB_VR_LOCK_VERTICAL'] = str(s.get('vr_lock_vertical') or 'never')
         # The headset paces the game: the game runs unpaced and each flip waits for the headset's next frame once it
         # keeps up (vr_openxr.cpp FramePeriod): the game's frame rate is the headset's refresh rate.
         env['BB_VBLANK_HZ'] = '240'
@@ -1547,6 +1551,12 @@ class Launcher:
         self.row(f, _('Resolution per eye'), self.choice(f, 'vr_eye_size', VR_EYE_SIZES, 34),
                  _('The size each eye is drawn at: lower is faster, higher is sharper. Uncharted 1 renders at it; '
                    'its menus and HUD lay themselves out for the square picture.'))
+        self.check(f, 'vr_head_aim', _('Head aiming'),
+                   _('While Nathan aims, your head moves the aim and the reticle (the right stick is not used). The '
+                     'aim turns as fast as the aiming camera allows, so a quick head turn is followed a moment later.'))
+        self.row(f, _('Lock the vertical axis'), self.choice(f, 'vr_lock_vertical', VR_LOCK_VERTICAL, 34),
+                 _('Ignores up and down on the right stick: the headset looks up and down. With head aiming on, '
+                   'your head still aims up and down.'))
         self.new_card(f, None)
 
     def build_controls(self):

@@ -931,8 +931,18 @@ void EndFrame() {
                 const float scale = reticle_distance / 1.1f;
                 reticle_layer.size = {hud.size.width * scale * float(bw) / float(g.far_chain.width),
                             hud.size.height * scale * float(bh) / float(g.far_chain.height)};
-                reticle_layer.pose.position = {g.reference_position.x - reticle_distance * std::sin(yaw), g.reference_position.y,
-                                     g.reference_position.z - reticle_distance * std::cos(yaw)};
+                // Head aim holds the view still while the aim camera turns: the reticle is where the camera looks, in
+                // the view's frame (left and up are positive here).
+                float aim_right = 0.f, aim_up = 0.f;
+                Camera::AimOffset(aim_right, aim_up);
+                const float aim_yaw = yaw - aim_right * 0.0174533f, aim_pitch = aim_up * 0.0174533f;
+                const float cy = std::cos(aim_yaw * 0.5f), sy = std::sin(aim_yaw * 0.5f);
+                const float cx = std::cos(aim_pitch * 0.5f), sx = std::sin(aim_pitch * 0.5f);
+                reticle_layer.pose.orientation = {cy * sx, sy * cx, -sy * sx, cy * cx};
+                reticle_layer.pose.position = {
+                    g.reference_position.x - reticle_distance * std::sin(aim_yaw) * std::cos(aim_pitch),
+                    g.reference_position.y + reticle_distance * std::sin(aim_pitch),
+                    g.reference_position.z - reticle_distance * std::cos(aim_yaw) * std::cos(aim_pitch)};
                 layers[2] = reinterpret_cast<XrCompositionLayerBaseHeader*>(&reticle_layer);
                 layer_count = 3;
             }
