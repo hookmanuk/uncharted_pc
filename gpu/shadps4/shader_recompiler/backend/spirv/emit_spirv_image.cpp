@@ -37,6 +37,9 @@ const ForcedImage& Forced() {
     return forced;
 }
 Id ForcedSample(EmitContext& ctx, u32 handle, bool dref) {
+    if (const Id fixed = Vr::FixedSample(ctx, handle & 0xFFFF, dref); Sirit::ValidId(fixed)) {
+        return fixed; // VR
+    }
     const auto& f = Forced();
     if (!f.hash || u32(ctx.info.pgm_hash) != f.hash || (handle & 0xFFFF) != f.image) {
         return {};

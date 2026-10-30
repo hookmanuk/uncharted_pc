@@ -18,6 +18,7 @@
 #include "shader_recompiler/frontend/fetch_shader.h"
 #include "shader_recompiler/info.h"
 #include "shader_recompiler/backend/spirv/emit_spirv.h"
+#include "shader_recompiler/backend/spirv/emit_spirv_vr.h"
 #include "shader_recompiler/ir/passes/ir_passes.h"
 #include "video_core/cache_storage.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
@@ -105,7 +106,7 @@ void RegisterShaderMeta(const Shader::Info& info,
     Serialization::Writer meta{ar};
 
     meta.Write(Serialization::ShaderMetaVersion);
-    meta.Write(Serialization::TranslatedBinaryVersion());
+    meta.Write(Serialization::TranslatedBinaryVersion() | Shader::Backend::SPIRV::Vr::ShaderTag(info.pgm_hash)); // VR
 
     meta.Write(perm_hash);
     meta.Write(perm_idx);
@@ -144,7 +145,7 @@ bool LoadShaderMeta(Serialization::Archive& ar, Shader::Info& info,
 
     u32 binary_version{};
     meta.Read(binary_version);
-    if (binary_version != Serialization::TranslatedBinaryVersion()) {
+    if ((binary_version & 0x00ffffffu) != Serialization::TranslatedBinaryVersion()) { // VR: the tag is the top byte
         return false;
     }
 
@@ -159,6 +160,10 @@ bool LoadShaderMeta(Serialization::Archive& ar, Shader::Info& info,
 
     spec.Deserialize(ar);
     info.Deserialize(ar);
+    if (binary_version != (Serialization::TranslatedBinaryVersion() |
+                           Shader::Backend::SPIRV::Vr::ShaderTag(info.pgm_hash))) { // VR: the fixes' tag
+        return false;
+    }
 
     fetch_shader_data = spec.fetch_shader_data;
     return true;

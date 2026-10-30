@@ -21,6 +21,11 @@ namespace Shader::Backend::SPIRV::Vr {
 /// Multiview shaders are compiled (BB_VR_STEREO=mv; fixed for the session).
 bool MultiviewShaders();
 
+/// The shader cache's tag for a program the VR fixes translate in their own way (a listed projective sample or eye
+/// light), 0 for every other: a stored shader whose tag differs is translated again, so adding or changing a fix
+/// retranslates only the shaders it names, not the whole cache. Only the top byte is used (the stored version's).
+u32 ShaderTag(u64 pgm_hash);
+
 /// Whether an image of this view type is declared as a 2D array.
 bool ArrayedImage(AmdGpu::ImageType view_type);
 
@@ -39,6 +44,17 @@ void Define(EmitContext& ctx);
 /// the centre camera's ray and the eye's depth (U1's light 43b8ee5e: the torch), the view-to-world translation moved by
 /// the eye's offset (emit_spirv_vr.cpp EyeConst). Otherwise `value`.
 Id EyeConst(EmitContext& ctx, u32 offset, Id value);
+
+/// A constant buffer's dword `index` (an id; constants are shared, so a constant index compares equal to ConstU32 of
+/// it): in the listed fragment shaders that fade with the view depth z (U2's mist and haze, pgm 84adaaea: density from
+/// c20 z), the term's coefficient times the pixel's ray length sqrt(1 + x^2 + y^2), so the fog goes by the distance and
+/// stays put when the head turns (emit_spirv_vr.cpp RadialDepth). Otherwise `value`.
+Id RadialConst(EmitContext& ctx, u32 handle, Id index, Id value);
+
+/// In the listed fragment shaders, the samples of one image read a fixed value instead (in VR): U2's depth of field
+/// composite (pgm 3371ae8d) blends the scene to its blur by image 2's focus mask, which reads 0, so the scene stays
+/// sharp (Matt 2026-10-29: "need to remove depth of field effect"). A null id otherwise (emit_spirv_vr.cpp).
+Id FixedSample(EmitContext& ctx, u32 image, bool dref);
 
 /// `coords` with the eye's layer appended when the image is a VR array (float for sampling, integer otherwise;
 /// integer layers are clamped to the image's layers, `image` being the loaded image or, for atomics, null).

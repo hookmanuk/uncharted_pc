@@ -204,25 +204,11 @@ bool Enabled() {
 }
 
 const char* CacheSuffix() {
-    // The cache opens before the game's render size can be read, and one shader holds that size (Fixes::PatchShader):
-    // other per-eye sizes than 2880 (the launcher's BB_VR_EYE_RES) keep a cache of their own.
-    static const std::string suffix = [] {
-        const char* res = std::getenv("BB_VR_EYE_RES");
-        // _mv5: guest buffers are per-eye arrays in the shaders (EyeBufferInfo); view-dependent outputs move with the eye.
-        // _mv6: projective samples move with the eye (emit_spirv_vr.cpp ProjectiveSample); their development settings
-        // keep caches of their own.
-        std::string out = "_mv7"; // _mv7: the eye-light computes (EyeConst)
-        for (const char* name : {"BB_VR_PROJECTIVE_SAMPLES", "BB_VR_PROJECTIVE_SCALE"}) {
-            if (const char* v = std::getenv(name); v && *v) {
-                out += "_p";
-                for (const char* c = v; *c; ++c) {
-                    out += std::isalnum(static_cast<unsigned char>(*c)) ? *c : '-';
-                }
-            }
-        }
-        return res && res[0] && std::strcmp(res, "2880") != 0 ? out + "_" + res : out;
-    }();
-    return Requested() ? suffix.c_str() : "";
+    // _mv5: guest buffers are per-eye arrays in the shaders (EyeBufferInfo); view-dependent outputs move with the eye.
+    // _mv6: projective samples; _mv7: the eye-light computes. One cache for every eye size (no shader holds it: the
+    // Uncharted fixes patch no shader for the render size). Shaders a VR fix translates in its own way carry a tag of
+    // their own in the cache (Shader::Backend::SPIRV::Vr::ShaderTag): adding or changing a fix retranslates only them.
+    return Requested() ? "_mv7" : "";
 }
 
 void OnDevice(VkDevice device, bool supported) {

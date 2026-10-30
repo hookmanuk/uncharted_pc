@@ -32,9 +32,15 @@ bool EyeBufferArrays() {
     return MultiviewShaders();
 }
 
+struct RadialDepth;
+const RadialDepth* RadialDepthOf(u64 pgm_hash);
+
 void Define(EmitContext& ctx) {
     if (!MultiviewShaders() || ctx.sw_stage == SwStage::Compute) {
         return;
+    }
+    if (ctx.sw_stage == SwStage::Fragment && !Sirit::ValidId(ctx.frag_coord) && RadialDepthOf(ctx.info.pgm_hash)) {
+        ctx.frag_coord = ctx.DefineVariable(ctx.F32[4], spv::BuiltIn::FragCoord, spv::StorageClass::Input);
     }
     ctx.AddExtension("SPV_KHR_multiview");
     ctx.AddCapability(spv::Capability::MultiView);
@@ -81,13 +87,14 @@ Id ViewShift(EmitContext& ctx) {
 // the water pixel's own shift between the centre and the eye (scale * vr_shift[view] / w, w from gl_FragCoord): each
 // eye reads its reflection where it sees the surface. BB_VR_PROJECTIVE_SAMPLES "pgm:image,..." (hex pgm, empty: none),
 // BB_VR_PROJECTIVE_SCALE (texture units per clip unit; 0.5: the image spans the view).
-bool ProjectiveSample(const EmitContext& ctx, const EmitContext::TextureDefinition& texture) {
-    struct Entry {
-        u64 pgm;
-        u32 image;
-    };
-    static const std::vector<Entry> entries = [] {
-        std::vector<Entry> out;
+struct ProjectiveEntry {
+    u64 pgm;
+    u32 image;
+};
+
+const std::vector<ProjectiveEntry>& ProjectiveEntries() {
+    static const std::vector<ProjectiveEntry> entries = [] {
+        std::vector<ProjectiveEntry> out;
         const char* env = std::getenv("BB_VR_PROJECTIVE_SAMPLES");
         const char* p = env ? env : "f2fab535:8";
         while (*p) {
@@ -106,12 +113,17 @@ bool ProjectiveSample(const EmitContext& ctx, const EmitContext::TextureDefiniti
         }
         return out;
     }();
+    return entries;
+}
+
+bool ProjectiveSample(const EmitContext& ctx, const EmitContext::TextureDefinition& texture) {
     if (ctx.sw_stage != SwStage::Fragment || !Sirit::ValidId(ctx.frag_coord) || ctx.images.empty()) {
         return false;
     }
     const u32 image = u32(&texture - ctx.images.data());
+    const auto& entries = ProjectiveEntries();
     return std::any_of(entries.begin(), entries.end(),
-                       [&](const Entry& e) { return e.pgm == ctx.info.pgm_hash && e.image == image; });
+                       [&](const ProjectiveEntry& e) { return e.pgm == ctx.info.pgm_hash && e.image == image; });
 }
 
 float ProjectiveScale() {
@@ -206,6 +218,164 @@ const std::vector<EyeLightCompute>& EyeLightComputes() {
         return out;
     }();
     return list;
+}
+
+// Full-screen fragment shaders that fade with the view depth z = c3 / (depth - c2) (the centre camera's axis), not the
+// distance: U2's mist and distance haze (pgm 84adaaea: density max(0, c20 z + c21) times a height term). The same
+// rock has another z once the head turns, so the mist thickened and thinned with the head (Matt 2026-10-29: "mist
+// moves on HMD rotate"). The term's coefficient becomes c[term] sqrt(1 + xr^2 + yr^2), the pixel's ray (x / z, y / z)
+// being xr = c[rx] (2u - 1 - c[ox]), yr = c[ry] (1 - 2v - c[oy]) as the shader makes it (u, v the pixel's texture
+// coordinates, from gl_FragCoord and the first image's size). BB_VR_RADIAL_DEPTH "pgm:term:rx:ry:ox:oy;..." (hex
+// pgm, dwords; empty: none).
+struct RadialDepth {
+    u64 pgm;
+    u32 term, rx, ry, ox, oy;
+};
+
+const std::vector<RadialDepth>& RadialDepths() {
+    static const std::vector<RadialDepth> list = [] {
+        std::vector<RadialDepth> out;
+        const char* env = std::getenv("BB_VR_RADIAL_DEPTH");
+        const char* p = env ? env : "84adaaea:20:0:1:70:71";
+        while (*p) {
+            RadialDepth e{};
+            char* end = nullptr;
+            e.pgm = std::strtoull(p, &end, 16);
+            u32* fields[5] = {&e.term, &e.rx, &e.ry, &e.ox, &e.oy};
+            bool ok = end != p;
+            for (u32* f : fields) {
+                ok = ok && *end == ':';
+                if (ok) {
+                    *f = u32(std::strtoul(end + 1, &end, 10));
+                }
+            }
+            if (!ok) {
+                break;
+            }
+            out.push_back(e);
+            p = *end ? end + 1 : end;
+        }
+        return out;
+    }();
+    return list;
+}
+
+const RadialDepth* RadialDepthOf(u64 pgm_hash) {
+    for (const RadialDepth& e : RadialDepths()) {
+        if (e.pgm == pgm_hash) {
+            return &e;
+        }
+    }
+    return nullptr;
+}
+
+Id RadialConst(EmitContext& ctx, u32 handle, Id index, Id value) {
+    if (!MultiviewShaders() || ctx.sw_stage != SwStage::Fragment || ctx.images.empty() ||
+        !Sirit::ValidId(ctx.frag_coord)) {
+        return value;
+    }
+    const RadialDepth* e = RadialDepthOf(ctx.info.pgm_hash);
+    if (!e || index.value != ctx.ConstU32(e->term).value) {
+        return value;
+    }
+    std::printf("VR radial depth: pgm %#llx c%u by the pixel's ray length%c", (unsigned long long)ctx.info.pgm_hash,
+                e->term, 10);
+    std::fflush(stdout);
+    const auto c = [&](u32 dword) {
+        return ctx.OpBitcast(ctx.F32[1], EmitReadConstBuffer(ctx, handle, ctx.ConstU32(dword)));
+    };
+    const auto& texture = ctx.images[0];
+    const Id image = ctx.OpLoad(texture.image_type, texture.id);
+    const Id size = texture.vr_array ? ctx.OpImageQuerySizeLod(ctx.U32[3], image, ctx.u32_zero_value)
+                                     : ctx.OpImageQuerySizeLod(ctx.U32[2], image, ctx.u32_zero_value);
+    const Id coord = ctx.OpLoad(ctx.F32[4], ctx.frag_coord);
+    const auto unit = [&](u32 k) { // the pixel's texture coordinate, 0..1
+        return ctx.OpFDiv(ctx.F32[1], ctx.OpCompositeExtract(ctx.F32[1], coord, k),
+                          ctx.OpConvertUToF(ctx.F32[1], ctx.OpCompositeExtract(ctx.U32[1], size, k)));
+    };
+    const Id two = ctx.ConstF32(2.f), one = ctx.ConstF32(1.f);
+    const Id x = ctx.OpFSub(ctx.F32[1], ctx.OpFMul(ctx.F32[1], two, unit(0)), one);
+    const Id y = ctx.OpFSub(ctx.F32[1], one, ctx.OpFMul(ctx.F32[1], two, unit(1)));
+    const Id xr = ctx.OpFMul(ctx.F32[1], c(e->rx), ctx.OpFSub(ctx.F32[1], x, c(e->ox)));
+    const Id yr = ctx.OpFMul(ctx.F32[1], c(e->ry), ctx.OpFSub(ctx.F32[1], y, c(e->oy)));
+    const Id length = ctx.OpSqrt(ctx.F32[1], ctx.OpFAdd(ctx.F32[1], one,
+                                                        ctx.OpFAdd(ctx.F32[1], ctx.OpFMul(ctx.F32[1], xr, xr),
+                                                                   ctx.OpFMul(ctx.F32[1], yr, yr))));
+    return ctx.OpBitcast(ctx.U32[1], ctx.OpFMul(ctx.F32[1], ctx.OpBitcast(ctx.F32[1], value), length));
+}
+
+// BB_VR_FIXED_SAMPLES "pgm:image:value;..." (hex pgm; empty: none). U2's depth of field: its composite (pgm 3371ae8d)
+// mixes the scene with a half-size blur by the focus mask in image 2 (an R8 the size of the scene); 0 keeps the scene.
+struct FixedImage {
+    u64 pgm;
+    u32 image;
+    float value;
+};
+
+const std::vector<FixedImage>& FixedImages() {
+    static const std::vector<FixedImage> list = [] {
+        std::vector<FixedImage> out;
+        const char* env = std::getenv("BB_VR_FIXED_SAMPLES");
+        const char* p = env ? env : "3371ae8d:2:0";
+        while (*p) {
+            FixedImage e{};
+            char* end = nullptr;
+            e.pgm = std::strtoull(p, &end, 16);
+            if (end == p || *end != ':') {
+                break;
+            }
+            e.image = u32(std::strtoul(end + 1, &end, 10));
+            if (*end != ':') {
+                break;
+            }
+            e.value = std::strtof(end + 1, &end);
+            out.push_back(e);
+            p = *end ? end + 1 : end;
+        }
+        return out;
+    }();
+    return list;
+}
+
+Id FixedSample(EmitContext& ctx, u32 image, bool dref) {
+    if (!MultiviewShaders() || ctx.sw_stage != SwStage::Fragment) {
+        return {};
+    }
+    for (const FixedImage& e : FixedImages()) {
+        if (e.pgm == ctx.info.pgm_hash && e.image == image) {
+            std::printf("VR fixed sample: pgm %#llx image %u reads %g%c", (unsigned long long)e.pgm, image, e.value, 10);
+            std::fflush(stdout);
+            return dref ? ctx.ConstF32(e.value, 0.f, 0.f, 0.f) : ctx.ConstF32(e.value, e.value, e.value, e.value);
+        }
+    }
+    return {};
+}
+
+u32 ShaderTag(u64 pgm_hash) {
+    if (!MultiviewShaders()) {
+        return 0;
+    }
+    u32 tag = 0;
+    const auto mix = [&](u64 v) { tag = (tag ^ u32(v ^ (v >> 32))) * 0x9e3779b1u; };
+    for (const ProjectiveEntry& e : ProjectiveEntries()) {
+        if (e.pgm == pgm_hash) {
+            mix(1), mix(e.image), mix(u64(ProjectiveScale() * 1e4f));
+        }
+    }
+    for (const FixedImage& e : FixedImages()) {
+        if (e.pgm == pgm_hash) {
+            mix(4), mix(e.image), mix(u64(e.value * 1e4f));
+        }
+    }
+    if (const RadialDepth* e = RadialDepthOf(pgm_hash)) {
+        mix(3), mix(e->term), mix(e->rx), mix(e->ry), mix(e->ox), mix(e->oy);
+    }
+    for (const EyeLightCompute& e : EyeLightComputes()) {
+        if (e.pgm == pgm_hash) {
+            mix(2), mix(e.ray), mix(e.rows[0]), mix(e.rows[1]), mix(e.rows[2]);
+        }
+    }
+    return tag ? ((tag >> 24) | 1) << 24 : 0; // the stored version's top byte
 }
 
 Id EyeConst(EmitContext& ctx, u32 offset, Id value) {

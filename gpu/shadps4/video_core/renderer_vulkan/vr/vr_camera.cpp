@@ -598,6 +598,24 @@ extern "C" void ProjectionHandler(u64* regs) {
     if (regs[RegCount] != g_main_caller || !(params[1] > 0.1f) || !(params[2] > 0.05f && params[2] < 1.f)) {
         return;
     }
+    // U2 / U3 build every render view through the same call: also lights' projections (the train wreck's fire: a 60
+    // degree view, far 11) and a view at the origin (far 100). Head-tracked, a light's projection turned with the head
+    // and its light and shadows moved (Matt 2026-10-29: "shadows move on HMD rotate"). The player's view sees far
+    // (U1 5000, U2 / U3 100000): views with a nearer far plane keep the game's (BB_VR_MAIN_FAR_MIN, metres).
+    static const float far_min = [] {
+        const char* v = std::getenv("BB_VR_MAIN_FAR_MIN");
+        return v ? float(std::atof(v)) : 500.f;
+    }();
+    if (!(params[3] >= far_min)) {
+        static int told = 0;
+        if (told < 8) {
+            ++told;
+            std::printf("VR camera: not head-tracked (far %.1f): view x scale %.4f near %.4f%c", params[3], params[1],
+                        params[2], 10);
+            std::fflush(stdout);
+        }
+        return;
+    }
     if (g_near_written != 0.f && params[2] == g_near_written) {
         params[2] = g_near_original; // the game did not set it again this frame
     }
