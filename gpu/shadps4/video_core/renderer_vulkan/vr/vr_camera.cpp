@@ -483,6 +483,64 @@ long long NowMs() {
         .count();
 }
 
+// The aim's target: when the aim begins, the point 10 m along the gaze (the reticle's distance). The game then moves
+// its camera to the shoulder over the zoom's blend; R turns with it so that the gaze the aim began with stays on that
+// point from wherever the camera is (Matt 2026-10-30: "the target aim should remain looking at what I was originally
+// looking at still, based on the new camera location ... smoothly rotate the look to maintain the target as the zoom
+// smoothly happens"). Once the zoom has settled the turn is kept in R and the target let go.
+struct AimTarget {
+    bool active = false;
+    float point[3] = {};
+    float from[3] = {}; // the direction to it when the aim began
+    float last_xscale = 0.f;
+    int steady = 0;
+    long long since = 0;
+};
+AimTarget g_target;
+Mat3 g_aim_effective = Identity3; // R as the view uses it (with the target's turn): AimHandler writes the gaze on it
+
+// Rodrigues: the rotation turning unit vector a onto unit vector b (rows: b = Q a as columns).
+Mat3 RotationBetween(const float* a, const float* b) {
+    const float c[3] = {a[1] * b[2] - a[2] * b[1], a[2] * b[0] - a[0] * b[2], a[0] * b[1] - a[1] * b[0]};
+    const float s = std::sqrt(Dot3(c, c)), d = Dot3(a, b);
+    if (s < 1e-6f) {
+        return Identity3;
+    }
+    const float k[3] = {c[0] / s, c[1] / s, c[2] / s};
+    const float t = 1.f - d;
+    return Mat3{{d + k[0] * k[0] * t, k[0] * k[1] * t - k[2] * s, k[0] * k[2] * t + k[1] * s,
+                 k[1] * k[0] * t + k[2] * s, d + k[1] * k[1] * t, k[1] * k[2] * t - k[0] * s,
+                 k[2] * k[0] * t - k[1] * s, k[2] * k[1] * t + k[0] * s, d + k[2] * k[2] * t}};
+}
+
+// R turned so the direction the aim began with points at the target from `position`: about the world's up first,
+// then up or down (no roll).
+Mat3 TargetBase(const Mat3& still, const float* position) {
+    float to[3] = {g_target.point[0] - position[0], g_target.point[1] - position[1], g_target.point[2] - position[2]};
+    const float n = std::sqrt(Dot3(to, to));
+    if (n < 0.5f) {
+        return still;
+    }
+    to[0] /= n, to[1] /= n, to[2] /= n;
+    const float* from = g_target.from;
+    const float yaw = std::atan2(to[0], to[2]) - std::atan2(from[0], from[2]);
+    const float cy = std::cos(yaw), sy = std::sin(yaw);
+    const Mat3 turn{{cy, 0, sy, 0, 1, 0, -sy, 0, cy}}; // about +Y: x' = x cos + z sin
+    float turned[3];
+    for (int r = 0; r < 3; ++r) {
+        turned[r] = turn.m[r * 3] * from[0] + turn.m[r * 3 + 1] * from[1] + turn.m[r * 3 + 2] * from[2];
+    }
+    const Mat3 q = Mul3(RotationBetween(turned, to), turn);
+    Mat3 out{};
+    for (int row = 0; row < 3; ++row) { // each axis (a row) turned by q
+        for (int c = 0; c < 3; ++c) {
+            out.m[row * 3 + c] = q.m[c * 3] * still.m[row * 3] + q.m[c * 3 + 1] * still.m[row * 3 + 1] +
+                                 q.m[c * 3 + 2] * still.m[row * 3 + 2];
+        }
+    }
+    return out;
+}
+
 // The base orientation for this frame, written into the rows of `in` (the camera-to-world input).
 void HeadAim(const float* h, float* in, float xscale) {
     static const bool enabled = [] {
@@ -511,6 +569,25 @@ void HeadAim(const float* h, float* in, float xscale) {
     const auto heading = [](const float* f) { return std::atan2(f[0], f[2]) * 57.29578f; };
     if (!g_aim_engaged) {
         if (zoom && g_aim_held.load()) {
+            static const float target_m = [] {
+                const char* v = std::getenv("BB_VR_AIM_TARGET_M");
+                return v ? float(std::atof(v)) : 10.f;
+            }();
+            Mat3 head0{};
+            for (int r = 0; r < 3; ++r) {
+                for (int c = 0; c < 3; ++c) {
+                    head0.m[r * 3 + c] = h[r * 4 + c];
+                }
+            }
+            const Mat3 gaze0 = Mul3(head0, camera);
+            g_target.active = target_m > 0.f;
+            std::memcpy(g_target.from, gaze0.m + 6, sizeof(g_target.from));
+            for (int k = 0; k < 3; ++k) {
+                g_target.point[k] = in[12 + k] + target_m * gaze0.m[6 + k];
+            }
+            g_target.last_xscale = xscale;
+            g_target.steady = 0;
+            g_target.since = now;
             g_aim_still = camera;
             g_aim_engaged = true;
             g_stick_yaw = 0.f;
@@ -522,6 +599,10 @@ void HeadAim(const float* h, float* in, float xscale) {
         g_follow_steer = false;
     } else {
         if (!g_release_ms) {
+            if (g_target.active) {
+                g_aim_still = TargetBase(g_aim_still, in + 12);
+                g_target.active = false;
+            }
             g_release_ms = now;
             g_follow_x = g_aim_still.m[6];
             g_follow_z = g_aim_still.m[8];
@@ -541,7 +622,44 @@ void HeadAim(const float* h, float* in, float xscale) {
         g_aim_still = TurnBase(g_aim_still, turn_yaw, 0.f);
         g_stick_total += turn_yaw;
     }
-    const Mat3 base = g_aim_engaged ? g_aim_still : camera;
+    float glide_gap = 0.f; // squared metres the glide is still behind the game's camera
+    // The viewpoint glides while the zoom blends in or out: the game blends toward the shoulder camera as it was when
+    // the aim began, then at the end puts the live one (behind the gaze) in place, 1 to 2 m off, in one frame. A
+    // smoothed position (time constant BB_VR_AIM_GLIDE_S, 0.12 s) makes that a short glide instead of a jump.
+    {
+        static const float glide = [] {
+            const char* v = std::getenv("BB_VR_AIM_GLIDE_S");
+            return v ? float(std::atof(v)) : 0.12f;
+        }();
+        static float smoothed[3];
+        static long long smoothed_ms = 0;
+        glide_gap = 0.f;
+        const bool blending = g_aim_engaged && (now - g_target.since < 2000 || g_release_ms != 0);
+        if (blending && glide > 0.f && smoothed_ms && now - smoothed_ms < 200) {
+            const float a = 1.f - std::exp(-float(now - smoothed_ms) * 0.001f / glide);
+            for (int k = 0; k < 3; ++k) {
+                smoothed[k] += a * (in[12 + k] - smoothed[k]);
+                glide_gap += (in[12 + k] - smoothed[k]) * (in[12 + k] - smoothed[k]);
+                in[12 + k] = smoothed[k];
+            }
+        } else {
+            std::memcpy(smoothed, in + 12, sizeof(smoothed));
+        }
+        smoothed_ms = now;
+    }
+    Mat3 effective = g_aim_still;
+    if (g_aim_engaged && g_target.active) {
+        effective = TargetBase(g_aim_still, in + 12);
+        // Settled: the zoom's x scale has stopped changing for a few frames (or a second and a half).
+        g_target.steady = std::abs(xscale - g_target.last_xscale) < 5e-4f ? g_target.steady + 1 : 0;
+        g_target.last_xscale = xscale;
+        if ((g_target.steady >= 4 && xscale > 1.4f && glide_gap < 4e-4f) || now - g_target.since > 2000) {
+            g_aim_still = effective;
+            g_target.active = false;
+        }
+    }
+    g_aim_effective = effective;
+    const Mat3 base = g_aim_engaged ? effective : camera;
     for (int r = 0; r < 3; ++r) {
         for (int c = 0; c < 3; ++c) {
             in[r * 4 + c] = base.m[r * 3 + c];
@@ -558,9 +676,24 @@ void HeadAim(const float* h, float* in, float xscale) {
         const Mat3 view = Mul3(head_t, base);
         const auto yaw = [](const Mat3& m) { return std::atan2(m.m[6], m.m[8]) * 57.29578f; };
         const auto pitch = [](const Mat3& m) { return std::asin(std::clamp(m.m[7], -1.f, 1.f)) * 57.29578f; };
-        std::printf("VR aim trace: t %lld xs %.3f eng %d cam %.2f %.2f base %.2f %.2f view %.2f %.2f%c",
+        // With a target: how far the gaze the aim began with is off it (degrees), seen from the camera.
+        float off = -1.f;
+        if (g_aim_engaged && g_target.active) {
+            float to[3] = {g_target.point[0] - in[12], g_target.point[1] - in[13], g_target.point[2] - in[14]};
+            const float n = std::sqrt(Dot3(to, to));
+            Mat3 head0{};
+            for (int r = 0; r < 3; ++r) {
+                for (int c = 0; c < 3; ++c) {
+                    head0.m[r * 3 + c] = h[r * 4 + c];
+                }
+            }
+            const Mat3 g = Mul3(head0, base);
+            off = std::acos(std::clamp(Dot3(g.m + 6, to) / n, -1.f, 1.f)) * 57.29578f;
+        }
+        std::printf("VR aim trace: t %lld xs %.3f eng %d cam %.2f %.2f base %.2f %.2f view %.2f %.2f pos %.3f %.3f %.3f "
+                    "target off %.2f%c",
                     (long long)NowMs(), xscale, int(g_aim_engaged), yaw(camera), pitch(camera), yaw(base), pitch(base),
-                    yaw(view), pitch(view), 10);
+                    yaw(view), pitch(view), in[12], in[13], in[14], off, 10);
     }
     if (!g_aim_engaged) {
         return;
@@ -658,7 +791,7 @@ extern "C" void AimHandler(u64* regs) {
         head = g_head;
     }
     constexpr float axes[3] = {-1.f, 1.f, -1.f};
-    const Mat3 still = TurnBase(g_aim_still, g_stick_yaw.load(), 0.f);
+    const Mat3 still = TurnBase(g_aim_effective, g_stick_yaw.load(), 0.f);
     float forward[3];
     for (int c = 0; c < 3; ++c) {
         forward[c] = 0.f;
