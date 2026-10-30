@@ -68,6 +68,10 @@ void OnDraw(Scheduler& scheduler, Runtime& runtime, VideoCore::TextureCache& tex
 /// same (the presenter drops alpha).
 void AdjustBlend(AmdGpu::BlendControl& control, u64 target_address);
 
+/// A HUD draw into the display buffer that blends its colour but masks out alpha also writes the alpha AdjustBlend gave
+/// it (else it is invisible in the HUD layer: U1's melee prompt).
+void AdjustWriteMask(vk::ColorComponentFlags& mask, const AmdGpu::BlendControl& control, u64 target_address);
+
 /// Development (DRAWLOG trigger): log the next 5000 single-target draws.
 void LogDraws();
 /// The draw log (LogDraws) is running.

@@ -1038,6 +1038,7 @@ bool PipelineCache::RefreshGraphicsKey(PipelineSelection& sel) {
         // Apply swizzle to target mask
         key.write_masks[cb] =
             vk::ColorComponentFlags{key.color_buffers[cb].swizzle.ApplyMask(target_mask)};
+        Vr::Stereo::AdjustWriteMask(key.write_masks[cb], key.blend_controls[cb], col_buf.Address()); // VR
 
         // Fill color samples
         const u8 prev_color_samples = std::exchange(color_samples, col_buf.NumSamples());

@@ -545,6 +545,24 @@ void AdjustBlend(AmdGpu::BlendControl& control, u64 target_address) {
     control.separate_alpha_blend = 1;
 }
 
+// U1's melee prompt ("Press Y after the first punch lands", vs 0xad649c68) blends its colour over the display buffer
+// but masks out alpha (write mask RGB): in the HUD layer, cleared to transparent black, it stayed at alpha 0 and the
+// headset showed nothing (Matt 2026-10-30: "In VR there is no prompt!"). A HUD draw whose alpha AdjustBlend gave the
+// coverage writes it too.
+void AdjustWriteMask(vk::ColorComponentFlags& mask, const AmdGpu::BlendControl& control, u64 target_address) {
+    static const bool keep = std::getenv("BB_VR_KEEP_SCENE") != nullptr;
+    if (!g.ready || keep || !control.enable || !control.separate_alpha_blend ||
+        !FrameCapture::IsDisplayBuffer(target_address) || (mask & vk::ColorComponentFlagBits::eA) ||
+        !(mask & (vk::ColorComponentFlagBits::eR | vk::ColorComponentFlagBits::eG | vk::ColorComponentFlagBits::eB))) {
+        return;
+    }
+    using Factor = AmdGpu::BlendControl::BlendFactor;
+    if (control.color_dst_factor == Factor::OneMinusSrcAlpha && control.alpha_src_factor == Factor::One &&
+        control.alpha_dst_factor == Factor::OneMinusSrcAlpha) {
+        mask |= vk::ColorComponentFlagBits::eA;
+    }
+}
+
 void LogDraws() {
     g_log_draws = 5000;
 }
