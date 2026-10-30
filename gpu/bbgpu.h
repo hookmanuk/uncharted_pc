@@ -43,6 +43,12 @@ void bbgpu_mouse_configure(int look);
 /* Heading (degrees, about the vertical axis) of the camera the game last rendered with and how old
  * it is; 0 before the first frame with a known camera. */
 int bbgpu_camera_yaw(float *yaw_degrees, double *age_seconds);
+/* VR head aim: the player turns the aim now (right stick off centre, or the mouse while aiming). */
+void bbgpu_vr_aim_input(void);
+/* VR head aim: the aim button is held (L2). */
+void bbgpu_vr_aim_held(int held);
+/* VR head aim: 1 while the follow camera is to face this forward (x, z: the view's heading before an aim that ended). */
+int bbgpu_vr_follow_heading(float *x, float *z);
 int bbgpu_mouse_sample(float *dx, float *dy, uint32_t *buttons, int *wheel);
 /* In-game trophy notice (the overlay draws it for a few seconds, one at a time): grade 1 platinum,
  * 2 gold, 3 silver, 4 bronze; png is the trophy's icon (a PNG file) or empty. */

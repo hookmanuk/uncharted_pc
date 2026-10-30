@@ -347,6 +347,11 @@ static void follow_camera(uint64_t camera, uint32_t dir_offset, uint32_t arc_off
     }
     camera_hook_us=now;
     float *dir=(float *)(uintptr_t)(camera+dir_offset);
+    float vr_x, vr_z;
+    if (bbgpu_vr_follow_heading(&vr_x,&vr_z)) { /* VR head aim: after aiming, back to the body view's heading */
+        const float n=SDL_sqrtf(dir[0]*dir[0]+dir[2]*dir[2]), m=SDL_sqrtf(vr_x*vr_x+vr_z*vr_z);
+        if (m>1e-4f) { dir[0]=-vr_x/m*n; dir[2]=-vr_z/m*n; }
+    }
     const float heading=heading_of(dir);
     float dx, dy;
     camera_take(0,&dx,&dy);
@@ -536,7 +541,7 @@ static void mouse_sticks(float *pad, const AimCurve *aim) {
         }
     }
     if (mouse_debug()) printf("Mouse: aim t=%.4f dt=%.4f dx=%.1f x=%.3f game=%.3f\n",now*1e-6,dt,dx,x,pad[2]);
-    if (x!=0.0f) { pad[2]+=x; pad[6]+=x; }
+    if (x!=0.0f) { pad[2]+=x; pad[6]+=x; if (aim_held) bbgpu_vr_aim_input(); }
     if (y!=0.0f) { pad[3]+=y; pad[7]+=y; }
 }
 static void __attribute__((ms_abi)) u1_joypad_sticks(uint64_t unused0, uint64_t unused1, uint64_t image, uint64_t r14, const RuntimeGuestRegs *regs) {
@@ -832,6 +837,8 @@ static void vr_sticks(PadData *d) {
         lock=v && !strcmp(v,"always") ? 1 : v && !strcmp(v,"aiming") ? 2 : 0;
     }
     if (lock==1 || (lock==2 && (d->buttons & BTN_L2))) d->right_y=128;
+    if (d->right_x<118 || d->right_x>138) bbgpu_vr_aim_input(); /* head aim: the stick's turns, not the game's */
+    bbgpu_vr_aim_held((d->buttons & BTN_L2)!=0);
 }
 
 static void sample_host(PadData *d) {

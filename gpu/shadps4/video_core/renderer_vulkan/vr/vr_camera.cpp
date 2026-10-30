@@ -469,6 +469,14 @@ Mat3 TurnBase(const Mat3& base, float yaw_degrees, float pitch_degrees) {
 bool g_aim_engaged = false;
 std::atomic<float> g_aim_error_right{0.f}, g_aim_error_up{0.f}, g_aim_offset_right{0.f}, g_aim_offset_up{0.f};
 std::atomic<long long> g_aim_stamp{0}; // steady clock ms of the last frame engaged, 0 when not
+std::atomic<long long> g_aim_update_ms{0}; // the aiming camera's update last ran (AimHandler): the game aims
+std::atomic<long long> g_aim_input_ms{0};  // the player last turned the aim (right stick or mouse: bbgpu_vr_aim_input)
+std::atomic<bool> g_aim_held{true};        // the aim button is held (bbgpu_vr_aim_held: the game's update runs on
+                                           // through the zoom's blend out, a second after the button let go)
+long long g_release_ms = 0;                // the aim ended at; R held until the game's camera is back on its heading
+std::atomic<float*> g_aim_direction{nullptr}; // the aiming camera's direction (AimHandler): where the shots go
+std::atomic<bool> g_follow_steer{false};   // meanwhile the follow camera is turned to R's heading (bbgpu_vr_follow_heading)
+std::atomic<float> g_follow_x{0.f}, g_follow_z{0.f};
 
 long long NowMs() {
     return std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch())
@@ -488,21 +496,45 @@ void HeadAim(const float* h, float* in, float xscale) {
         const char* v = std::getenv("BB_VR_RETICLE_XSCALE");
         return v ? float(std::atof(v)) : 1.8f;
     }();
-    const bool aiming = xscale > threshold;
     Mat3 camera{};
     for (int r = 0; r < 3; ++r) {
         for (int c = 0; c < 3; ++c) {
             camera.m[r * 3 + c] = in[r * 4 + c];
         }
     }
-    if (aiming && !g_aim_engaged) {
-        g_aim_still = camera;
-        g_aim_engaged = true;
-        g_stick_yaw = 0.f;
-        g_aim_written_valid = false;
-    } else if (!aiming && g_aim_engaged) {
-        g_aim_engaged = false;
-        g_aim_stamp = 0;
+    // The aim begins with the aiming camera's update (before the game blends its view into the zoom: R is the view the
+    // player had), and ends once the game's camera is back on R's heading after the update stopped (the follow camera
+    // turned there, bbgpu_vr_follow_heading), so neither the start nor the end moves the view (Matt 2026-10-30: "when I
+    // look to the left before aiming, then aim, then the camera moves ... when I finish aiming the view snaps").
+    const long long now = NowMs();
+    const bool zoom = now - g_aim_update_ms.load() < 150;
+    const auto heading = [](const float* f) { return std::atan2(f[0], f[2]) * 57.29578f; };
+    if (!g_aim_engaged) {
+        if (zoom && g_aim_held.load()) {
+            g_aim_still = camera;
+            g_aim_engaged = true;
+            g_stick_yaw = 0.f;
+            g_aim_written_valid = false;
+            g_release_ms = 0;
+        }
+    } else if (zoom && g_aim_held.load()) {
+        g_release_ms = 0;
+        g_follow_steer = false;
+    } else {
+        if (!g_release_ms) {
+            g_release_ms = now;
+            g_follow_x = g_aim_still.m[6];
+            g_follow_z = g_aim_still.m[8];
+            g_follow_steer = true;
+        }
+        float apart = heading(camera.m + 6) - heading(g_aim_still.m + 6);
+        apart -= 360.f * std::round(apart / 360.f);
+        if ((std::abs(apart) < 1.f && xscale <= threshold) || now - g_release_ms > 1500) {
+            g_aim_engaged = false;
+            g_aim_stamp = 0;
+            g_release_ms = 0;
+            g_follow_steer = false;
+        }
     }
     if (g_aim_engaged) {
         const float turn_yaw = g_stick_yaw.exchange(0.f);
@@ -514,6 +546,21 @@ void HeadAim(const float* h, float* in, float xscale) {
         for (int c = 0; c < 3; ++c) {
             in[r * 4 + c] = base.m[r * 3 + c];
         }
+    }
+    static const bool trace = std::getenv("BB_VR_HEAD_AIM_TRACE") != nullptr; // development: every frame's yaws
+    if (trace) {
+        Mat3 head_t{};
+        for (int r = 0; r < 3; ++r) {
+            for (int c = 0; c < 3; ++c) {
+                head_t.m[r * 3 + c] = h[r * 4 + c];
+            }
+        }
+        const Mat3 view = Mul3(head_t, base);
+        const auto yaw = [](const Mat3& m) { return std::atan2(m.m[6], m.m[8]) * 57.29578f; };
+        const auto pitch = [](const Mat3& m) { return std::asin(std::clamp(m.m[7], -1.f, 1.f)) * 57.29578f; };
+        std::printf("VR aim trace: t %lld xs %.3f eng %d cam %.2f %.2f base %.2f %.2f view %.2f %.2f%c",
+                    (long long)NowMs(), xscale, int(g_aim_engaged), yaw(camera), pitch(camera), yaw(base), pitch(base),
+                    yaw(view), pitch(view), 10);
     }
     if (!g_aim_engaged) {
         return;
@@ -531,8 +578,19 @@ void HeadAim(const float* h, float* in, float xscale) {
     const float gx = Dot3(g, camera.m), gy = Dot3(g, camera.m + 3), gz = Dot3(g, camera.m + 6);
     g_aim_error_right = std::atan2(-gx, gz) * Degrees;
     g_aim_error_up = std::atan2(gy, std::hypot(gx, gz)) * Degrees;
-    // The camera's direction in the still base's frame: where the reticle is.
+    // The aim's direction in the still base's frame: where the reticle is. The aiming camera's own direction (the
+    // player's aim reads it, AimHandler writes it): the camera the game shows blends into the zoom over half a second
+    // and only then turns to it, so a reticle placed by the camera slid slowly and fell short of a head turned far
+    // (Matt 2026-10-30: "the initial aiming is slow and not accurate").
+    float aim[3];
     const float* a = camera.m + 6;
+    if (float* direction = g_aim_direction.load(); direction && zoom) {
+        std::memcpy(aim, direction, sizeof(aim));
+        const float n = std::sqrt(Dot3(aim, aim));
+        if (n > 0.9f && n < 1.1f) {
+            a = aim;
+        }
+    }
     const float ax = Dot3(a, base.m), ay = Dot3(a, base.m + 3), az = Dot3(a, base.m + 6);
     g_aim_offset_right = std::atan2(-ax, az) * Degrees;
     g_aim_offset_up = std::atan2(ay, std::hypot(ax, az)) * Degrees;
@@ -551,11 +609,13 @@ void HeadAim(const float* h, float* in, float xscale) {
 // The aiming camera's update begins: the head's direction goes in (see HeadAim), after the turn the last update
 // gave the direction written then is taken into R.
 extern "C" void AimHandler(u64* regs) {
+    g_aim_update_ms = NowMs();
     if (!g_aim_engaged || !g_game) {
         g_aim_written_valid = false;
         return;
     }
     auto* direction = reinterpret_cast<float*>(regs[g_game->aim_object_rdi ? RDI : RSI] + g_game->aim_direction);
+    g_aim_direction = direction;
     // Only a direction (a unit vector) is replaced: a wrong offset in another version leaves the game alone.
     const float length2 = direction[0] * direction[0] + direction[1] * direction[1] + direction[2] * direction[2];
     if (!(length2 > 0.81f && length2 < 1.21f)) {
@@ -568,7 +628,9 @@ extern "C" void AimHandler(u64* regs) {
         g_aim_written_valid = false;
         return;
     }
-    if (g_aim_written_valid) {
+    // Only the player's turn moves R: the game also sets the direction itself (its first update after the aim began put
+    // back the follow camera's, 30 degrees off a head turned left: the view jumped).
+    if (g_aim_written_valid && NowMs() - g_aim_input_ms.load() < 200) {
         // The sideways turn from what was written to what the update left: about the world's up, right positive.
         const float* a = g_aim_written;
         const float* b = direction;
@@ -607,6 +669,27 @@ extern "C" void AimHandler(u64* regs) {
     std::memcpy(direction, forward, sizeof(forward));
     std::memcpy(g_aim_written, forward, sizeof(forward));
     g_aim_written_valid = true;
+}
+
+// The pad layer (src/runtime_pad.c): the player turns the aim (the right stick off centre, or the mouse while aiming).
+extern "C" void bbgpu_vr_aim_input() {
+    g_aim_input_ms = NowMs();
+}
+
+// The pad layer: the aim button (L2, or what is bound to it) is held.
+extern "C" void bbgpu_vr_aim_held(int held) {
+    g_aim_held = held != 0;
+}
+
+// The pad layer's follow camera hook: after an aim, the forward (x, z) the follow camera is to take (the view's
+// heading before the aim, R), so the game's camera comes back where the player's body view is.
+extern "C" int bbgpu_vr_follow_heading(float* x, float* z) {
+    if (!g_follow_steer.load()) {
+        return 0;
+    }
+    *x = g_follow_x.load();
+    *z = g_follow_z.load();
+    return 1;
 }
 
 extern "C" void ProjectionHandler(u64* regs) {
