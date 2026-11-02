@@ -243,6 +243,13 @@ u32 BackingLayers(const VideoCore::ImageInfo& info, u32 layers) {
         (info.pixel_format == vk::Format::eB10G11R11UfloatPack32 || info.pixel_format == vk::Format::eR16G16B16A16Sfloat)) {
         return 2;
     }
+    // U3's volumetric spot light: its epipolar march (compute 661db47f: 512 lines of 512 samples, from the eye's depth
+    // and the light's shadow map, R16G16 float), which the beam pass (pgm 0a8f4f44) reads. One layer, it was marched for
+    // the left eye alone and the right eye drew the left's shafts (BB_VR_AUDIT: ONE EYE, read by both). Two, the
+    // compute runs per eye (it reads and writes the layer of its push_data.vr_eye) and each eye's beam reads its own.
+    if (info.size.width == 512 && info.size.height == 512 && info.pixel_format == vk::Format::eR16G16Sfloat) {
+        return 2;
+    }
     // The render size and the output size (larger when DLSS upscales) and their halvings (rounded up), down to a
     // sixteenth.
     u32 sizes[2][2]{};
@@ -819,6 +826,44 @@ const std::vector<EyeRayPass>& EyeRayPasses() {
     return list;
 }
 
+// Passes whose constants hold a projection's offset to the screen (a texture coordinate's c[index] added to u): each
+// eye's copy moved by scale x its clip shift, so the eye's own picture is read where a point is in it (the clip shift s
+// moves u by s / 2). U3's epipolar march (compute 661db47f, buffer 0: u = c32 x/z + c34 into the eye's depth) read the
+// eye's depth where the centre camera sees each point. BB_VR_EYE_OFFSET_PS "pgm:buffer:index:scale;..." (hex pgm).
+struct EyeOffsetPass {
+    u64 pgm;
+    u32 buffer, index;
+    float scale;
+};
+const std::vector<EyeOffsetPass>& EyeOffsetPasses() {
+    static const std::vector<EyeOffsetPass> list = [] {
+        std::vector<EyeOffsetPass> out;
+        const char* env = std::getenv("BB_VR_EYE_OFFSET_PS");
+        const char* p = env ? env : "661db47f:0:34:0.5";
+        while (*p) {
+            EyeOffsetPass e{};
+            char* end = nullptr;
+            e.pgm = std::strtoull(p, &end, 16);
+            if (end == p || *end != ':') {
+                break;
+            }
+            e.buffer = u32(std::strtoul(end + 1, &end, 10));
+            if (*end != ':') {
+                break;
+            }
+            e.index = u32(std::strtoul(end + 1, &end, 10));
+            if (*end != ':') {
+                break;
+            }
+            e.scale = std::strtof(end + 1, &end);
+            out.push_back(e);
+            p = *end ? end + 1 : end;
+        }
+        return out;
+    }();
+    return list;
+}
+
 bool EyeConstants(const Instance& instance, u64 stage_hash, u32 buffer_index, vk::DescriptorBufferInfo& left,
                   vk::DescriptorBufferInfo& right) {
     static const bool on = [] {
@@ -837,7 +882,25 @@ bool EyeConstants(const Instance& instance, u64 stage_hash, u32 buffer_index, vk
             ray_pass = &e;
         }
     }
-    if (ray_pass) {
+    const EyeOffsetPass* offset_pass = nullptr;
+    for (const EyeOffsetPass& e : EyeOffsetPasses()) {
+        if (e.pgm == stage_hash && e.buffer == buffer_index) {
+            offset_pass = &e;
+        }
+    }
+    if (offset_pass) {
+        static u32 applied = 0, skipped = 0;
+        const bool usable = g_enabled && binding.valid && binding.size >= (offset_pass->index + 1) * 4 &&
+                            binding.adjust <= 256 && binding.address;
+        if ((usable ? applied++ : skipped++) % 10000 == 0) {
+            std::printf("VR screen offsets per eye: pgm %#llx applied %u, skipped %u\n", (unsigned long long)stage_hash,
+                        applied, skipped);
+            std::fflush(stdout);
+        }
+        if (!usable) {
+            return false;
+        }
+    } else if (ray_pass) {
         static u32 applied = 0, skipped = 0;
         const bool usable = g_enabled && binding.valid && binding.size >= (ray_pass->row + 12) * 4 &&
                             binding.adjust <= 256 && binding.address;
@@ -888,6 +951,12 @@ bool EyeConstants(const Instance& instance, u64 stage_hash, u32 buffer_index, vk
         std::memcpy(dst + binding.adjust,
                     binding.ring_data ? binding.ring_data : reinterpret_cast<const void*>(binding.address), binding.size);
         auto* f = reinterpret_cast<float*>(dst + binding.adjust);
+        if (offset_pass) {
+            const float scale = g_light_eye_scale.load(std::memory_order_relaxed);
+            f[offset_pass->index] += offset_pass->scale * (eye == 0 ? g_shift : -g_shift) * scale;
+            *infos[eye] = vk::DescriptorBufferInfo{g_eye_constants->Handle(), offset, range};
+            continue;
+        }
         if (ray_pass) {
             const float scale = g_light_eye_scale.load(std::memory_order_relaxed);
             const float delta = (eye == 0 ? g_shift : -g_shift) * scale * f[ray_pass->ray];
