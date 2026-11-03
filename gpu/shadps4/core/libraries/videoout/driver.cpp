@@ -930,7 +930,7 @@ void VideoOutDriver::PresentThread(std::stop_token token) {
         // Check if it's time to take a request.
         auto& vblank_status = main_port.vblank_status;
         const auto now = std::chrono::steady_clock::now();
-        const bool movie = fast_vblank && MovieActive(now);
+        const bool movie = (fast_vblank || Vulkan::Vr::ImmediateFlips()) && MovieActive(now); // VR: headset-rate flips too
         if (movie) {
             if (now + vblank_period / 2 < next_movie_vblank) {
                 timer.End();
