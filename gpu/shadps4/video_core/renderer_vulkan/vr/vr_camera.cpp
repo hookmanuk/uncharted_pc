@@ -854,6 +854,24 @@ extern "C" void ProjectionHandler(u64* regs) {
     if (g_near_written != 0.f && params[2] == g_near_written) {
         params[2] = g_near_original; // the game did not set it again this frame
     }
+    // A telephoto view (x scale above 3.5, about 32 degrees across; play is 1.3, the aim's zoom under 2.5) that is not
+    // an aim: U3's title backdrop (x scale 4.5, far 27000), built only for that narrow view. With the headset's field
+    // of view the eyes saw past its ground (Matt 2026-11-03: "the start splash screen is horrible ... all yellow"). The
+    // game's view is kept, untagged: its frames go to the flat screen, as the other menus. The game sets the view once
+    // a frame; later calls see the x scale this handler wrote.
+    static float xscale_written = 0.f, xscale_game = 0.f;
+    if (params[1] != xscale_written) {
+        xscale_game = params[1];
+    }
+    if (xscale_game > 3.5f && NowMs() - g_aim_update_ms.load() > 250) { // (no aiming camera update in 0.25 s)
+        static bool told = false;
+        if (!told) {
+            told = true;
+            std::printf("VR camera: telephoto view (x scale %.2f, far %.0f): the flat screen%c", xscale_game, params[3], 10);
+            std::fflush(stdout);
+        }
+        return;
+    }
     g_near = params[2];
     g_game_xscale = params[1];
     if (g_log_next.load(std::memory_order_relaxed) > 0 && g_log_next.fetch_sub(1) > 0) {
@@ -917,6 +935,7 @@ extern "C" void ProjectionHandler(u64* regs) {
     const float tx = std::max(-l, r), ty = std::max(u, -d);
     params[0] = ty / tx;
     params[1] = 1.f / tx;
+    xscale_written = params[1];
     g_near_original = params[2];
     g_tag = g_tag % TagCount + 1;
     params[2] = g_near_original + float(g_tag) * NearStep;
