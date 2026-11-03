@@ -89,6 +89,9 @@ void ShootTarget(u64 guest_address);
 /// Development (EYES trigger): the next stereo frame's eyes and scene, full size, to %TEMP%\dcvr\eye_<n>.raw (n: 0 left,
 /// 1 right, 2 the centre scene; width, height, then RGBA).
 void DumpEyes();
+
+// The share of the last HUD layers' 16 x 16 samples the game drew on (0..1; a menu's panels, not play's HUD).
+float HudCover();
 /// Development (dev key FRAMELOG, its content the frame count): the left eye of each of the next `frames` frames the
 /// headset shows, as a 192x192 thumbnail (BB_FRAMELOG_SIZE: another side), into %TEMP%\dcvr\framelog.raw (u32
 /// width, height, count, the RGBA thumbnails, a u64 steady-clock microsecond time per frame, then each frame's scene

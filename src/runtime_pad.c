@@ -1555,9 +1555,11 @@ static void vr_sticks(PadData *d) {
         const char *v=getenv("BB_VR_LOCK_VERTICAL");
         lock=v && !strcmp(v,"always") ? 1 : v && !strcmp(v,"aiming") ? 2 : 0;
     }
-    if (lock==1 || (lock==2 && (d->buttons & BTN_L2))) d->right_y=128;
+    if (lock==1 || (lock==2 && (d->buttons & (BTN_L1|BTN_L2)))) d->right_y=128;
     if (d->right_x<118 || d->right_x>138) bbgpu_vr_aim_input(); /* head aim: the stick's turns, not the game's */
-    bbgpu_vr_aim_held((d->buttons & BTN_L2)!=0);
+    /* L1 aims in the collection's default layout (U2 chapter 5), L2 in the alternate one; the aiming camera's update
+     * still has to run for head aim to engage. */
+    bbgpu_vr_aim_held((d->buttons & (BTN_L1|BTN_L2))!=0);
 }
 
 static void sample_host(PadData *d) {

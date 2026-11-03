@@ -26,6 +26,7 @@
 #include <xbyak/xbyak.h>
 
 #include "video_core/renderer_vulkan/vr/vr_camera.h"
+#include "video_core/renderer_vulkan/vr/vr_stereo.h"
 #include "video_core/renderer_vulkan/vr/vr_fixes.h"
 #include "video_core/renderer_vulkan/vr/vr_multiview.h"
 
@@ -863,7 +864,33 @@ extern "C" void ProjectionHandler(u64* regs) {
     if (params[1] != xscale_written) {
         xscale_game = params[1];
     }
-    if (xscale_game > 3.5f && NowMs() - g_aim_update_ms.load() > 250) { // (no aiming camera update in 0.25 s)
+    // A menu: U2's title and menus show a backdrop with the main camera, built for its one view as U3's title is (Matt
+    // 2026-11-03: "That's all corrupted too!"). The camera has not moved for 1.5 s and the game's 2D layer covers more
+    // than 6% of the screen (its panels; play's HUD, hints and subtitles stay under 3%), or it was a menu and the
+    // camera has still not moved (its frames on the flat screen take no HUD samples). Play and cutscenes move the
+    // camera; an idle player or a tutorial's frozen frame has a still one but only a hint drawn.
+    const long long now_ms = NowMs();
+    static float still_input[16] = {};
+    static long long still_since = 0;
+    // (the game's camera: later calls in a frame see the one this handler wrote)
+    const float* game_input =
+        g_input_written_valid && std::memcmp(input, g_input_written, sizeof(g_input_written)) == 0 ? g_input_original : input;
+    static bool menu = false;
+    if (std::memcmp(still_input, game_input, sizeof(still_input)) != 0) {
+        std::memcpy(still_input, game_input, sizeof(still_input));
+        still_since = now_ms;
+    }
+    const bool was_menu = menu;
+    menu = now_ms - still_since > 1500 && (menu || Stereo::HudCover() > 0.06f) && now_ms - g_aim_update_ms.load() > 1000;
+    if (menu != was_menu) {
+        std::printf("VR camera: %s (2D layer %.0f%%)%c", menu ? "a menu: the flat screen" : "3D again",
+                    Stereo::HudCover() * 100.f, 10);
+        std::fflush(stdout);
+    }
+    if (menu) {
+        return;
+    }
+    if (xscale_game > 3.5f && now_ms - g_aim_update_ms.load() > 250) { // (no aiming camera update in 0.25 s)
         static bool told = false;
         if (!told) {
             told = true;

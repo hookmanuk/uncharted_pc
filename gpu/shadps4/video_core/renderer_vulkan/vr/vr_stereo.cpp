@@ -1228,6 +1228,8 @@ bool CaptureAtFlip(Runtime& runtime, vk::CommandBuffer command_buffer, VideoCore
     return true;
 }
 
+void SampleCover(VkCommandBuffer cmd, VkImage image, u32 w, u32 h);
+
 void OnDisplayBuffer(Runtime& runtime, vk::CommandBuffer command_buffer, VideoCore::Image& display) {
     std::scoped_lock lock{g.mutex};
     if (CaptureAtFlip(runtime, command_buffer, display)) {
@@ -1258,6 +1260,47 @@ void OnDisplayBuffer(Runtime& runtime, vk::CommandBuffer command_buffer, VideoCo
     // GENERAL from here on: the headset's queue copies it and the desktop mirror reads it, neither transitions it.
     Barrier(cmd, slot.hud.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_GENERAL);
     slot.has_hud = true;
+    SampleCover(cmd, slot.hud.image, slot.width, slot.height);
+}
+
+// HudCover: a 16 x 16 grid of the HUD layer's texels read back each frame into a ring of four buffers; a buffer's
+// samples are counted just before it is used again (four frames on, its copy long done).
+constexpr u32 CoverGrid = 16;
+Readback g_cover[4];
+u32 g_cover_frame = 0;
+std::atomic<float> g_hud_cover{0.f};
+
+void SampleCover(VkCommandBuffer cmd, VkImage image, u32 w, u32 h) {
+    Readback& r = g_cover[g_cover_frame++ % 4];
+    if (!r.buffer && !MakeReadback(r, CoverGrid * CoverGrid * 4)) {
+        return;
+    }
+    if (g_cover_frame > 4) {
+        void* data = nullptr;
+        VKD.vkMapMemory(g.device, r.memory, 0, r.size, 0, &data);
+        const auto* texels = static_cast<const u32*>(data);
+        u32 drawn = 0;
+        for (u32 i = 0; i < CoverGrid * CoverGrid; ++i) {
+            drawn += texels[i] != 0;
+        }
+        VKD.vkUnmapMemory(g.device, r.memory);
+        g_hud_cover = float(drawn) / float(CoverGrid * CoverGrid);
+    }
+    VkBufferImageCopy regions[CoverGrid * CoverGrid]{};
+    for (u32 y = 0; y < CoverGrid; ++y) {
+        for (u32 x = 0; x < CoverGrid; ++x) {
+            auto& region = regions[y * CoverGrid + x];
+            region.bufferOffset = (y * CoverGrid + x) * 4;
+            region.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+            region.imageOffset = {s32((x * 2 + 1) * w / (CoverGrid * 2)), s32((y * 2 + 1) * h / (CoverGrid * 2)), 0};
+            region.imageExtent = {1, 1, 1};
+        }
+    }
+    VKD.vkCmdCopyImageToBuffer(cmd, image, VK_IMAGE_LAYOUT_GENERAL, r.buffer, CoverGrid * CoverGrid, regions);
+}
+
+float HudCover() {
+    return g_hud_cover.load(std::memory_order_relaxed);
 }
 
 Readback g_flog;
