@@ -60,10 +60,18 @@ void Set(Values& v, const std::string& key, const std::string& value) {
         v.debug_view = std::clamp(i, 0, DebugViewCount - 1);
     } else if (key == "show_fps") {
         v.show_fps = i != 0;
+    } else if (key == "gyro_aim") {
+        v.gyro_aim = i != 0;
     } else if (key == "fsr4_auto_exposure") {
         v.fsr4_auto_exposure = i != 0;
     } else if (key == "fsr4_invert_jitter") {
         v.fsr4_invert_jitter = i != 0;
+    } else if (key == "display_mode") {
+        for (int m = 0; m < DisplayModeCount; ++m) {
+            if (value == DisplayModeName(m)) {
+                v.display_mode = m;
+            }
+        }
     } else if (key == "model_lod") {
         v.model_lod = std::clamp(i, -2, 2);
     } else if (key == "live_resolution") {
@@ -128,6 +136,17 @@ void Load() {
             Set(v, key, value);
         }
     }
+    // The launcher's Fullscreen switch decides at start (BB_FULLSCREEN, always set by the launchers):
+    // 1 opens fullscreen (exclusive when the in-game menu last chose it, otherwise borderless),
+    // 0 opens windowed. Without the variable the in-game menu's last choice (bbport.ini) is used.
+    // The in-game menu then switches live for the session.
+    if (const char* fullscreen = std::getenv("BB_FULLSCREEN"); fullscreen && fullscreen[0]) {
+        if (fullscreen[0] == '1') {
+            if (v.display_mode != DisplayExclusive) v.display_mode = DisplayBorderless;
+        } else {
+            v.display_mode = DisplayWindowed;
+        }
+    }
     v.startup_preset = v.preset;
     v.startup_upscaler = v.upscaler;
     v.startup_object_motion = v.object_motion;
@@ -139,16 +158,26 @@ void Load() {
     v.startup_live_resolution = v.live_resolution;
 }
 
-void ConfigureUpscalerSupport(bool fsr4, bool fsr411) {
+void ConfigureUpscalerSupport(bool fsr4, bool fsr411, bool fsr4_assets) {
     auto& v = Get();
-    v.fsr4_supported = fsr4;
+    // FSR 4.1.1 has its own assets (fsr4_411/) and keeps its own check.
+    v.fsr4_supported = fsr4 && fsr4_assets;
     v.fsr411_supported = fsr4 && fsr411;
+    if (fsr4 && !fsr4_assets) {
+        v.fsr4_problem = "assets not installed (fsr4_shaders, tools/fetch_fsr4_assets.sh)";
+        std::printf("Upscaler: FSR 4 assets not installed (fsr4_shaders or BB_FSR4_DIR); FSR 4 is "
+                    "not offered\n");
+    }
     const int requested = v.upscaler;
     if ((requested == UpscalerFsr4 && !v.fsr4_supported) ||
         (requested == UpscalerFsr411 && !v.fsr411_supported)) {
-        v.fsr4_problem = "GPU does not support the selected FSR 4 shaders; using FSR 3.1";
-        std::printf("Upscaler: %s unsupported on this GPU; falling back to FSR 3.1 before the first frame\n",
-                    UpscalerName(requested));
+        const bool assets_only = requested == UpscalerFsr4 && fsr4 && !fsr4_assets;
+        if (!assets_only) {
+            v.fsr4_problem = "GPU does not support the selected FSR 4 shaders; using FSR 3.1";
+        }
+        std::printf("Upscaler: %s %s; falling back to FSR 3.1 before the first frame\n",
+                    UpscalerName(requested),
+                    assets_only ? "assets not installed" : "unsupported on this GPU");
         v.upscaler = UpscalerFsr3;
     }
 }
@@ -210,13 +239,15 @@ void Save() {
                  "# bbport settings (in-game menu: Insert / L3+R3)\n"
                  "upscaler=%s\npreset=%d\nsharpen=%d\nsharpness=%.2f\njitter=%d\n"
                  "reactive=%d\nobject_motion=%d\nreactive_scale=%.2f\nreactive_threshold=%.2f\nreactive_max=%.2f\n"
-                 "debug_view=%d\nshow_fps=%d\nfsr4_auto_exposure=%d\nfsr4_invert_jitter=%d\n",
+                 "debug_view=%d\nshow_fps=%d\ngyro_aim=%d\nfsr4_auto_exposure=%d\nfsr4_invert_jitter=%d\n"
+                 "display_mode=%s\n",
                  UpscalerName(v.upscaler), v.preset.load(), int(v.sharpen.load()),
                  v.sharpness.load(), int(v.jitter.load()), int(v.reactive.load()),
                  int(v.object_motion.load()),
                  v.reactive_scale.load(), v.reactive_threshold.load(), v.reactive_max.load(),
-                 v.debug_view.load(), int(v.show_fps.load()),
-                 int(v.fsr4_auto_exposure.load()), int(v.fsr4_invert_jitter.load()));
+                 v.debug_view.load(), int(v.show_fps.load()), int(v.gyro_aim.load()),
+                 int(v.fsr4_auto_exposure.load()), int(v.fsr4_invert_jitter.load()),
+                 DisplayModeName(v.display_mode));
     // Read by patches.py at start.
     for (int e = 0; e < EffectCount; ++e) {
         std::fprintf(file, "%s=%d\n", Effects[e].key, int(v.effects[e].load()));
@@ -258,6 +289,11 @@ bool FsrDriverValidated(unsigned driver_id) {
         if (id != 0 && id == driver_id) return true;
     }
     return false;
+}
+
+const char* DisplayModeName(int mode) {
+    static constexpr const char* names[DisplayModeCount] = {"windowed", "borderless", "exclusive"};
+    return names[std::clamp(mode, 0, DisplayModeCount - 1)];
 }
 
 } // namespace BbSettings

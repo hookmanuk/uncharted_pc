@@ -25,8 +25,8 @@ fi
 out/pyenv/Scripts/python.exe -m pip install -q --disable-pip-version-check pyinstaller pillow tkinterdnd2 iced-x86
 # The scripts run inside Uncharted.exe (--script): the standard modules they import come along.
 hidden=()
-for module in argparse base64 bisect collections hashlib json re shutil struct tempfile zlib ctypes.wintypes cheats \
-              uncharted_art uncharted_fonts uncharted_i18n uncharted_widgets bbport_steam PIL.ImageTk iced_x86; do
+for module in argparse base64 bisect collections datetime hashlib hmac json re shutil struct tempfile zlib ctypes.wintypes cheats \
+              uncharted_art uncharted_fonts uncharted_i18n uncharted_saves uncharted_slots uncharted_widgets bbport_steam PIL.ImageTk iced_x86; do
     hidden+=(--hidden-import "$module")
 done
 out/pyenv/Scripts/python.exe -m PyInstaller --noconfirm --clean --log-level WARN --windowed \
@@ -34,7 +34,7 @@ out/pyenv/Scripts/python.exe -m PyInstaller --noconfirm --clean --log-level WARN
     --workpath out/pyi-work --specpath out/pyi-work --paths "$(cygpath -w "$PWD/scripts")" \
     --paths "$(cygpath -w "$PWD/launcher")" \
     --add-data "$(cygpath -w "$PWD/launcher/fonts");fonts" \
-    --add-data "$(cygpath -w "$PWD/launcher/covers");covers" \
+    --add-data "$(cygpath -w "$PWD/launcher/textures");textures" \
     "${hidden[@]}" \
     "$(cygpath -w "$PWD/launcher/uncharted_launcher.py")"
 
@@ -57,6 +57,8 @@ ldd "$dest/bin/bb-probe.exe" "$dest/bin/bb-gpu-capabilities.exe" |
     done
 # Only what run.py runs to prepare a game (Bloodborne's patch and mod tools stay out).
 cp scripts/prepare.py scripts/link_modules.py scripts/link_libc.py scripts/content_profile.py scripts/trophies.py scripts/isa_rewrite.py "$dest/scripts/"
+# The Saves page's editor (launcher load_save_editor) once it is in the tree.
+if [[ -f scripts/save_editor.py ]]; then cp scripts/save_editor.py "$dest/scripts/"; fi
 cp patches/redzone.json "$dest/patches/"  # red-zone-safe guest stores (link_modules.py)
 cp scripts/vr_resolution.py "$dest/scripts/" # VR fork
 cp run.py LICENSE "$dest/"

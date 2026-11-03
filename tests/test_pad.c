@@ -8,6 +8,8 @@ static int rumble_calls;
 static uint16_t rumble_low, rumble_high;
 int bbgpu_overlay_captures_input(void) { return capture; }
 void bbgpu_mouse_configure(int look) { (void)look; }
+void bbgpu_overlay_key_configure(int slot, int kind, int code) { (void)slot; (void)kind; (void)code; }
+void bbgpu_share_key_configure(int slot, int kind, int code) { (void)slot; (void)kind; (void)code; }
 int bbgpu_mouse_sample(float *dx, float *dy, uint32_t *buttons, int *wheel) {
     *dx=*dy=0; *buttons=0; *wheel=0;
     return 0;
@@ -16,6 +18,7 @@ int bbgpu_camera_yaw(float *yaw_degrees, double *age_seconds) { (void)yaw_degree
 void bbgpu_vr_aim_input(void) {}
 void bbgpu_vr_aim_held(int held) { (void)held; }
 int bbgpu_vr_follow_heading(float *x, float *z) { (void)x; (void)z; return 0; }
+int bbgpu_gyro_aim(void) { return 0; }
 void bbgpu_prompts_controller(int device) { (void)device; }
 uintptr_t runtime_lookup(const RuntimeExport *table, size_t count, const char *name) {
     (void)table; (void)count; (void)name;
@@ -114,6 +117,12 @@ int main(void) {
         keys[SDL_SCANCODE_W]=true;
         assert(pad_read_state(1,&data)==0 && data.left_x==128 && data.left_y==0);
         keys[SDL_SCANCODE_W]=false;
+        /* Left Ctrl (walk) held: W pushes the stick 45% forward, W+D the same length diagonally. */
+        keys[SDL_SCANCODE_LCTRL]=keys[SDL_SCANCODE_W]=true;
+        assert(pad_read_state(1,&data)==0 && data.left_x==128 && data.left_y==70);
+        keys[SDL_SCANCODE_D]=true;
+        assert(pad_read_state(1,&data)==0 && data.left_x==168 && data.left_y==87);
+        keys[SDL_SCANCODE_LCTRL]=keys[SDL_SCANCODE_W]=keys[SDL_SCANCODE_D]=false;
         for (int dir=-1; dir<=1; dir+=2) {
             keys[dir<0 ? SDL_SCANCODE_R : SDL_SCANCODE_T]=true;
             int min_x=255, max_x=0, min_y=255, max_y=0, first_x=128;
@@ -183,5 +192,5 @@ int main(void) {
     SDL_Quit();
     unlink(path);
     unlink(config);
-    puts("PASS: pad ABI, debug camera chord, left/right clicks, rotate keys, SDL touch, vibration controls, overlay capture");
+    puts("PASS: pad ABI, debug camera chord, left/right clicks, rotate and walk keys, SDL touch, vibration controls, overlay capture");
 }

@@ -430,6 +430,8 @@ private:
     u64 trigger_gc_memory = 0;
     u64 pressure_gc_memory = 0;
     u64 critical_gc_memory = 0;
+    /// bbport: the marks computed at startup (cards of 8 GB and up lift them from the live budget).
+    u64 base_trigger_gc_memory = 0, base_pressure_gc_memory = 0, base_critical_gc_memory = 0;
     u64 total_used_samplers = 0;
     u64 trigger_gc_samplers = 0;
     u64 pressure_gc_samplers = 0;
@@ -474,9 +476,18 @@ private:
         ImageId owner{};
     };
     tsl::robin_map<VAddr, MetaDataInfo> surface_metas;
-    /// bbport: most layers seen for a depth array at an address (PadDepthLayers).
-    tsl::robin_map<VAddr, u32> depth_array_layers;
-    void PadDepthLayers(ImageInfo& info);
+    /// bbport: most layers seen for a depth array at an address, and the most memory a depth
+    /// image requested there covered (PadDepthLayers).
+    /// layer_bytes: the largest layer of a request with that many layers.
+    struct DepthArraySeen {
+        u32 layers{};
+        u64 bytes{};
+        u64 layer_bytes{};
+    };
+    tsl::robin_map<VAddr, DepthArraySeen> depth_array_layers;
+    /// requested: what the game asked for when `info` is merged with a cached image (recorded
+    /// instead of `info`); null: `info` is the request.
+    void PadDepthLayers(ImageInfo& info, const ImageInfo* requested = nullptr);
 };
 
 } // namespace VideoCore

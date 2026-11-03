@@ -3,6 +3,7 @@
 
 #pragma once
 
+#include <optional>
 #include <mutex>
 #include <vector>
 
@@ -34,6 +35,10 @@ namespace Vulkan {
 
 class GraphicsPipeline;
 class Runtime;
+
+/// bbport: prints the last commands the CPU recorded and how far the GPU got (fault-handler
+/// safe: no driver calls).
+void ReportRecentCheckpoints(u32 max_records);
 
 class Rasterizer {
 public:
@@ -127,17 +132,31 @@ public:
     /// bbport: small buffers (up to 64 bytes) a compute shader writes are read by the game's CPU
     /// code (the auto-exposure multiplier of Uncharted, among others). The dispatch notes them and
     /// the next end-of-pipe event copies them to guest memory (BB_READBACK_SMALL_BUFFERS=0: off).
-    void NoteSmallWrittenBuffers(const Shader::Info& stage);
+    /// True when the shader wrote a small result whose landing holds back the label (gated):
+    /// the dispatch is then submitted at once, so that the landing waits for it alone and not
+    /// for the rest of the frame recorded after it.
+    bool NoteSmallWrittenBuffers(const Shader::Info& stage);
+    /// bbport (BB_COPY64_EOP_READBACK=1): the dwords a dispatch of the 64-dword copy shader
+    /// (6a6422a9) writes, when they total 64 KiB or less, are read back at the next end-of-pipe
+    /// event, and that event's label waits for them. True when the dispatch noted such a range
+    /// (it is then submitted at once, like a gated small result).
+    bool NoteCopy64Readback(const Shader::Info& stage);
     void ReadBackSmallWrittenBuffers();
+    /// Whether the small results of compute shader `writer` are gated in the default mode
+    /// (BB_READBACK_SMALL_GATE unset); `why` says which list it is on.
+    bool SmallWriterGated(u64 writer, const char** why = nullptr) const;
     /// Before a guest-visible write: fences deferred earlier are written first.
     void WaitDeferredSignals() {
         scheduler.WaitDeferredSignals();
     }
     /// Runs `signal` after the guest memory copies issued so far, without waiting here.
-    void SignalAfterHostCopies(std::function<void()> signal, u64 landing_seq = 0) {
-        scheduler.SignalAfterHostCopies(std::move(signal), landing_seq);
+    void SignalAfterHostCopies(std::function<void()> signal, u64 landing_seq = 0,
+                               bool off_recorder = false) {
+        scheduler.SignalAfterHostCopies(std::move(signal), landing_seq, off_recorder);
     }
     /// The GPU command thread or the draw recording thread (fault handling runs inline there).
+    /// The draw recording thread (stage B).
+    bool OnDrawRecThread() const;
     bool IsGpuSideThread() const;
     bool IsGpuSideThreadId(u32 tid) const;
     /// A guest write hit a protected page.
@@ -328,6 +347,7 @@ private:
     void ResolveIndexBuffer(u32 index_offset);
     void EmitIndexBuffer();
 
+    bool IsHostStreamRead(const VideoCore::Buffer* buffer);
     void ResetBindings(bool is_compute);
 
     bool IsComputeMetaClear(const Pipeline* pipeline);
@@ -344,7 +364,13 @@ private:
     VideoCore::BufferCache buffer_cache;
     VideoCore::TextureCache texture_cache;
     std::mutex small_written_mutex;
-    std::vector<std::pair<VAddr, u32>> small_written_buffers;
+    struct SmallWritten {
+        VAddr address;
+        u32 size;
+        u64 writer; ///< pgm_hash of the compute shader that wrote it last
+    };
+    std::vector<SmallWritten> small_written_buffers;
+    std::vector<SmallWritten> copy64_readbacks; ///< NoteCopy64Readback; small_written_mutex
     AmdGpu::Liverpool* liverpool;
     Core::MemoryManager* memory;
     boost::icl::interval_set<VAddr> mapped_ranges;
@@ -520,6 +546,14 @@ private:
     float sampler_lod_bias = 0.0f; ///< bbport: extra bias of this draw's samplers
     bool scene_debug_frame = false; ///< BB_SCENE_DEBUG: this frame's passes are printed
     bool PendingWriteOverlaps(VAddr address, u64 size);
+    /// Stage A: whether a guest-memory HLE dispatch can go to the recording thread like other
+    /// dispatches (a raycaster copy of GPU data), instead of a drain and the copy here; if so,
+    /// the destination range it writes on the GPU (to note as a pending write once queued).
+    struct StageBCopy {
+        VAddr dst{};
+        u64 size{};
+    };
+    std::optional<StageBCopy> GuestCopyOnStageB(const Shader::Info& cs);
     /// Stage B: the ring bindings of the stages of the packet being recorded.
     struct RingStage {
         const Shader::Info* info;

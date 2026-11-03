@@ -1,6 +1,7 @@
 /* Minimal x86-64 native loader experiment. Not a PS4 emulator or game port. */
 #define _GNU_SOURCE
 #include <stdint.h>
+#include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -222,6 +223,66 @@ static void describe_address(char *out, size_t size, uintptr_t address) {
     }
     snprintf(out,size,"%p",(void *)address);
 }
+/* An address in committed executable memory (a return address candidate). */
+static int executable_address(uintptr_t address) {
+    MEMORY_BASIC_INFORMATION m;
+    if (address<0x10000 || !VirtualQuery((const void *)address,&m,sizeof(m)) || m.State!=MEM_COMMIT) return 0;
+    return (m.Protect&(PAGE_EXECUTE|PAGE_EXECUTE_READ|PAGE_EXECUTE_READWRITE|PAGE_EXECUTE_WRITECOPY))!=0;
+}
+/* After the report: the stack as a list of addresses in executable memory (return address
+ * candidates, not a verified call chain: rbp is not a frame pointer in drivers and optimised
+ * host code, and a call to a bad pointer leaves only [rsp]). Bounded by the TEB stack (fibers
+ * set it to their own) and by what can be read. */
+static void scan_stack(uintptr_t sp) {
+    uintptr_t top, limit; /* NT_TIB StackBase, StackLimit (gs:[8], gs:[16]; NtCurrentTeb trips -Warray-bounds) */
+    __asm__ volatile("mov %%gs:8,%0\n mov %%gs:16,%1" : "=r"(top), "=r"(limit));
+    if (sp<limit || sp>=top || top-sp>32768) top=sp+32768;
+    char where[MAX_PATH+64];
+    uintptr_t last=0;
+    int shown=0;
+    for (uintptr_t at=sp&~(uintptr_t)7; at<top && shown<24; at+=8) {
+        uint64_t value;
+        SIZE_T got=0;
+        if (!ReadProcessMemory(GetCurrentProcess(),(const void *)at,&value,sizeof(value),&got) || got!=sizeof(value)) break;
+        if (value==last || !executable_address((uintptr_t)value)) continue;
+        describe_address(where,sizeof(where),(uintptr_t)value);
+        fprintf(stderr,"  stack+0x%04" PRIxPTR " %s\n",at-sp,where);
+        last=value; ++shown;
+    }
+}
+/* user/crash.dmp (threads, modules, stacks and the memory they point at): a later crash can be
+ * read with a debugger. dbghelp is loaded at start (not in a crashed process); the dump is
+ * written by a helper thread that gets 15 s: a lock held by the faulting code (heap, loader)
+ * then costs the dump, never a hung process. BB_NO_CRASH_DUMP=1: none. */
+typedef BOOL (WINAPI *MiniDumpWriteDumpFn)(HANDLE,DWORD,HANDLE,int,const void *,const void *,const void *);
+static MiniDumpWriteDumpFn crash_dump_write;
+static char crash_dump_path[MAX_PATH];
+static struct { DWORD thread; EXCEPTION_POINTERS *pointers; BOOL client; } crash_exception;
+static void crash_dump_configure(const char *user) {
+    if (getenv("BB_NO_CRASH_DUMP")) return;
+    snprintf(crash_dump_path,sizeof(crash_dump_path),"%s\\crash.dmp",user);
+    HMODULE dbghelp=LoadLibraryA("dbghelp.dll");
+    if (dbghelp) crash_dump_write=(MiniDumpWriteDumpFn)(void *)GetProcAddress(dbghelp,"MiniDumpWriteDump");
+}
+static DWORD WINAPI crash_dump_thread(void *unused) {
+    (void)unused;
+    HANDLE file=CreateFileA(crash_dump_path,GENERIC_WRITE,0,NULL,CREATE_ALWAYS,FILE_ATTRIBUTE_NORMAL,NULL);
+    if (file==INVALID_HANDLE_VALUE) return 1;
+    /* MiniDumpWithIndirectlyReferencedMemory | WithUnloadedModules | WithProcessThreadData |
+     * WithThreadInfo: no full memory (the guest maps gigabytes). */
+    const BOOL ok=crash_dump_write(GetCurrentProcess(),GetCurrentProcessId(),file,0x40|0x20|0x100|0x1000,&crash_exception,NULL,NULL);
+    CloseHandle(file);
+    return ok ? 0 : 2;
+}
+static void write_crash_dump(EXCEPTION_POINTERS *info) {
+    if (!crash_dump_write) return;
+    crash_exception.thread=GetCurrentThreadId(); crash_exception.pointers=info; crash_exception.client=FALSE;
+    HANDLE helper=CreateThread(NULL,0,crash_dump_thread,NULL,0,NULL);
+    DWORD code=3;
+    if (helper && WaitForSingleObject(helper,15000)==WAIT_OBJECT_0) GetExitCodeThread(helper,&code);
+    if (code==0) fprintf(stderr,"Crash dump: %s\n",crash_dump_path);
+    else fprintf(stderr,"Crash dump: not written (%s)\n",code==1 ? "cannot create the file" : code==2 ? "dbghelp failed" : "timed out");
+}
 static int fatal_reported;
 static LONG fatal_exception(EXCEPTION_POINTERS *info) {
     if (__atomic_exchange_n(&fatal_reported,1,__ATOMIC_ACQ_REL)) { Sleep(INFINITE); }
@@ -229,12 +290,17 @@ static LONG fatal_exception(EXCEPTION_POINTERS *info) {
     const CONTEXT *c=info->ContextRecord;
     char where[MAX_PATH+64];
     describe_address(where,sizeof(where),(uintptr_t)c->Rip);
+    char thread[96];
+    const char *guest=runtime_thread_name_here(), *fiber=runtime_fiber_name_here();
+    if (fiber) snprintf(thread,sizeof(thread),"thread %lu '%s', fiber '%s'",GetCurrentThreadId(),guest ? guest : "?",fiber);
+    else if (guest) snprintf(thread,sizeof(thread),"thread %lu '%s'",GetCurrentThreadId(),guest);
+    else snprintf(thread,sizeof(thread),"thread %lu, host",GetCurrentThreadId());
     if (record->ExceptionCode==EXCEPTION_ACCESS_VIOLATION && record->NumberParameters>=2)
-        fprintf(stderr,"Fault: %s access to %p at %s (thread %lu)\n",
+        fprintf(stderr,"Fault: %s access to %p at %s (%s)\n",
                 record->ExceptionInformation[0]==1 ? "write" : record->ExceptionInformation[0]==8 ? "execute" : "read",
-                (void *)record->ExceptionInformation[1],where,GetCurrentThreadId());
+                (void *)record->ExceptionInformation[1],where,thread);
     else
-        fprintf(stderr,"Fault: exception 0x%08lx at %s (thread %lu)\n",record->ExceptionCode,where,GetCurrentThreadId());
+        fprintf(stderr,"Fault: exception 0x%08lx at %s (%s)\n",record->ExceptionCode,where,thread);
     fprintf(stderr,"  rax=%016llx rbx=%016llx rcx=%016llx rdx=%016llx\n  rsi=%016llx rdi=%016llx rbp=%016llx rsp=%016llx\n"
             "  r8=%016llx  r9=%016llx  r10=%016llx r11=%016llx\n  r12=%016llx r13=%016llx r14=%016llx r15=%016llx\n",
             c->Rax,c->Rbx,c->Rcx,c->Rdx,c->Rsi,c->Rdi,c->Rbp,c->Rsp,
@@ -246,6 +312,7 @@ static LONG fatal_exception(EXCEPTION_POINTERS *info) {
                              isa_kind_name(isa_table->sites[site].kind));
         isa_rewrite_report(isa_table,stderr);
     }
+    if (gpu_enabled) bbgpu_dump_recent_checkpoints();
     /* rbp chain (guest and host code keep frame pointers). */
     uintptr_t rbp=(uintptr_t)c->Rbp;
     for (int depth=0; depth<24 && rbp; ++depth) {
@@ -256,6 +323,17 @@ static LONG fatal_exception(EXCEPTION_POINTERS *info) {
         fprintf(stderr,"  #%d %s\n",depth,where);
         rbp=frame[0];
     }
+    {
+        uint64_t slot;
+        SIZE_T got=0;
+        if (ReadProcessMemory(GetCurrentProcess(),(const void *)(uintptr_t)c->Rsp,&slot,sizeof(slot),&got) && got==sizeof(slot)) {
+            describe_address(where,sizeof(where),(uintptr_t)slot);
+            fprintf(stderr,"  [rsp] %s%s\n",where,executable_address((uintptr_t)slot) ? "" : " (not code)");
+        }
+    }
+    scan_stack((uintptr_t)c->Rsp);
+    fflush(NULL);
+    write_crash_dump(info);
     fflush(NULL);
     TerminateProcess(GetCurrentProcess(),3);
     return EXCEPTION_CONTINUE_SEARCH;
@@ -758,16 +836,17 @@ static void install_game_callbacks(Segment *segments, uint64_t ns, uint64_t imag
     const RuntimeGuestCallback *callbacks=runtime_guest_callbacks(&count);
     unsigned char *thunks=NULL;
     size_t used=0;
-    uint8_t installed[32]={0};
-    uint64_t hook_offsets[32]; size_t hooks_done=0;
+    uint8_t installed[64]={0};
+    uint64_t hook_offsets[64]; size_t hooks_done=0;
     guest_image_size=image_size;
-    if (count>sizeof(installed)) count=sizeof(installed);
+    if (count>sizeof(installed)) { printf("Callbacks: table has %zu entries, only %zu fit\n",count,sizeof(installed)); count=sizeof(installed); }
     /* A/B tests: BB_CALLBACKS=0 installs none, BB_CALLBACKS_SKIP=<text> none whose name contains the text */
     const char *off=getenv("BB_CALLBACKS"), *skip=getenv("BB_CALLBACKS_SKIP");
     if (off && off[0]=='0') { printf("Callbacks: disabled (BB_CALLBACKS=0)\n"); return; }
     for (size_t i=0;i<count;++i) {
         const RuntimeGuestCallback *c=&callbacks[i];
         if (skip && *skip && strstr(c->name,skip)) continue;
+        if (!runtime_guest_callback_wanted(c,0)) continue;              /* switched off (launcher setting) */
         uint64_t found=0;
         size_t length=0, matches=find_pattern(segments,ns,c->pattern,&found,&length);
         if (matches>1) { printf("Callbacks: %s: %zu matches, not installed\n",c->name,matches); continue; }
@@ -777,14 +856,21 @@ static void install_game_callbacks(Segment *segments, uint64_t ns, uint64_t imag
         for (size_t j=0;j<hooks_done;++j) if (hook_offsets[j]==offset) hooked=1;
         if (hooked) continue;                                          /* an earlier entry took this site */
         if (hooks_done<sizeof(hook_offsets)/sizeof(*hook_offsets)) hook_offsets[hooks_done++]=offset;
+        runtime_guest_callback_wanted(c,offset);
         if (!c->callback) {
             memcpy(image+offset,c->patch,c->moved);
             installed[i]=1;
+            runtime_guest_callback_installed(c);
             printf("Callbacks: %s at %#" PRIx64 " (patch)\n",c->name,offset);
             continue;
         }
-        if (!thunks && !(thunks=near_image_memory(8192))) { printf("Callbacks: no thunk memory\n"); return; }
-        if (used+320>8192) break;
+        /* Sized from the table (8 KiB held about 25 code hooks and the loop stopped there without a word). */
+        const size_t thunk_bytes=count*320;
+        if (!thunks && !(thunks=near_image_memory(thunk_bytes))) {
+            printf("Callbacks: no thunk memory near the image: %s and the ones after it not installed\n",c->name);
+            return;
+        }
+        if (used+320>thunk_bytes) { printf("Callbacks: thunk memory full at %s, the rest not installed\n",c->name); break; }
         unsigned char *t=thunks+used, *f=image+offset;
         size_t k=0;
         /* lea rsp, [rsp-0x80] (a hook inside a leaf function must not touch the 128 bytes below rsp that the compiler uses as scratch);
@@ -826,12 +912,14 @@ static void install_game_callbacks(Segment *segments, uint64_t ns, uint64_t imag
         f[0]=0xe9; memcpy(f+1,&to,4); memset(f+5,0x90,c->moved-5);
         used+=(k+15)&~(size_t)15;
         installed[i]=1;
+        runtime_guest_callback_installed(c);
         printf("Callbacks: %s at %#" PRIx64 "\n",c->name,offset);
     }
     /* Names start with the game ("U2 ..."): a callback missing from a game whose other callbacks
      * attached is reported; callbacks of the other games are not. */
     int any=0;
     for (size_t i=0;i<count;++i) {
+        if (!runtime_guest_callback_wanted(&callbacks[i],0)) continue;
         int seen=0, ok=0, group=0;
         const size_t game=strcspn(callbacks[i].name," ");
         for (size_t j=0;j<count;++j) {
@@ -843,6 +931,135 @@ static void install_game_callbacks(Segment *segments, uint64_t ns, uint64_t imag
     }
     if (!any) printf("Callbacks: none of the known camera and pad code was found (unknown build?)\n");
 }
+/* A thunk that calls `callback` (Microsoft x64: rdi, rsi, the image base, r14) with the guest's
+ * registers and flags kept, runs the `moved` bytes of position-independent instructions from `f`
+ * and jumps back; `f` jumps to it. 0 without thunk memory. (Mevlock's helper, after
+ * Umar-Qayyum-dev's job idle yield; the camera callbacks above build their own thunks.) */
+static unsigned char *callback_thunks;
+static size_t callback_thunks_used;
+static int callback_thunk(unsigned char *f, size_t moved, const void *callback) {
+    if (!callback_thunks && !(callback_thunks=near_image_memory(4096))) {
+        printf("Callbacks: no thunk memory\n");
+        return 0;
+    }
+    if (callback_thunks_used+256>4096) return 0;
+    unsigned char *t=callback_thunks+callback_thunks_used;
+    size_t k=0;
+    /* lea rsp, [rsp-0x80] (the red zone of a leaf function); pushfq; push rax rcx rdx r8-r11 rbx;
+     * mov rbx, rsp; and rsp, -16; sub rsp, 0xa0 (works at a function's start and inside it) */
+    static const unsigned char save[]={0x48,0x8d,0x64,0x24,0x80,0x9c,0x50,0x51,0x52,0x41,0x50,0x41,0x51,0x41,0x52,0x41,0x53,0x53,
+                                       0x48,0x89,0xe3,0x48,0x83,0xe4,0xf0,0x48,0x81,0xec,0xa0,0x00,0x00,0x00};
+    memcpy(t+k,save,sizeof(save)); k+=sizeof(save);
+    for (int x=0;x<8;++x) {                                     /* movdqu [rsp+0x20+16x], xmmx */
+        const uint32_t disp=0x20u+16u*(uint32_t)x;
+        t[k++]=0xf3; t[k++]=0x0f; t[k++]=0x7f; t[k++]=(unsigned char)(0x84|x<<3); t[k++]=0x24;
+        memcpy(t+k,&disp,4); k+=4;
+    }
+    t[k++]=0x48; t[k++]=0x89; t[k++]=0xf9;                      /* mov rcx, rdi */
+    t[k++]=0x48; t[k++]=0x89; t[k++]=0xf2;                      /* mov rdx, rsi */
+    const uintptr_t base=(uintptr_t)image, host=(uintptr_t)callback;
+    t[k++]=0x49; t[k++]=0xb8; memcpy(t+k,&base,8); k+=8;        /* movabs r8, image */
+    t[k++]=0x4d; t[k++]=0x89; t[k++]=0xf1;                      /* mov r9, r14 */
+    t[k++]=0x48; t[k++]=0xb8; memcpy(t+k,&host,8); k+=8;        /* movabs rax, callback */
+    t[k++]=0xff; t[k++]=0xd0;                                   /* call rax */
+    for (int x=0;x<8;++x) {                                     /* movdqu xmmx, [rsp+0x20+16x] */
+        const uint32_t disp=0x20u+16u*(uint32_t)x;
+        t[k++]=0xf3; t[k++]=0x0f; t[k++]=0x6f; t[k++]=(unsigned char)(0x84|x<<3); t[k++]=0x24;
+        memcpy(t+k,&disp,4); k+=4;
+    }
+    /* mov rsp, rbx; pop rbx r11-r8 rdx rcx rax; popfq; lea rsp, [rsp+0x80] */
+    static const unsigned char restore[]={0x48,0x89,0xdc,0x5b,0x41,0x5b,0x41,0x5a,0x41,0x59,0x41,0x58,
+                                          0x5a,0x59,0x58,0x9d,0x48,0x8d,0xa4,0x24,0x80,0x00,0x00,0x00};
+    memcpy(t+k,restore,sizeof(restore)); k+=sizeof(restore);
+    memcpy(t+k,f,moved); k+=moved;                              /* the moved instructions */
+    int32_t back=(int32_t)((int64_t)(uintptr_t)(f+moved)-(int64_t)(uintptr_t)(t+k+5));
+    t[k++]=0xe9; memcpy(t+k,&back,4); k+=4;
+    int32_t to=(int32_t)((int64_t)(uintptr_t)t-(int64_t)(uintptr_t)(f+5));
+    f[0]=0xe9; memcpy(f+1,&to,4); memset(f+5,0x90,moved-5);
+    callback_thunks_used+=(k+15)&~(size_t)15;
+    return 1;
+}
+/* The single offset of a byte pattern ("4d8d7001 74??", ?? = any byte) in the image: -1 none,
+ * -2 several. */
+static int64_t find_masked(const char *hex, uint64_t size) {
+    unsigned char bytes[64], mask[64];
+    int n=0;
+    for (const char *p=hex; *p && n<64;) {
+        if (*p==' ') { ++p; continue; }
+        if (p[0]=='?') { bytes[n]=0; mask[n++]=0; p+=2; continue; }
+        unsigned v; sscanf(p,"%2x",&v); bytes[n]=(unsigned char)v; mask[n++]=1; p+=2;
+    }
+    int64_t found=-1;
+    for (uint64_t i=0; i+n<=size; ++i) {
+        if (image[i]!=bytes[0]) continue;
+        int k=1;
+        while (k<n && (!mask[k] || image[i+k]==bytes[k])) ++k;
+        if (k<n) continue;
+        if (found>=0) return -2; /* not unique */
+        found=(int64_t)i;
+    }
+    return found;
+}
+/* Render command contexts (ndgi): Begin and End are hooked to keep a per-thread flag, set while a
+ * job worker has a context open (runtime_ndgi_open, cleared too when a fiber leaves the thread,
+ * runtime_fiber.c), used by the job wait patch below. A context records its worker at Begin
+ * (+0xe810) and asserts the same one at End ("m_workerThreadIndex == GetCurrentWorkerThreadIndex()"). */
+#ifdef _WIN32
+extern _Thread_local int runtime_ndgi_open; /* runtime_fiber.c */
+static void __attribute__((ms_abi)) ndgi_end(uint64_t rdi, uint64_t rsi, uint64_t base, uint64_t r14) {
+    (void)rdi; (void)rsi; (void)base; (void)r14;
+    runtime_ndgi_open=0;
+}
+static void __attribute__((ms_abi)) ndgi_begin(uint64_t rdi, uint64_t rsi, uint64_t base, uint64_t r14) {
+    (void)rdi; (void)rsi; (void)base; (void)r14;
+    runtime_ndgi_open=1;
+}
+static int64_t find_masked(const char *hex, uint64_t size);
+static void install_ndgi_hooks(uint64_t image_size) {
+    const char *wait=getenv("BB_JOB_LOCK_WAIT_MS");
+    if (wait && wait[0]=='0' && !wait[1]) return; /* nothing uses the flag */
+    static const unsigned char begin[]={0x49,0x89,0x84,0x24,0x10,0xe8,0x00,0x00}; /* mov [r12+0xe810], rax */
+    int64_t begin_at=-1;
+    for (uint64_t at=0;at+16<=image_size;++at) {
+        if (image[at]!=0x49 || memcmp(image+at,begin,sizeof(begin))) continue;
+        if (begin_at>=0) { begin_at=-2; break; }
+        begin_at=(int64_t)at;
+    }
+    size_t begin_len=8;
+    if (begin_at==-1) {
+        /* US 1.02 (as CUSA02344): the worker path's mov [r15+0xe810], r12 */
+        begin_at=find_masked("4d89a710e80000",image_size);
+        begin_len=7;
+    }
+    if (begin_at<0) {
+        printf("Render contexts: begin site %s\n",begin_at==-2 ? "not unique" : "not found");
+        return;
+    }
+    /* End: mov rbx,[r14+0xe810]; call GetCurrentWorkerThreadIndex; cmp rbx,rax; je */
+    static const unsigned char head[]={0x49,0x8b,0x9e,0x10,0xe8,0x00,0x00,0xe8};
+    static const unsigned char tail[]={0x48,0x39,0xc3,0x74};
+    int64_t found=-1;
+    for (uint64_t at=0;at+16<=image_size;++at) {
+        if (image[at]!=0x49 || memcmp(image+at,head,sizeof(head)) || memcmp(image+at+12,tail,sizeof(tail))) continue;
+        if (found>=0) { printf("Render contexts: end site not unique\n"); return; }
+        found=(int64_t)at;
+    }
+    if (found<0) {
+        /* US 1.02: cmp byte [r15+0xe7dc],0; je; mov r12,[r15+0xe810] (the index call is inlined) */
+        const int64_t us=find_masked("4180bfdce70000 00 0f84???????? 4d8ba710e80000",image_size);
+        if (us>=0) found=us+14;
+    }
+    if (found<0) { printf("Render contexts: end site not found\n"); return; }
+    /* both or neither: a Begin without its End would leave the flag set. End first (alone it only
+     * clears the flag), Begin only once End is in. */
+    if (!callback_thunk(image+found,7,(const void *)ndgi_end)) { printf("Render contexts: end hook failed\n"); return; }
+    printf("Render contexts: end hooked at %#" PRIx64 "\n",(uint64_t)found);
+    if (callback_thunk(image+begin_at,begin_len,(const void *)ndgi_begin))
+        printf("Render contexts: begin hooked at %#" PRIx64 "\n",(uint64_t)begin_at);
+    else
+        printf("Render contexts: begin hook failed\n");
+}
+#endif
 /* Naughty Dog's FrameBegin (ndlib/render/fg-draw-mgr.cpp) asserts that the frame it recycles,
  * three back, has its GPU end-of-pipe tick (set by the game's EOP interrupt handler). It never
  * waits: on PS4 the GPU always keeps up. Here the GPU side can fall behind (shaders building on a
@@ -934,10 +1151,11 @@ static void patch_job_sleep(uint64_t image_size) {
     if (env && env[0]=='0') { printf("Job workers: spin while idle (BB_JOB_SLEEP=0)\n"); return; }
 #ifdef _WIN32
     /* Sleeping workers free the cores of small CPUs, but cost ~8% in busy scenes on a 16-thread
-     * one (U3 Cartagena square: 87 vs 94 FPS). By default only up to 8 hardware threads;
+     * one (U3 Cartagena square: 87 vs 94 FPS). By default up to 12 hardware threads (6-core CPUs
+     * such as the i5-10400 doubled their CPU load without it, fork issue #3);
      * BB_JOB_SLEEP=1 forces it. */
     const DWORD threads=GetActiveProcessorCount(ALL_PROCESSOR_GROUPS);
-    if (!env && threads>8) { printf("Job workers: spin while idle (%lu hardware threads)\n",(unsigned long)threads); return; }
+    if (!env && threads>12) { printf("Job workers: spin while idle (%lu hardware threads)\n",(unsigned long)threads); return; }
 #endif
     struct Patch {
         const char *name, *pattern;
@@ -1058,6 +1276,308 @@ static void patch_null_binding_handler(uint64_t image_size) {
     }
     if (!patched) printf("Shader bindings: null handler call site not found\n");
 }
+/* The job system's counter wait (corelib job scheduling: until [counter+0x20] == or <= a target):
+ * a job worker that finds the counter not there yet suspends its job (SuspendJob) and retries when
+ * the job runs again, which may be on another worker; other threads sleep 1 ms and retry in place.
+ * On the PS4 each worker owns a core and the counter is there in time. With 4 cores the jobs it
+ * waits for lag: U2's water Draw waits with a render command context open, resumed on another
+ * worker and failed
+ * "m_workerThreadIndex == GetCurrentWorkerThreadIndex()" (End) and "cmdBuf.m_bInUse == false"
+ * (Begin, on the worker it left) within 1-7 deaths of a 4-core death loop. A worker with a render
+ * context open (the Begin/End hooks above) now first retries in place (SwitchToThread, then 1 ms
+ * sleeps, up to BB_JOB_LOCK_WAIT_MS, default 250; 0: off) and suspends its job only after that, as
+ * before (the jobs it waits for still get a free worker); other workers suspend at once. The
+ * counter is read again on every try. */
+static uint64_t job_lock_try;
+static unsigned job_lock_wait_ms=250;
+static volatile long job_lock_fallbacks;
+static ABI int job_lock_wait(uint64_t counter, uint64_t a, uint32_t b) {
+    typedef int (ABI *Try)(uint64_t, uint64_t, uint32_t);
+    const Try try_value=(Try)(uintptr_t)job_lock_try;
+    const volatile uint64_t *value=(const volatile uint64_t *)(uintptr_t)(counter+0x20);
+#define try_lock(c,x,y) try_value(*value,(x),(y))
+#ifdef _WIN32
+    /* Without a render context open the job may move: suspend at once, as the game does (waiting
+     * in place for every taken lock starved the job system: 3.6 fps loading with 4 cores). */
+    if (!runtime_ndgi_open) return 0;
+    for (unsigned i=0;i<16;++i) {
+        if (try_lock(counter,a,b)&0xff) return 1;
+        SwitchToThread();
+    }
+    /* a real deadline: Sleep(1) can take a whole 15.6 ms timer tick */
+    const ULONGLONG deadline=GetTickCount64()+job_lock_wait_ms;
+    do {
+        if (try_lock(counter,a,b)&0xff) return 1;
+        compat_sleep_ns(1000000);
+    } while (GetTickCount64()<deadline);
+#else
+    for (unsigned i=0;i<job_lock_wait_ms*10;++i) {
+        if (try_lock(counter,a,b)&0xff) return 1;
+        usleep(100);
+    }
+#endif
+    if (try_lock(counter,a,b)&0xff) return 1;
+    const long n=__atomic_add_fetch(&job_lock_fallbacks,1,__ATOMIC_RELAXED);
+    if (n<=20) printf("Job wait: a worker with a render context open waited %u ms in vain, its job suspends (%ld)\n",
+                      job_lock_wait_ms,n);
+    return 0;
+#undef try_lock
+}
+/* US 1.02 (CUSA02320, as CUSA02344), all three games: the try is inlined (counter r15, target r14,
+ * mode ebx) and the worker check is in al:
+ *   mov rcx,[r15+0x20]; cmp ebx,1; jne; cmp rcx,r14; setle cl; jmp; test ebx,ebx; jne; cmp rcx,r14;
+ *   sete cl; test cl,cl; jne done; test al,al; je not_a_worker; nop10; (suspend loop:) mov rdi,r15;
+ *   mov rsi,r14; mov edx,ebx; call SuspendJob
+ * The game keeps an uncalled copy of the try function, which job_lock_wait calls. */
+static void patch_job_lock_wait_us(uint64_t image_size) {
+    const int64_t at=find_masked("498b4f20 83fb01 75?? 4c39f1 0f9ec1 eb?? 85db 75?? 4c39f1 0f94c1 84c9 75?? 84c0 74?? "
+                                 "662e0f1f840000000000 4c89ff 4c89f6 89da e8????????",image_size);
+    const int64_t try_at=find_masked("83fa01 7507 4839f7 0f9ec0 c3 85d2 7507 4839f7 0f94c0 c3",image_size);
+    if (at<0 || try_at<0) { printf("Job wait: pattern not found, not patched\n"); return; }
+    unsigned char *p=image+at;
+    job_lock_try=(uint64_t)(uintptr_t)(image+try_at);
+    const uint64_t done=(uint64_t)(uintptr_t)(p+31+(int8_t)p[30]);
+    const uint64_t not_worker=(uint64_t)(uintptr_t)(p+35+(int8_t)p[34]);
+    const uint64_t suspend_loop=(uint64_t)(uintptr_t)(p+45);
+    unsigned char *t=near_image_memory(4096);
+    if (!t) { printf("Job wait: no thunk memory, not patched\n"); return; }
+    size_t k=0;
+    const uintptr_t host=(uintptr_t)job_lock_wait;
+    t[k++]=0x84; t[k++]=0xc0; t[k++]=0x75; t[k++]=0x0e;                                   /* test al,al; jnz worker */
+    t[k++]=0xff; t[k++]=0x25; memset(t+k,0,4); k+=4; memcpy(t+k,&not_worker,8); k+=8;    /* jmp [rip]: not a worker */
+    static const unsigned char args[]={0x4c,0x89,0xff,0x4c,0x89,0xf6,0x89,0xda};        /* rdi=r15 (the counter), rsi=r14, edx=ebx */
+    memcpy(t+k,args,sizeof(args)); k+=sizeof(args);
+    t[k++]=0x48; t[k++]=0xb8; memcpy(t+k,&host,8); k+=8;   /* movabs rax, job_lock_wait */
+    t[k++]=0xff; t[k++]=0xd0;                              /* call rax (rsp aligned as at the original call) */
+    t[k++]=0x84; t[k++]=0xc0;                              /* test al,al */
+    t[k++]=0x74; t[k++]=0x0e;                              /* jz suspend */
+    t[k++]=0xff; t[k++]=0x25; memset(t+k,0,4); k+=4; memcpy(t+k,&done,8); k+=8;          /* jmp [rip]: there */
+    t[k++]=0xff; t[k++]=0x25; memset(t+k,0,4); k+=4; memcpy(t+k,&suspend_loop,8); k+=8;  /* jmp [rip]: suspend as before */
+    const int32_t to=(int32_t)((int64_t)(uintptr_t)t-(int64_t)(uintptr_t)(p+31+5));
+    p[31]=0xe9; memcpy(p+32,&to,4);                        /* replaces test al,al; je */
+    memset(p+36,0x90,9);
+    printf("Job wait: workers with a render context open wait for a job counter in place for up to %u ms before suspending their job (0x%" PRIx64 ", US)\n",
+           job_lock_wait_ms,(uint64_t)at);
+}
+static void patch_job_lock_wait(uint64_t image_size) {
+    const char *env=getenv("BB_JOB_LOCK_WAIT_MS");
+    if (env) job_lock_wait_ms=(unsigned)strtoul(env,NULL,10);
+    if (!job_lock_wait_ms) { printf("Job wait: BB_JOB_LOCK_WAIT_MS=0, workers suspend at once\n"); return; }
+#ifdef _WIN32
+    /* By default only on CPUs with up to 12 hardware threads, where the crash happens (4 and 6
+     * cores). With more, a free worker takes the suspended job at once, and waiting in place cost
+     * U3's Cartagena square 92 -> 50 FPS on a big CPU (SuperMedo 0.3.11). BB_JOB_LOCK_WAIT_MS turns
+     * it on anywhere. */
+    const DWORD threads=GetActiveProcessorCount(ALL_PROCESSOR_GROUPS);
+    if (!env && threads>12) {
+        printf("Job wait: workers suspend at once (%lu hardware threads; BB_JOB_LOCK_WAIT_MS=250 to wait)\n",
+               (unsigned long)threads);
+        return;
+    }
+#endif
+    /* mov rdi,[rbx+0x20]; mov rsi,r15; mov edx,r14d; call try; test al,al; jne done;
+     * test r12b,r12b; je not_a_worker; nop5; (suspend loop:) mov rdi,rbx; mov rsi,r15; mov edx,r14d; call SuspendJob */
+    const int64_t at=find_masked("488b7b20 4c89fe 4489f2 e8???????? 84c0 75?? 4584e4 74?? 0f1f440000 4889df 4c89fe 4489f2 e8????????",
+                                 image_size);
+    if (at==-1) { patch_job_lock_wait_us(image_size); return; }
+    if (at<0) { printf("Job wait: %s\n",at==-2 ? "pattern not unique, not patched" : "pattern not found, not patched"); return; }
+    unsigned char *p=image+at;
+    int32_t rel; memcpy(&rel,p+11,4);
+    job_lock_try=(uint64_t)(uintptr_t)(p+15+rel);
+    const uint64_t done=(uint64_t)(uintptr_t)(p+19+(int8_t)p[18]);
+    const uint64_t not_worker=(uint64_t)(uintptr_t)(p+24+(int8_t)p[23]);
+    const uint64_t suspend_loop=(uint64_t)(uintptr_t)(p+29);
+    unsigned char *t=near_image_memory(4096);
+    if (!t) { printf("Job wait: no thunk memory, not patched\n"); return; }
+    size_t k=0;
+    const uintptr_t host=(uintptr_t)job_lock_wait;
+    static const unsigned char test_r12b[]={0x45,0x84,0xe4,0x75,0x0e};      /* test r12b,r12b; jnz worker */
+    memcpy(t+k,test_r12b,sizeof(test_r12b)); k+=sizeof(test_r12b);
+    t[k++]=0xff; t[k++]=0x25; memset(t+k,0,4); k+=4; memcpy(t+k,&not_worker,8); k+=8;  /* jmp [rip]: not a worker */
+    /* worker: */
+    static const unsigned char args[]={0x48,0x89,0xdf,0x90,0x4c,0x89,0xfe,0x44,0x89,0xf2}; /* rdi=rbx (the counter), rsi=r15, edx=r14d */
+    memcpy(t+k,args,sizeof(args)); k+=sizeof(args);
+    t[k++]=0x48; t[k++]=0xb8; memcpy(t+k,&host,8); k+=8;   /* movabs rax, job_lock_wait */
+    t[k++]=0xff; t[k++]=0xd0;                              /* call rax (rsp aligned as at the original calls) */
+    t[k++]=0x84; t[k++]=0xc0;                              /* test al,al */
+    t[k++]=0x74; t[k++]=0x0e;                              /* jz suspend */
+    t[k++]=0xff; t[k++]=0x25; memset(t+k,0,4); k+=4; memcpy(t+k,&done,8); k+=8;          /* jmp [rip]: acquired */
+    t[k++]=0xff; t[k++]=0x25; memset(t+k,0,4); k+=4; memcpy(t+k,&suspend_loop,8); k+=8;  /* jmp [rip]: suspend as before */
+    const int32_t to=(int32_t)((int64_t)(uintptr_t)t-(int64_t)(uintptr_t)(p+19+5));
+    p[19]=0xe9; memcpy(p+20,&to,4);                        /* replaces test r12b,r12b; je */
+    printf("Job wait: workers with a render context open wait for a job counter in place for up to %u ms before suspending their job (0x%" PRIx64 ")\n",
+           job_lock_wait_ms,(uint64_t)at);
+}
+/* Uncharted 1 (EU and US 1.02): the rigid-body integrator holds still any body slower than "Sticky Speed
+ * (nothing-moves speed)" or "Sticky Omega (nothing-rotates omega)", both 0.1 (EU 0x988674 / 0x988670, the game's own
+ * names). A body at rest gains g*dt per step: 0.16 m/s at 60 FPS gets it moving, 0.07 m/s at 144 FPS does not, so
+ * above 60 FPS bodies that should tip or drop off a ledge stay put and fall asleep (jet ski river barrels hanging in
+ * mid-air). The world step (EU 0x235350, dt in xmm0) scales both thresholds by min(1, 60*dt), so every step behaves
+ * as at 60 FPS. BB_U1_STICKY=0 keeps the game's values.
+ * The same step also scales "Max Stop Frames" (10) and "Max Crawl Frames" (30): a body that stays that slow for that many
+ * steps comes to rest (step counters at body+0x136 / +0x138), 0.17 s / 0.5 s at 60 FPS but 0.07 s / 0.21 s at 144, so
+ * objects and ragdolls settled early. They become N / min(1, 60*dt) steps, the same time at any rate. BB_U1_SETTLE=0:
+ * the game's counts. */
+static float *u1_sticky_omega, *u1_sticky_speed, u1_sticky_omega0, u1_sticky_speed0;
+static uint32_t *u1_settle_stop, *u1_settle_crawl, u1_settle_stop0, u1_settle_crawl0;
+/* "Artificial Damping V" / "W" (0.9998) multiply the velocities every step: 0.9998^(60*dt) per step is the 60 FPS loss
+ * per second at any rate. BB_U1_DAMPING=0: the game's factors. */
+static float *u1_damp_v, *u1_damp_w, u1_damp_v0, u1_damp_w0;
+static ABI void u1_sticky_step(float dt) {
+    if (!(dt>0.0f)) return;
+    const float scale=dt*60.0f<1.0f ? dt*60.0f : 1.0f;
+    if (u1_sticky_omega) {
+        *u1_sticky_omega=u1_sticky_omega0*scale;
+        *u1_sticky_speed=u1_sticky_speed0*scale;
+    }
+    if (u1_settle_stop) {
+        *u1_settle_stop=(uint32_t)((float)u1_settle_stop0/scale+0.5f);
+        *u1_settle_crawl=(uint32_t)((float)u1_settle_crawl0/scale+0.5f);
+    }
+    if (u1_damp_w) {
+        *u1_damp_v=powf(u1_damp_v0,scale);
+        *u1_damp_w=powf(u1_damp_w0,scale);
+    }
+}
+static void patch_u1_sticky(uint64_t image_size) {
+    const char *env=getenv("BB_U1_STICKY"), *settle_env=getenv("BB_U1_SETTLE"), *damping_env=getenv("BB_U1_DAMPING");
+    const int sticky=!(env && env[0]=='0'), settle=!(settle_env && settle_env[0]=='0'),
+              damping=!(damping_env && damping_env[0]=='0');
+    if (!sticky && !settle && !damping) return;
+    /* push rbp; mov rbp,rsp; push r14 | push rbx; sub rsp,0x10; mov r14,rsi; vmovss [rbp-0x14],xmm0; mov rbx,rdi;
+     * mov dword [rbx+0x14eb4],0 */
+    const int64_t at=find_masked("554889e5 4156 53 4883ec10 4989f6 c5fa1145ec 4889fb c783b44e010000000000",image_size);
+    if (at<0) return; /* not Uncharted 1 */
+    /* the integrator's tests: vaddss; lea rax,[omega]; vucomiss xmm0,[rax]; jae; mov qword [r15],0 and
+     * vmulss xmm3,xmm3,xmm3; vmulss xmm2,xmm2,xmm3; lea rax,[speed]; vmovss xmm3,[rax]; vmulss xmm3,xmm3,xmm3 */
+    const int64_t o=find_masked("c5f258c0 488d05???????? c5f82e00 73?? 49c70700000000",image_size);
+    const int64_t v=find_masked("c5e259db c5ea59d3 488d05???????? c5fa1018 c5e259db",image_size);
+    /* the settle test: movzx eax,word [rcx+0x136]; lea rdx,[stop]; cmp eax,[rdx]; ja; movzx eax,word [rcx+0x138];
+     * lea rcx,[crawl]; cmp eax,[rcx]; ja (EU 0x1c7b63, US 0x1c80d3) */
+    const int64_t c=find_masked("0fb78136010000 488d15???????? 3b02 77?? 0fb78138010000 488d0d???????? 3b01 77",image_size);
+    /* the artificial damping: vmovss xmm4,[rbp-0x2c]; lea rsi,[W]; vmulss xmm2,xmm4,[rsi] (EU 0x1c1e20, US 0x1c2390)
+     * and lea rsi,[V]; vmulss xmm2,xmm4,[rsi]; vmulss xmm0,xmm0,xmm2 (EU 0x1c1e50, US 0x1c23c0) */
+    const int64_t dw=find_masked("c5fa1065d4 488d35???????? c5da5916",image_size);
+    const int64_t dv=find_masked("488d35???????? c5da5916 c5fa59c2",image_size);
+    unsigned char *t=near_image_memory(512);
+    int32_t d;
+    if (damping && dw>=0 && dv>=0) {
+        memcpy(&d,image+dw+8,4); u1_damp_w=(float *)(image+dw+12+d);
+        memcpy(&d,image+dv+3,4); u1_damp_v=(float *)(image+dv+7+d);
+        u1_damp_w0=*u1_damp_w; u1_damp_v0=*u1_damp_v;
+        if (!(u1_damp_w0>0.9f && u1_damp_w0<=1.0f && u1_damp_v0>0.9f && u1_damp_v0<=1.0f)) u1_damp_w=NULL;
+    }
+    if (damping && !u1_damp_w) printf("U1 physics: artificial damping not found, not scaled\n");
+    if (sticky && o>=0 && v>=0) {
+        memcpy(&d,image+o+7,4); u1_sticky_omega=(float *)(image+o+11+d);
+        memcpy(&d,image+v+11,4); u1_sticky_speed=(float *)(image+v+15+d);
+        u1_sticky_omega0=*u1_sticky_omega; u1_sticky_speed0=*u1_sticky_speed;
+    } else if (sticky) {
+        printf("U1 physics: sticky thresholds not found, not scaled\n");
+    }
+    if (settle && c>=0) {
+        memcpy(&d,image+c+10,4); u1_settle_stop=(uint32_t *)(image+c+14+d);
+        memcpy(&d,image+c+28,4); u1_settle_crawl=(uint32_t *)(image+c+32+d);
+        u1_settle_stop0=*u1_settle_stop; u1_settle_crawl0=*u1_settle_crawl;
+        if (!u1_settle_stop0 || !u1_settle_crawl0 || u1_settle_stop0>1000 || u1_settle_crawl0>1000) u1_settle_stop=NULL;
+    }
+    if (settle && !u1_settle_stop) printf("U1 physics: settle frame counts not found, not scaled\n");
+    if ((!u1_sticky_omega && !u1_settle_stop && !u1_damp_w) || !t) return;
+    unsigned char *p=image+at;
+    size_t k=0;
+    static const unsigned char save[]={0x57,0x56,0x50,0x51,0x52,0x41,0x50,0x41,0x51,0x41,0x52,0x41,0x53}; /* push rdi rsi rax rcx rdx r8-r11 */
+    memcpy(t+k,save,sizeof(save)); k+=sizeof(save);
+    /* The world step's float arguments (dt in xmm0, read right after the prologue) and every other XMM register are
+     * live here and caller-saved for u1_sticky_step: sub rsp,0x100; movdqu [rsp+16*n],xmmN for N = 0..15 (13 pushes
+     * on the entry's rsp-8 leave rsp 16-byte aligned). */
+    static const unsigned char sub_rsp[]={0x48,0x81,0xec,0x00,0x01,0x00,0x00}, add_rsp[]={0x48,0x81,0xc4,0x00,0x01,0x00,0x00};
+    memcpy(t+k,sub_rsp,sizeof(sub_rsp)); k+=sizeof(sub_rsp);
+    for (int n=0;n<16;++n) {
+        const int32_t disp=n*16;
+        t[k++]=0xf3; if (n>=8) t[k++]=0x44; t[k++]=0x0f; t[k++]=0x7f;  /* movdqu [rsp+disp32], xmmN */
+        t[k++]=(unsigned char)(0x84|((n&7)<<3)); t[k++]=0x24; memcpy(t+k,&disp,4); k+=4;
+    }
+    const uintptr_t host=(uintptr_t)u1_sticky_step;
+    t[k++]=0x48; t[k++]=0xb8; memcpy(t+k,&host,8); k+=8; /* movabs rax, u1_sticky_step */
+    t[k++]=0xff; t[k++]=0xd0;                            /* call rax: u1_sticky_step(xmm0) */
+    for (int n=0;n<16;++n) {
+        const int32_t disp=n*16;
+        t[k++]=0xf3; if (n>=8) t[k++]=0x44; t[k++]=0x0f; t[k++]=0x6f;  /* movdqu xmmN, [rsp+disp32] */
+        t[k++]=(unsigned char)(0x84|((n&7)<<3)); t[k++]=0x24; memcpy(t+k,&disp,4); k+=4;
+    }
+    memcpy(t+k,add_rsp,sizeof(add_rsp)); k+=sizeof(add_rsp);
+    static const unsigned char restore[]={0x41,0x5b,0x41,0x5a,0x41,0x59,0x41,0x58,0x5a,0x59,0x58,0x5e,0x5f};
+    memcpy(t+k,restore,sizeof(restore)); k+=sizeof(restore);
+    memcpy(t+k,p,6); k+=6;                               /* push rbp; mov rbp,rsp; push r14 */
+    const uint64_t back=(uint64_t)(uintptr_t)(p+6);
+    t[k++]=0xff; t[k++]=0x25; memset(t+k,0,4); k+=4; memcpy(t+k,&back,8); k+=8; /* jmp [rip]: p+6 */
+    const int32_t to=(int32_t)((int64_t)(uintptr_t)t-(int64_t)(uintptr_t)(p+5));
+    p[0]=0xe9; memcpy(p+1,&to,4); p[5]=0x90;
+    if (u1_sticky_omega)
+        printf("U1 physics: sticky speed %.3f and omega %.3f scale with the step (world step %#" PRIx64 ")\n",
+               u1_sticky_speed0,u1_sticky_omega0,(uint64_t)at);
+    if (u1_settle_stop)
+        printf("U1 physics: bodies settle after %u / %u steps at 60 FPS, the same time at any rate (counts at %#" PRIx64 ")\n",
+               u1_settle_stop0,u1_settle_crawl0,(uint64_t)c);
+    if (u1_damp_w)
+        printf("U1 physics: artificial damping %.4f / %.4f per 60 FPS step, the same loss per second at any rate\n",
+               u1_damp_v0,u1_damp_w0);
+}
+/* U2 chapter 21 (convoy), issue #638: assertion IsFinite(m_targetSpeed_mps) in SetTargetSpeed_mps
+ * (game/vehicle/rail-vehicle.cpp:1941). The convoy's rail controller divides the change of its
+ * distance error by the gameplay clock's frame time in whole 1/300 s ticks ([clocks+0x90],
+ * kGameplayClock), which the clock rounds down and carries over. A frame shorter than one tick
+ * gets 0 ticks while its time in seconds is not 0 (the controller only skips frames whose time is
+ * 0): x/0, an infinite or NaN speed. On PS4 a frame is 5 ticks (60 FPS); at 120 FPS it is 2.5 and
+ * at 240 FPS 1.25, so a short frame now reaches 0. The tick count the controller reads is taken as
+ * at least 1 (the 15 bytes of lea rax, clocks; vcvtsi2ss xmmN, xmm0, [rax+0x90]):
+ *   mov eax, [rip+clocks+0x90]; cmp eax, 1; adc al, 0; vcvtsi2ss xmmN, xmm0, eax
+ * Builds 102 (US and EU, 0xa8e732) and 100 (0x45d9d2). BB_CONVOY_TICKS=0: off. */
+static void patch_u2_convoy_ticks(uint64_t image_size) {
+    static const struct { const char *pattern; unsigned char modrm; } sites[]={
+        {"488d05???????? c5fa2a8890000000 c5f2590d???????? c4c17a105f40 c4c17a10574c",0xc8}, /* 102: xmm1 */
+        {"488d05???????? c5fa2a8090000000 c4c17a10542440 c4c17a104c244c",0xc0},             /* 100: xmm0 */
+    };
+    const char *env=getenv("BB_CONVOY_TICKS");
+    if (env && env[0]=='0') return;
+    for (size_t i=0;i<sizeof(sites)/sizeof(*sites);++i) {
+        const int64_t at=find_masked(sites[i].pattern,image_size);
+        if (at==-2) { printf("Convoy ticks: pattern not unique, not patched\n"); return; }
+        if (at<0) continue;
+        unsigned char *p=image+at;
+        int32_t lea; memcpy(&lea,p+3,4);
+        const int64_t field=at+7+lea+0x90;                 /* the clock's tick count, image offset */
+        const int32_t disp=(int32_t)(field-(at+6));
+        unsigned char code[15]={0x8b,0x05,0,0,0,0, 0x83,0xf8,0x01, 0x14,0x00, 0xc5,0xfa,0x2a,sites[i].modrm};
+        memcpy(code+2,&disp,4);
+        memcpy(p,code,sizeof(code));
+        printf("Convoy ticks: the convoy's speed controller counts at least one tick per frame (%#" PRIx64 ")\n",(uint64_t)at);
+        return;
+    }
+}
+/* U2 chapter 21 (convoy): Elena's truck sinks 2-4 m into the snow for ~0.5 s after a bump. The bump
+ * plays an animation on the truck by adding a node to its animation blend (US 0x399700, EU 0x102330:
+ * node, anim, params). Adding a node copies the params' bool at +0x11 into bit 2 of the previous
+ * node's flags as (flag << 2). The play-animation call the convoy uses (US 0xa21b20) never writes
+ * that bool: it is whatever was on the stack. With 0x64 there, 0x64 << 2 = 0x90 also sets bit 4 of
+ * the previous node, "the reference frame follows the object", so the rail animation that keeps the
+ * truck on its rail now takes the truck's own last position as its base each frame and the bump's
+ * offsets pile up (traced: flags 0xc8 -> 0xd8 at each sink, 0x64 at +0x11 each time). PS4 stack
+ * contents differ (the PS4 version does not sink). Only bit 0 of the bool is used:
+ *   and cl, 1; shl cl, 2; and byte [rax+0x80], 0xfb; or [rax+0x80], cl; nop  (same 20 bytes)
+ * Builds 102 US and EU. BB_CONVOY_SINK=0: off. */
+static void patch_u2_convoy_sink(uint64_t image_size) {
+    const char *env=getenv("BB_CONVOY_SINK");
+    if (env && env[0]=='0') return;
+    /* (mov cl, [r+0x11];) mov dl, [rax+0x80]; shl cl, 2; and dl, 0xfb; or dl, cl; mov [rax+0x80], dl */
+    const int64_t at=find_masked("11 8a9080000000 c0e102 80e2fb 08ca 889080000000",image_size);
+    if (at==-2) { printf("Convoy sink: pattern not unique, not patched\n"); return; }
+    if (at<0) return;
+    static const unsigned char code[20]={0x80,0xe1,0x01, 0xc0,0xe1,0x02, 0x80,0xa0,0x80,0x00,0x00,0x00,0xfb,
+                                         0x08,0x88,0x80,0x00,0x00,0x00, 0x90};
+    memcpy(image+at+1,code,sizeof(code));
+    printf("Convoy sink: animation node flag uses only bit 0 of its bool (%#" PRIx64 ")\n",(uint64_t)at+1);
+}
 /* Restarts the game through run.sh (the settings menu: a new render resolution is a patch
  * applied at start). Descriptors are closed first so the old GPU device and its memory are
  * released before the new process opens its own. */
@@ -1157,6 +1677,9 @@ int main(int argc, char **argv) {
     }
     if (app0) {
         runtime_file_configure(app0, user_dir ? user_dir : "user");
+#ifdef _WIN32
+        crash_dump_configure(user_dir ? user_dir : "user");
+#endif
         char sfo[4096], id[16]="";
         snprintf(sfo,sizeof(sfo),"%s/sce_sys/param.sfo",app0);
         if (sfo_value(sfo,"INSTALL_DIR_SAVEDATA",id,sizeof(id),NULL) || sfo_value(sfo,"TITLE_ID",id,sizeof(id),NULL))
@@ -1332,6 +1855,9 @@ int main(int argc, char **argv) {
     }
     image = runtime_image_map(round_page(size) + isa_area, PROT_READ | PROT_WRITE);
     if (!image) image = allocate(round_page(size) + isa_area);
+#ifdef _WIN32
+    red_zone_reserve(image, round_page(size) + isa_area); /* before bbgpu_init: the driver's allocations may fill its reach */
+#endif
     if (fread(image, 1, size, f) != size || fgetc(f) != EOF) fail("incorrect memory image size");
     fclose(f);
     if (isa_table && isa_table_matches(isa_table, image, size)) {
@@ -1387,9 +1913,16 @@ int main(int argc, char **argv) {
         for (uint64_t s=0;s<ns;++s) if (segments[s].address+segments[s].size>image_end) image_end=segments[s].address+segments[s].size;
         install_game_callbacks(segments, ns, image_end);
         runtime_display_patch(image, image_end);
+#ifdef _WIN32
+        install_ndgi_hooks(image_end);
+#endif
         patch_eop_tick_wait(image_end);
         patch_job_sleep(image_end);
         patch_null_binding_handler(image_end);
+        patch_job_lock_wait(image_end);
+        patch_u1_sticky(image_end);
+        patch_u2_convoy_ticks(image_end);
+        patch_u2_convoy_sink(image_end);
     }
 #ifdef _WIN32
     printf("Guest TCB loads redirected to the TEB TLS slot: %" PRIu64 "\n", patch_tcb_loads(segments, ns));

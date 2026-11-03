@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: Copyright 2025-2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include "shader_recompiler/ir/passes/ir_passes.h"
 #include <algorithm>
 #include <atomic>
 #include <chrono>
@@ -24,17 +25,25 @@
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_pipeline_cache.h"
 #include "video_core/renderer_vulkan/vk_shader_util.h"
+#include "bbport_focus_fix.h"
 
 namespace Serialization {
 /* You should increment versions below once corresponding serialization scheme is changed. */
-static constexpr u32 ShaderBinaryVersion = 13u; // bbport: LDS barriers for workgroups larger than one wave; 12: LDS bounds checks, scalar EXEC scopes and GCN NaN semantics (shadPS4 PR #5257); 10: motion shaders hold address stand-ins
-static constexpr u32 ShaderMetaVersion = 9u; // bbport: checksum of the shader binary; 8: RuntimeInfo::Properties::dx10_clamp; 7: ImageResource::needs_native
-static constexpr u32 PipelineKeyVersion = 6u; // bbport: Info layout (ImageResource::needs_native)
+static constexpr u32 ShaderBinaryVersion = 14u; // bbport: WorkgroupSplit (SuperMedo 0.3.11, NVIDIA); 13: LDS barriers for workgroups larger than one wave; 12: LDS bounds checks, scalar EXEC scopes and GCN NaN semantics (shadPS4 PR #5257); 10: motion shaders hold address stand-ins
+static constexpr u32 ShaderMetaVersion = 10u; // bbport: InfoPersistent::cs_split_eligible; 9: checksum of the shader binary; 8: RuntimeInfo::Properties::dx10_clamp; 7: ImageResource::needs_native
+static constexpr u32 PipelineKeyVersion = 7u; // bbport: Info layout (cs_split_eligible), HwComputeRuntimeInfo::indirect; 6: ImageResource::needs_native
 // bbport: translator options that change the shaders it produces are part of the stored version,
 // so switching one retranslates the shaders instead of reusing the cached ones.
 static u32 TranslatedBinaryVersion() {
     // BB_WAVE_LDS_BARRIERS=1 changes the compute shaders of workgroups larger than one wave.
     return ShaderBinaryVersion | (Shader::WaveLdsBarriers() ? 0x40000u : 0u);
+}
+/// bbport (BilalReloaded): the cache name of a shader's SPIR-V. Shaders that gained multi-wave
+/// LDS barriers get a new name, so their binaries cached before the fix are not found and only
+/// those shaders recompile.
+static std::string ShaderBinaryName(u64 pgm_hash, size_t perm_idx) {
+    return fmt::format("{:#018x}_{}{}", pgm_hash, perm_idx,
+                       Shader::Optimization::MultiwaveLdsBarriers(pgm_hash) ? "_lds4" : "");
 }
 } // namespace Serialization
 
@@ -127,7 +136,7 @@ void RegisterShaderBinary(std::vector<u32>&& spv, u64 pgm_hash, size_t perm_idx)
 
     t_saved_binary = {pgm_hash, perm_idx, BinaryChecksum(spv)};
     Storage::DataBase::Instance().Save(Storage::BlobType::ShaderBinary,
-                                       fmt::format("{:#018x}_{}", pgm_hash, perm_idx),
+                                       Serialization::ShaderBinaryName(pgm_hash, perm_idx),
                                        std::move(spv));
 }
 
@@ -400,6 +409,15 @@ void PipelineCache::WarmUpThread() {
         } else {
             entry.gkey.Deserialize(ar);
             entry.gsdata.Deserialize(ar);
+            // Motion-vector pipelines are not preloaded: the shader meta is stored once per program,
+            // not per permutation, so the meta found for a motion pipeline's stages can be the plain
+            // permutation and the preload would build the 8-attachment motion key with plain
+            // shaders (the AMD driver refused some: "Failed to create graphics pipeline:
+            // ErrorUnknown" at start; the accepted ones drew without motion output). They are built
+            // at first use. Based on a fix by Joao Pedro Valadares (spacepepperoni/uncharted_Linux 7b366f7).
+            if (entry.gkey.motion_vectors) {
+                return;
+            }
         }
         entry.parsed = true;
     });
@@ -440,7 +458,8 @@ void PipelineCache::WarmUpThread() {
         u64 checksum = 0;
         if (!LoadShaderMeta(meta_ar, stage.program->info, unused, stage.spec, stage.perm_idx,
                             &checksum) ||
-            Shader::Backend::SPIRV::IsForcedShader(stage.program->info.pgm_hash)) {
+            Shader::Backend::SPIRV::IsForcedShader(stage.program->info.pgm_hash) ||
+            BbFocusFix::FocusCentreShader(stage.program->info.pgm_hash)) {
             stage.program.reset();
             return;
         }
@@ -455,7 +474,7 @@ void PipelineCache::WarmUpThread() {
         }
         std::vector<u32> spv{};
         db.Load(Storage::BlobType::ShaderBinary,
-                fmt::format("{:#018x}_{}", info.pgm_hash, stage.perm_idx), spv);
+                Serialization::ShaderBinaryName(info.pgm_hash, stage.perm_idx), spv);
         if (spv.empty()) {
             return;
         }
@@ -465,8 +484,22 @@ void PipelineCache::WarmUpThread() {
             mismatched_binaries.fetch_add(1, std::memory_order_relaxed);
             db.Remove(Storage::BlobType::ShaderMeta, fmt::format("{:#018x}", stage_hashes[i]));
             db.Remove(Storage::BlobType::ShaderBinary,
-                      fmt::format("{:#018x}_{}", info.pgm_hash, stage.perm_idx));
+                      Serialization::ShaderBinaryName(info.pgm_hash, stage.perm_idx));
             return;
+        }
+        // bbport: the stored binary is the guest's 1024-thread module; BB_CS_SPLIT_1024 applies
+        // to it like to a freshly compiled one (vk_shader_util.cpp).
+        if (info.hw_stage == Shader::HwStage::Compute) {
+            const u32 target = SplitWorkgroupTarget();
+            if (target != 0) {
+                std::vector<u32> split_spv = spv;
+                if (SplitWorkgroup(split_spv, target)) {
+                    spv = std::move(split_spv);
+                    stage.program->info.split_workgroup = target;
+                    std::printf("Compute shader %08x: 1024-thread group split into %u (cached)\n",
+                                u32(info.pgm_hash), target);
+                }
+            }
         }
         stage.module = CompileSPV(spv, device);
     });

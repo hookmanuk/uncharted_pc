@@ -34,12 +34,16 @@ namespace VideoCore::ButtonPrompts {
 namespace {
 
 // input.ini actions with a picture on the sheets, in runtime_pad.c's names.
-enum Action { Cross, Circle, Square, Triangle, L1, R1, L2, R2, L3, R3, Options, Touchpad, Actions };
+// RotCcw and RotCw (the keys that turn the left stick in circles) have no picture on the sheets
+// (the stick prompt of valves and wheels shows the movement keys, stick_keys).
+enum Action { Cross, Circle, Square, Triangle, L1, R1, L2, R2, L3, R3, Options, Touchpad, RotCcw, RotCw, Actions };
 constexpr const char* action_names[Actions] = {"cross", "circle", "square", "triangle",
                                                "l1",    "r1",     "l2",     "r2",
-                                               "l3",    "r3",     "options", "touchpad"};
+                                               "l3",    "r3",     "options", "touchpad",
+                                               "rotate_ccw", "rotate_cw"};
 constexpr const char* action_defaults[Actions] = {"Space", "C", "F", "E", "Q", "G", "Mouse Right",
-                                                  "Mouse Left", "Left Shift", "V", "Escape", "Tab"};
+                                                  "Mouse Left", "Left Shift", "V", "Escape", "Tab",
+                                                  "R", "T"};
 enum Icon { Move = Actions, Look };
 // The d-pad pictures: DPad plus the lit directions.
 enum : u8 { DPad = 16, LitUp = 1, LitDown = 2, LitLeft = 4, LitRight = 8 };
@@ -90,6 +94,9 @@ enum Shape : u8 {
     Puck,        ///< 512x512: a raised button seen from the side (tapping prompts)
     PressedPuck, ///< 512x512: the same button pressed down (hold prompts)
     HudDPad,     ///< 256x256: the weapon switch d-pad
+    Bumper,      ///< 256x256: L1 / R1, flat top, round bottom
+    LeftTrigger, ///< 256x256: L2, round top, the left side leaning out
+    RightTrigger, ///< 256x256: R2, the same mirrored
 };
 struct Picture {
     u64 hash;
@@ -102,12 +109,62 @@ struct Picture {
 const Picture pictures[] = {
     {0x5db884aa1bae54f9ull, 256, RoundButton, Triangle, {55, 216, 104}, "Uncharted 2 triangle prompt"},
     {0x7af1abf688d8c824ull, 256, RoundButton, Circle, {230, 58, 35}, "Uncharted 2 circle prompt"},
+    {0x9edd4f2f0f64f6e5ull, 256, RoundButton, Square, {243, 160, 155}, "Uncharted 2 square prompt"},
+    // The rest of the big prompts of art/general/hud/buttons (hud.pak; the same pictures in Uncharted 1).
+    {0x2bf5d90eb864162full, 256, RoundButton, Cross, {136, 149, 238}, "Uncharted 2 cross prompt"},
+    {0xb88838d137123548ull, 256, Bumper, L1, {197, 170, 131}, "Uncharted 2 L1 prompt"},
+    {0x4999c8b20a45cd6dull, 256, Bumper, R1, {197, 170, 131}, "Uncharted 2 R1 prompt"},
+    {0x539b560401a1ac83ull, 256, LeftTrigger, L2, {197, 170, 131}, "Uncharted 2 L2 prompt"},
+    {0xe2c351d65c6a63f1ull, 256, RightTrigger, R2, {197, 170, 131}, "Uncharted 2 R2 prompt"},
+    // Uncharted 3's own encodings of the same pictures (the triangle, circle and square are shared).
+    {0x305c2c731ec227e6ull, 256, RoundButton, Cross, {136, 149, 238}, "Uncharted 3 cross prompt"},
+    {0x6c3fc301ede4114aull, 256, Bumper, L1, {199, 172, 136}, "Uncharted 3 L1 prompt"},
+    {0xbd74a617a879f120ull, 256, Bumper, R1, {199, 172, 136}, "Uncharted 3 R1 prompt"},
+    {0x2e8ae3386e2a91ddull, 256, LeftTrigger, L2, {199, 172, 136}, "Uncharted 3 L2 prompt"},
+    {0x784278339a5a55bfull, 256, RightTrigger, R2, {199, 172, 136}, "Uncharted 3 R2 prompt"},
+    {0x07ff3d0e4090be85ull, 512, Puck, Triangle, {54, 215, 103}, "Uncharted 3 triangle tapping prompt"},
+    {0x4181f3ae6bd1efffull, 512, PressedPuck, Triangle, {54, 215, 103},
+     "Uncharted 3 triangle hold prompt"},
+    {0x668cf3cc04ab6963ull, 512, Puck, Square, {255, 158, 158}, "Uncharted 3 square tapping prompt"},
+    {0x1b7e089f40b3bb21ull, 512, PressedPuck, Square, {255, 158, 158}, "Uncharted 3 square hold prompt"},
     {0x25d954ce23a8f5e2ull, 512, Puck, Triangle, {55, 216, 104}, "Uncharted 2 triangle tapping prompt"},
     {0xc96e34fbb203279eull, 512, PressedPuck, Triangle, {55, 216, 104},
      "Uncharted 2 triangle hold prompt"},
     {0x705083db743dd2f9ull, 256, HudDPad, LitUp, {206, 185, 156}, "Uncharted 2 weapon d-pad"},
     {0x94d741f6b51815eeull, 512, Puck, Circle, {222, 32, 32}, "Uncharted 3 circle tapping prompt"},
     {0x93b46ba81469882cull, 512, PressedPuck, Circle, {222, 32, 32}, "Uncharted 3 circle hold prompt"},
+};
+
+// The "turn the left stick in circles" prompt (valves and wheels): the ring with its arrows over a
+// stick cap that tips around in its socket, one 256x512 picture per frame and a BC1 colour picture
+// plus a BC4 mask (the alpha) for each, stored upside down and 1D-tiled. art/general/textures/hud/
+// buttons Rotate-Analog-FRAME1..4 turn counter-clockwise, Rotate-Reverse-FRAME1..4 clockwise (the
+// same pictures mirrored). For the keyboard every frame becomes one still picture: the game's ring
+// with its arrows, and in place of the stick and its socket the keys of the stick_keys actions.
+struct StickFrame {
+    u64 hash;
+    bool clockwise;
+    bool mask; ///< the BC4 mask, else the BC1 colour picture
+    const char* name;
+};
+constexpr u32 stick_width = 256, stick_height = 512;
+const StickFrame stick_frames[] = {
+    {0x62ce1cf45bcd3fa6ull, false, false, "Uncharted 1 stick prompt, frame 1"},
+    {0x7515a2f4f6a1022dull, false, false, "Uncharted 1 stick prompt, frame 2"},
+    {0x349208a673329cceull, false, false, "Uncharted 1 stick prompt, frame 3"},
+    {0x8d9e67192111aafbull, false, false, "Uncharted 1 stick prompt, frame 4"},
+    {0x071de85cc9f9b927ull, false, true, "Uncharted 1 stick prompt mask, frame 1"},
+    {0xa88cacd63b4d3120ull, false, true, "Uncharted 1 stick prompt mask, frame 2"},
+    {0x1b6fd491c8e2509dull, false, true, "Uncharted 1 stick prompt mask, frame 3"},
+    {0xfd2317b11bf49f10ull, false, true, "Uncharted 1 stick prompt mask, frame 4"},
+    {0xc40e867f01db15daull, true, false, "Uncharted 1 clockwise stick prompt, frame 1"},
+    {0x520ae52d155398d0ull, true, false, "Uncharted 1 clockwise stick prompt, frame 2"},
+    {0xc79c5d399daa5371ull, true, false, "Uncharted 1 clockwise stick prompt, frame 3"},
+    {0xde307a2c8adf213full, true, false, "Uncharted 1 clockwise stick prompt, frame 4"},
+    {0xfa2b05a934e43c38ull, true, true, "Uncharted 1 clockwise stick prompt mask, frame 1"},
+    {0x6517c5ecd522ad7full, true, true, "Uncharted 1 clockwise stick prompt mask, frame 2"},
+    {0xc4c6e4617bc4ed1dull, true, true, "Uncharted 1 clockwise stick prompt mask, frame 3"},
+    {0xdd5680fbf43710c7ull, true, true, "Uncharted 1 clockwise stick prompt mask, frame 4"},
 };
 
 struct Bindings {
@@ -284,7 +341,7 @@ public:
 
     /// Draws `text` (UTF-8) centred on (cx, cy), as large as fits `max_width` up to `size` px.
     void Draw(Canvas& c, const std::string& text, float cx, float cy, float max_width,
-              float size) const {
+              float size, Color color = text_color) const {
         if (!ok) {
             return;
         }
@@ -312,7 +369,7 @@ public:
                 for (int x = 0; x < w; ++x) {
                     // Slightly bold: each pixel also takes its left neighbour's coverage.
                     const float a = std::max(bitmap[y * w + x], x ? bitmap[y * w + x - 1] : u8(0));
-                    c.Blend(left + x, top + y, text_color, a / 255.0f);
+                    c.Blend(left + x, top + y, color, a / 255.0f);
                 }
             }
             stbtt_FreeBitmap(bitmap, nullptr);
@@ -735,6 +792,52 @@ void DrawRoundButton(Canvas& up, const Font& font, const std::string& key, int x
     DrawLabel(up, font, key, cx, cy, 2 * radius - 34.0f, 80.0f, 1.0f);
 }
 
+/// A shoulder button prompt (L1/R1 bumper, L2/R2 trigger) as a key: dark face, light rim, the
+/// bound key. The outlines are measured on the game's pictures (upright); its masks cut them out.
+void DrawShoulder(Canvas& up, const Font& font, const std::string& key, u8 shape, int xbox = -1) {
+    const bool bumper = shape == Bumper;
+    const bool mirror = shape == RightTrigger;
+    // Approximate signed distance from the outline (negative inside).
+    const auto distance = [&](float x, float y) {
+        if (bumper) {
+            const float cx = 127.5f, half = 83.0f, top = 76.0f, mid = 112.0f, ry = 62.0f;
+            if (y <= mid) {
+                return RoundedRect(x, y, cx, mid, half, mid - top, 10.0f);
+            }
+            const float ex = (x - cx) / half, ey = (y - mid) / ry;
+            return (std::sqrt(ex * ex + ey * ey) - 1.0f) * ry;
+        }
+        if (mirror) {
+            x = 257.0f - x;
+        }
+        // L2: the left side leans out, the right side nearly upright, round top, flat bottom.
+        const float left = (66.0f - 0.275f * (y - 112.0f) - x) / 1.0371f;
+        const float right = (x - 192.0f - 0.075f * (y - 112.0f)) / 1.0028f;
+        float d = std::max({left, right, y - 202.0f});
+        if (y < 114.25f) {
+            d = std::max(d, std::hypot(x - 129.0f, y - 114.25f) - 62.25f);
+        }
+        return d;
+    };
+    const float top = bumper ? 76.0f : 52.0f, bottom = bumper ? 174.0f : 202.0f;
+    for (u32 y = 0; y < up.height; ++y) {
+        for (u32 x = 0; x < up.width; ++x) {
+            const float d = distance(x + 0.5f, y + 0.5f);
+            up.Blend(x, y, {0.03f, 0.03f, 0.03f}, Coverage(d));
+            const float t = std::clamp((y + 0.5f - top) / (bottom - top), 0.0f, 1.0f);
+            up.Blend(x, y, Mix(cap_top, cap_bottom, t), Coverage(d + 5.0f));
+            up.Blend(x, y, rim, 0.8f * std::min(Coverage(d + 9.0f), 1.0f - Coverage(d + 12.0f)));
+        }
+    }
+    const float cx = bumper ? 127.5f : mirror ? 128.0f : 129.0f, cy = bumper ? 118.0f : 136.0f;
+    const float width = bumper ? 116.0f : 96.0f, height = bumper ? 60.0f : 90.0f;
+    if (xbox >= 0) {
+        DrawGlyphFit(up, xbox, cx, cy, width, height, 1.0f, false);
+        return;
+    }
+    DrawLabel(up, font, key, cx, cy, width, std::min(height, 72.0f), 1.0f);
+}
+
 /// The tapping prompt's raised button (a puck seen from above at an angle) or the hold prompt's
 /// pressed one, as a key with the label lying on its face.
 void DrawPuck(Canvas& up, const Font& font, const std::string& key, bool pressed, int xbox = -1) {
@@ -826,6 +929,11 @@ std::vector<Patch> BuildPicture(const Picture& picture, u32 levels, Style style)
     case Puck:
     case PressedPuck:
         DrawPuck(up, font, bindings.keys[picture.icon], picture.shape == PressedPuck, xbox);
+        break;
+    case Bumper:
+    case LeftTrigger:
+    case RightTrigger:
+        DrawShoulder(up, font, bindings.keys[picture.icon], picture.shape, xbox);
         break;
     case HudDPad:
         if (style == Style::Xbox) {
@@ -1021,6 +1129,230 @@ std::vector<Patch> Build(const Sheet& sheet, u32 levels, Style style) {
     return patches;
 }
 
+/// The keys the stick prompt shows, side by side, as indices in Bindings::move (ls_left, ls_right):
+/// wheels and valves turn with the movement keys. For the rotate keys instead, draw
+/// bindings.keys[RotCcw] / [RotCw] in BuildStick.
+constexpr int stick_keys[2] = {1, 3};
+
+/// Mip 0 of a 1D-tiled picture of 8-byte blocks (BC1, BC4) as rows of blocks: 8x8 block micro
+/// tiles of 512 bytes in rows, the blocks inside in the thin micro tile order.
+std::vector<u8> DetileBlocks(const u8* tiled, u32 bw, u32 bh) {
+    std::vector<u8> out(size_t(bw) * bh * 8);
+    for (u32 y = 0; y < bh; ++y) {
+        for (u32 x = 0; x < bw; ++x) {
+            const u32 micro = (x & 1) | ((y & 1) << 1) | ((x & 2) << 1) | ((y & 2) << 2) |
+                              ((x & 4) << 2) | ((y & 4) << 3);
+            const size_t from = (size_t(y / 8) * (bw / 8) + x / 8) * 512 + micro * 8;
+            std::memcpy(&out[(size_t(y) * bw + x) * 8], tiled + from, 8);
+        }
+    }
+    return out;
+}
+
+/// A BC1 (colour) or BC4 (the value in r, g and b) picture as an opaque canvas, flipped upright.
+Canvas DecodeUpright(const std::vector<u8>& blocks, u32 w, u32 h, bool bc4) {
+    Canvas c{w, h};
+    for (u32 by = 0; by < h / 4; ++by) {
+        for (u32 bx = 0; bx < w / 4; ++bx) {
+            const u8* b = &blocks[(size_t(by) * (w / 4) + bx) * 8];
+            float pal[8][3]{};
+            u64 bits = 0;
+            int shift = 0;
+            if (bc4) {
+                const float a0 = b[0] / 255.0f, a1 = b[1] / 255.0f;
+                pal[0][0] = a0, pal[1][0] = a1;
+                for (int i = 2; i < 8; ++i) {
+                    pal[i][0] = b[0] > b[1] ? ((8 - i) * a0 + (i - 1) * a1) / 7.0f
+                                : i < 6     ? ((6 - i) * a0 + (i - 1) * a1) / 5.0f
+                                            : (i == 6 ? 0.0f : 1.0f);
+                }
+                for (auto& p : pal) {
+                    p[1] = p[2] = p[0];
+                }
+                for (int k = 0; k < 6; ++k) {
+                    bits |= u64(b[2 + k]) << (8 * k);
+                }
+                shift = 3;
+            } else {
+                const u16 c0 = u16(b[0] | b[1] << 8), c1 = u16(b[2] | b[3] << 8);
+                const Color e0 = Expand565(c0), e1 = Expand565(c1);
+                const float ends[2][3] = {{e0.r, e0.g, e0.b}, {e1.r, e1.g, e1.b}};
+                for (int k = 0; k < 3; ++k) {
+                    pal[0][k] = ends[0][k], pal[1][k] = ends[1][k];
+                    pal[2][k] = c0 > c1 ? (2 * ends[0][k] + ends[1][k]) / 3 : (ends[0][k] + ends[1][k]) / 2;
+                    pal[3][k] = c0 > c1 ? (ends[0][k] + 2 * ends[1][k]) / 3 : 0.0f;
+                }
+                bits = u64(b[4]) | u64(b[5]) << 8 | u64(b[6]) << 16 | u64(b[7]) << 24;
+                shift = 2;
+            }
+            for (u32 i = 0; i < 16; ++i) {
+                const u32 index = u32(bits >> (shift * i)) & ((1u << shift) - 1);
+                const u32 x = bx * 4 + i % 4, y = h - 1 - (by * 4 + i / 4);
+                float* p = &c.px[(size_t(y) * w + x) * 4];
+                p[0] = pal[index][0], p[1] = pal[index][1], p[2] = pal[index][2], p[3] = 1.0f;
+            }
+        }
+    }
+    return c;
+}
+
+/// BC4 blocks of a canvas's red channel: each block's range as end points (a0 > a1, 8 levels).
+std::vector<u8> EncodeBc4(const Canvas& c) {
+    const u32 bw = (c.width + 3) / 4, bh = (c.height + 3) / 4;
+    std::vector<u8> out(size_t(bw) * bh * 8);
+    for (u32 by = 0; by < bh; ++by) {
+        for (u32 bx = 0; bx < bw; ++bx) {
+            int v[16];
+            int lo = 255, hi = 0;
+            for (u32 i = 0; i < 16; ++i) {
+                const u32 x = std::min(bx * 4 + i % 4, c.width - 1);
+                const u32 y = std::min(by * 4 + i / 4, c.height - 1);
+                v[i] = int(std::lround(std::clamp(c.px[(size_t(y) * c.width + x) * 4], 0.0f, 1.0f) * 255.0f));
+                lo = std::min(lo, v[i]), hi = std::max(hi, v[i]);
+            }
+            if (hi == lo) {
+                // Keep a0 > a1 (the 8-level mode); the value is then one of the two end points.
+                hi == 255 ? --lo : ++hi;
+            }
+            u64 bits = 0;
+            for (u32 i = 0; i < 16; ++i) {
+                // The step 0..7 from hi to lo, as a BC4 index (0 = hi, 1 = lo, 2..7 between).
+                const int step = int(std::lround(float(hi - v[i]) * 7.0f / float(hi - lo)));
+                const int index = step == 0 ? 0 : step == 7 ? 1 : step + 1;
+                bits |= u64(index) << (3 * i);
+            }
+            u8* block = &out[(size_t(by) * bw + bx) * 8];
+            block[0] = u8(hi), block[1] = u8(lo);
+            for (int k = 0; k < 6; ++k) {
+                block[2 + k] = u8(bits >> (8 * k));
+            }
+        }
+    }
+    return out;
+}
+
+/// The glow around the solid parts of the stick prompt's mask, by distance in px from them (1 to
+/// 17), as a share of the solid value; measured on the game's ring.
+constexpr float stick_glow[17] = {0.90f, 0.73f, 0.55f, 0.42f, 0.37f, 0.33f, 0.30f, 0.27f, 0.23f,
+                                  0.21f, 0.18f, 0.16f, 0.13f, 0.11f, 0.10f, 0.08f, 0.06f};
+float StickGlow(float distance) {
+    if (distance <= 1.0f) {
+        return 1.0f + (stick_glow[0] - 1.0f) * std::max(distance, 0.0f);
+    }
+    if (distance >= 17.0f) {
+        return std::max(0.0f, stick_glow[16] * (18.0f - distance));
+    }
+    const int i = int(distance) - 1;
+    const float t = distance - std::floor(distance);
+    return stick_glow[i] + (stick_glow[i + 1] - stick_glow[i]) * t;
+}
+
+/// One stick prompt frame as the still keyboard picture (all mip levels): the game's ring with
+/// its arrows from this frame (the same in every frame above upright row 236; below it the stick's
+/// glow joins the ring's, so the ring's own glow is redrawn there), and the keys in place of the
+/// stick and its socket.
+std::vector<Patch> BuildStick(const StickFrame& frame, u32 levels, const u8* guest) {
+    const Bindings bindings = LoadBindings();
+    const Font font;
+    constexpr u32 w = stick_width, h = stick_height;
+    // Upright rows: the stick's glow starts at 236, the ring ends at 258, the stick starts at 260.
+    constexpr int glow_from = 236, blend_to = 246, ring_end = 258, stick_from = 260;
+    Canvas up = DecodeUpright(DetileBlocks(guest, w / 4, h / 4), w, h, frame.mask);
+    // The two keys (upright): 96 px squares, 14 px apart, where the stick was.
+    constexpr float key = 96.0f, gap = 14.0f, key_top = 292.0f;
+    const Slot slots[2] = {
+        {u16(128.0f - gap / 2 - key), u16(key_top), u16(128.0f - gap / 2), u16(key_top + key), 0},
+        {u16(128.0f + gap / 2), u16(key_top), u16(128.0f + gap / 2 + key), u16(key_top + key), 0},
+    };
+    // The distance from the keys' outline (DrawKey's shape), negative inside.
+    const auto key_distance = [&](float x, float y) {
+        float d = 1e9f;
+        for (const Slot& s : slots) {
+            const float x0 = s.x0 + 2.0f, y0 = s.y0 + 2.0f, x1 = s.x1 - 2.0f, y1 = s.y1 - 2.0f;
+            d = std::min(d, RoundedRect(x, y, (x0 + x1) * 0.5f, (y0 + y1) * 0.5f, (x1 - x0) * 0.5f,
+                                        (y1 - y0) * 0.5f, std::min(x1 - x0, y1 - y0) * 0.22f));
+        }
+        return d;
+    };
+    if (frame.mask) {
+        // The ring's solid value (the clockwise set's mask peaks lower) and its solid pixels.
+        float peak = 0.0f;
+        for (int y = 150; y < glow_from; ++y) {
+            for (u32 x = 0; x < w; ++x) {
+                peak = std::max(peak, up.px[(size_t(y) * w + x) * 4]);
+            }
+        }
+        const float solid = peak * 0.95f;
+        std::vector<std::pair<int, int>> ring;
+        for (int y = glow_from - 20; y <= ring_end; ++y) {
+            for (u32 x = 0; x < w; ++x) {
+                if (up.px[(size_t(y) * w + x) * 4] >= solid) {
+                    ring.emplace_back(int(x), y);
+                }
+            }
+        }
+        for (int y = glow_from; y < int(h); ++y) {
+            for (u32 x = 0; x < w; ++x) {
+                float* p = &up.px[(size_t(y) * w + x) * 4];
+                float v = 0.0f;
+                if (y <= ring_end && p[0] >= solid) {
+                    v = p[0];
+                } else if (y < ring_end + 18) { // the ring's glow, the stick's gone
+                    float d2 = 18.0f * 18.0f;
+                    for (const auto& [rx, ry] : ring) {
+                        const float dx = float(rx) - float(x), dy = float(ry) - float(y);
+                        d2 = std::min(d2, dx * dx + dy * dy);
+                    }
+                    v = peak * StickGlow(std::sqrt(d2));
+                    if (y < blend_to) {
+                        const float t = float(y - glow_from) / float(blend_to - glow_from);
+                        v = p[0] * (1.0f - t) + v * t;
+                    }
+                }
+                // The keys, solid, with the same glow around them.
+                const float d = key_distance(x + 0.5f, y + 0.5f);
+                v = std::max(v, peak * (d <= 0.0f ? 1.0f : StickGlow(d)));
+                p[0] = p[1] = p[2] = v;
+            }
+        }
+    } else {
+        // The background (nothing is drawn in the top rows) where the stick was, then the keys.
+        float bg[3]{};
+        for (int y = 0; y < 100; ++y) {
+            for (u32 x = 0; x < w; ++x) {
+                for (int k = 0; k < 3; ++k) {
+                    bg[k] += up.px[(size_t(y) * w + x) * 4 + k] / (100.0f * w);
+                }
+            }
+        }
+        for (int y = stick_from; y < int(h); ++y) {
+            for (u32 x = 0; x < w; ++x) {
+                float* p = &up.px[(size_t(y) * w + x) * 4];
+                p[0] = bg[0], p[1] = bg[1], p[2] = bg[2];
+            }
+        }
+        for (int i = 0; i < 2; ++i) {
+            DrawBinding(up, font, slots[i], bindings.move[stick_keys[i]]);
+        }
+    }
+    // Upside down like the game's pictures.
+    Canvas level{w, h};
+    for (u32 y = 0; y < h; ++y) {
+        std::memcpy(&level.px[size_t(y) * w * 4], &up.px[size_t(h - 1 - y) * w * 4],
+                    w * 4 * sizeof(float));
+    }
+    std::vector<Patch> patches;
+    for (u32 mip = 0; mip < std::max(levels, 1u); ++mip) {
+        patches.push_back({mip, 0, 0, level.width, level.height,
+                           frame.mask ? EncodeBc4(level) : EncodeBc1(level)});
+        if (level.width == 1 && level.height == 1) {
+            break;
+        }
+        level = Downsample(level);
+    }
+    return patches;
+}
+
 } // namespace
 
 namespace {
@@ -1107,7 +1439,10 @@ bool Candidate(u32 width, u32 height, Format format) {
                 return true;
             }
         }
-        return false;
+        return width == stick_width && height == stick_height;
+    }
+    if (format == Format::Bc4) {
+        return width == stick_width && height == stick_height;
     }
     for (const Sheet& sheet : sheets) {
         if (sheet.width == width && sheet.height == height) {
@@ -1117,7 +1452,8 @@ bool Candidate(u32 width, u32 height, Format format) {
     return false;
 }
 
-const std::vector<Patch>* Find(u64 hash, u32 width, u32 height, u32 levels, Format format) {
+const std::vector<Patch>* Find(u64 hash, u32 width, u32 height, u32 levels, Format format,
+                               const u8* guest, size_t guest_size) {
     if (Forced() == Force::Off) {
         return nullptr;
     }
@@ -1144,13 +1480,27 @@ const std::vector<Patch>* Find(u64 hash, u32 width, u32 height, u32 levels, Form
         }
         return nullptr;
     };
+    const auto known_stick = [&]() -> const StickFrame* {
+        for (const StickFrame& frame : stick_frames) {
+            if (format == (frame.mask ? Format::Bc4 : Format::Bc1) && frame.hash == hash &&
+                width == stick_width && height == stick_height) {
+                return &frame;
+            }
+        }
+        return nullptr;
+    };
     const Sheet* sheet = known_sheet();
     const Picture* picture = sheet ? nullptr : known_picture();
-    if (!sheet && !picture) {
+    const StickFrame* stick = sheet || picture ? nullptr : known_stick();
+    if (!sheet && !picture && !stick) {
         return nullptr;
     }
-    if (style == Style::Original) {
-        return &original; // a known picture, shown as the game drew it
+    // A known picture is shown as the game drew it. The stick prompt stays the game's for Xbox
+    // controllers too (a left stick), and is built from the uploaded frame's data.
+    const size_t stick_size = size_t(stick_width / 4) * (stick_height / 4) * 8;
+    if (style == Style::Original ||
+        (stick && (style == Style::Xbox || !guest || guest_size < stick_size))) {
+        return &original;
     }
     const auto key = std::make_tuple(hash, levels, style);
     if (const auto it = built.find(key); it != built.end()) {
@@ -1161,6 +1511,12 @@ const std::vector<Patch>* Find(u64 hash, u32 width, u32 height, u32 levels, Form
         auto& patches = built[key] = Build(*sheet, levels, style);
         std::printf("Button prompts: %s button pictures drawn as %s (%zu pictures, %u mip levels)\n",
                     sheet->name, look, sheet->slots.size(), levels);
+        return &patches;
+    }
+    if (stick) {
+        auto& patches = built[key] = BuildStick(*stick, levels, guest);
+        std::printf("Button prompts: %s drawn as a still picture with the keys (%u mip levels)\n",
+                    stick->name, levels);
         return &patches;
     }
     auto& patches = built[key] = BuildPicture(*picture, levels, style);

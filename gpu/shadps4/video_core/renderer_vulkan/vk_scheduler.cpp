@@ -239,7 +239,8 @@ std::unique_ptr<RecordChunk> Scheduler::AcquireChunk() {
     return chunk;
 }
 
-void Scheduler::SignalAfterHostCopies(std::function<void()> signal, u64 landing_seq) {
+void Scheduler::SignalAfterHostCopies(std::function<void()> signal, u64 landing_seq,
+                                      bool off_recorder) {
     if (!IsRecordingDeferred()) {
         WaitHostCopies();
         if (VideoCore::LandingGate::Active()) {
@@ -251,16 +252,21 @@ void Scheduler::SignalAfterHostCopies(std::function<void()> signal, u64 landing_
     }
     BbCopy::FlushBatch();
     deferred_signals_issued.fetch_add(1, std::memory_order_relaxed);
-    Record([signal = std::move(signal), done = deferred_signals_done,
-            landing_seq](vk::CommandBuffer) mutable {
-        BbCopy::AfterCopies([signal = std::move(signal), done = std::move(done), landing_seq] {
+    Record([signal = std::move(signal), done = deferred_signals_done, landing_seq,
+            off_recorder](vk::CommandBuffer) mutable {
+        BbCopy::AfterCopies([signal = std::move(signal), done = std::move(done), landing_seq,
+                             off_recorder] {
             auto fire = [signal = std::move(signal), done = std::move(done)] {
                 signal();
                 done->fetch_add(1, std::memory_order_release);
             };
             // A signal behind deferred raycaster copies waits for them on the landing thread:
             // this thread must not block (submissions wait for the copy threads).
-            VideoCore::LandingGate::Run(landing_seq, std::move(fire));
+            if (off_recorder) {
+                VideoCore::LandingGate::Post(landing_seq, std::move(fire));
+            } else {
+                VideoCore::LandingGate::Run(landing_seq, std::move(fire));
+            }
         });
     });
     KickRecording(true);
@@ -310,14 +316,17 @@ void Scheduler::KickRecording(bool force) {
     if (full_chunks.empty() && record_chunk->Empty()) {
         return;
     }
+    // bbport: the replacement is taken before the current chunk is handed over, so record_chunk
+    // is never null (see RetireChunk). AcquireChunk() takes recorder_mutex itself.
+    std::unique_ptr<RecordChunk> next = record_chunk->Empty() ? nullptr : AcquireChunk();
     bool wake;
     {
         std::scoped_lock lk{recorder_mutex};
         for (auto& chunk : full_chunks) {
             recorder_queue.push_back(std::move(chunk));
         }
-        if (!record_chunk->Empty()) {
-            recorder_queue.push_back(std::move(record_chunk));
+        if (next) {
+            recorder_queue.push_back(std::exchange(record_chunk, std::move(next)));
         }
         wake = recorder_sleeping;
         queued_chunks.store(recorder_queue.size(), std::memory_order_release);

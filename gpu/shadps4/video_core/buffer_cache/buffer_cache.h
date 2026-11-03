@@ -123,11 +123,24 @@ public:
     /// gated false: the labels the guest sees do not wait for this landing (it lands once the GPU
     /// work is done, in order with the others). guest_part false: only the GPU-written bytes of [src, src + size) land (dst == src, no
     /// guest copy): a GPU result the guest reads in place (Rasterizer::ReadBackSmallWrittenBuffers).
-    bool DeferGuestCopy(VAddr src, VAddr dst, u64 size, bool guest_part = true, bool gated = true);
+    /// writer (guest_part false, nonzero): the compute shader that wrote the result. Its landings
+    /// then check whether the guest rewrote the bytes between landings, and a shader whose results
+    /// the guest keeps rewriting is learned (SmallWriterLearned).
+    /// bbport: whether DeferGuestCopy can take a raycaster copy of this range (its checks that don't
+    /// depend on the arena), so callers that rely on the deferral can fall back in time.
+    [[nodiscard]] bool CanDeferGuestCopy(VAddr src, VAddr dst, u64 size) const;
+    bool DeferGuestCopy(VAddr src, VAddr dst, u64 size, bool guest_part = true, bool gated = true,
+                        u64 writer = 0);
+    /// bbport: whether the guest was seen rewriting the small results of compute shader `writer`
+    /// between their landings (it resets or refills them for the next pass and reads the GPU's
+    /// answer after the end-of-pipe label): those results must land before the label shows
+    /// (Rasterizer::ReadBackSmallWrittenBuffers gates them). Any thread.
+    bool SmallWriterLearned(u64 writer) const;
     u64 PendingLanding() const;
     bool LandingGateActive() const;
     void WaitLanding(u64 seq);
-    void RunAfterLanding(u64 seq, std::function<void()> fn);
+    /// `off_caller`: never runs `fn` on the calling thread (LandingGate::Post).
+    void RunAfterLanding(u64 seq, std::function<void()> fn, bool off_caller = false);
     /// Ends the landing thread: nothing more is deferred, every wait on it lets go, what is
     /// pending is dropped (~BufferCache; idempotent).
     void StopLanding();
@@ -287,6 +300,10 @@ private:
     struct SideQueue;
     std::unique_ptr<SideQueue> side_queue;
     bool DownloadOnSideQueue(VAddr page, u64 length);
+    /// bbport: the same read back for a guest thread's write fault on GPU data whose writes are
+    /// submitted, made on the faulting thread instead of the GPU command thread (BB_GPU_MERGE=0).
+    /// False when it cannot be done there (the GPU command thread's path then settles it).
+    bool ReadBackOnFaultThread(VAddr device_addr, u64 size);
 
     /// bbport: deferred raycaster copies (DeferGuestCopy).
     struct Landing;

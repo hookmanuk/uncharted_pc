@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: Copyright 2024-2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <algorithm>
 #include <cstdlib>
 #include <xxhash.h>
 
@@ -14,6 +15,7 @@
 #include "core/memory.h"
 #include "video_core/buffer_cache/buffer_cache.h"
 #include "video_core/page_manager.h"
+#include "video_core/renderer_vulkan/liverpool_to_vk.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_vram.h"
 #include <vk_mem_alloc.h>
@@ -69,10 +71,34 @@ TextureCache::TextureCache(const Vulkan::Instance& instance_, Vulkan::Scheduler&
     critical_gc_memory = static_cast<u64>(
         std::max<u64>(std::min(device_local_memory - min_vacancy_critical, min_spacing_critical),
                       DEFAULT_CRITICAL_GC_MEMORY));
+    // bbport (from the Bloodborne port): below 8 GB the pressure mark was 40% of the budget
+    // (2.5 GB on an 8 GB laptop card), under what the game holds outside textures: such cards
+    // were under pressure all session, evicting textures unused for 5 s and uploading them
+    // again. 60% (BB_GC_PRESSURE_PERCENT) leaves the textures of an area room first.
+    if (device_local_memory < TARGET_GC_THRESHOLD) {
+        static const s64 percent = [] {
+            const char* env = std::getenv("BB_GC_PRESSURE_PERCENT");
+            return std::clamp<s64>(env ? std::strtoll(env, nullptr, 10) : 60, 10, 75);
+        }();
+        pressure_gc_memory = std::max<u64>(pressure_gc_memory,
+                                           static_cast<u64>(device_local_memory / 100 * percent));
+    }
     trigger_gc_memory = static_cast<u64>((device_local_memory - mem_threshold) / 2);
+    base_trigger_gc_memory = trigger_gc_memory;
+    base_pressure_gc_memory = pressure_gc_memory;
+    base_critical_gc_memory = critical_gc_memory;
+    // bbport: the marks in the log, so a player's log tells where eviction starts on that card.
+    std::printf("Texture cache: VRAM budget %lld MiB; marks: collect %llu, pressure %llu, critical %llu MiB\n",
+                static_cast<long long>(device_local_memory >> 20),
+                static_cast<unsigned long long>(trigger_gc_memory >> 20),
+                static_cast<unsigned long long>(pressure_gc_memory >> 20),
+                static_cast<unsigned long long>(critical_gc_memory >> 20));
 }
 
-TextureCache::~TextureCache() = default;
+TextureCache::~TextureCache() {
+    // bbport: the Vulkan images kept for reuse (UniqueImage::Recycle) belong to no image.
+    UniqueImage::ReleaseRecycled();
+}
 
 void TextureCache::ProcessDownloadImages() {
     std::unique_lock lk{download_images_mutex};
@@ -212,6 +238,11 @@ void TextureCache::UnmapMemory(VAddr cpu_addr, size_t size) {
         // TODO: Download image data back to host.
         FreeImage(id);
     }
+    // bbport: unmapped memory holds no depth array any more (PadDepthLayers).
+    for (auto it = depth_array_layers.begin(); it != depth_array_layers.end();) {
+        it = it->first >= cpu_addr && it->first < cpu_addr + size ? depth_array_layers.erase(it)
+                                                                  : std::next(it);
+    }
 }
 
 /// bbport: U3 keeps its shadow maps as one depth array (16 layers, one per light) at a fixed address
@@ -220,22 +251,52 @@ void TextureCache::UnmapMemory(VAddr cpu_addr, size_t size) {
 /// that frame (ten times in a frame): the layers drawn before were lost, so those lights lost their
 /// shadow maps (the flashlight's light vanished for a frame, then came back in blocky tiles).
 /// A depth image made at an address that has held a deeper array gets all those layers at once; the
-/// game draws each layer again every frame. BB_DEPTH_ARRAY_PAD=0: off.
+/// game draws each layer again every frame.
 /// (Mevlock 670bf18.)
-void TextureCache::PadDepthLayers(ImageInfo& info) {
-    static const bool pad = [] {
+/// bbport: the padded image stays within the memory the depth images at that address have
+/// covered. Padded by layer count alone, a 4096x4096 depth target at the address of U3's shadow
+/// array in the London pub became 8 layers, 512 MiB over memory the game's CPU code writes every
+/// frame: each frame's write made the texture cache hash all of it again (~10 GB a second, the
+/// draw recording thread busy at 20 FPS). The memory seen only covers what was requested, though:
+/// the first 1280 request after the array ran at 1024 (16 layers of 1024: 64 MiB seen, 16 of
+/// 1280: 100 MiB) would not be padded and the flashlight dropout above came back for that frame.
+/// So a layer up to twice the size of a layer of the deepest array seen there is padded too
+/// (1280 over 1024: 1.56x); the London target (16x) is not. What is recorded is what the game
+/// requested (`requested`), never a padded or merged size, so the cap does not lift itself.
+/// BB_DEPTH_ARRAY_PAD: 0 = no padding, 2 = padding by layer count alone (uncapped, as before
+/// the cap), unset or anything else = capped as above.
+void TextureCache::PadDepthLayers(ImageInfo& info, const ImageInfo* requested) {
+    static const int mode = [] {
         const char* env = std::getenv("BB_DEPTH_ARRAY_PAD");
-        return !(env && env[0] == '0');
+        if (env && env[0] == '0') {
+            return 0;
+        }
+        return env && env[0] == '2' ? 2 : 1;
     }();
-    if (!pad || !info.props.is_depth) {
+    if (mode == 0 || !info.props.is_depth) {
         return;
     }
+    const ImageInfo& asked = requested ? *requested : info;
+    const u32 asked_layers = std::max(asked.resources.layers, 1u);
+    const u64 asked_bytes = asked.guest_size;
+    const u64 asked_layer_bytes = asked_bytes / asked_layers;
     auto& seen = depth_array_layers[info.guest_address];
-    if (info.resources.layers > seen) {
-        seen = info.resources.layers;
-    } else if (seen > info.resources.layers && seen > 1) {
-        info.resources.layers = seen;
-        info.UpdateSize();
+    seen.bytes = std::max<u64>(seen.bytes, asked_bytes);
+    if (asked_layers > seen.layers) {
+        seen.layers = asked_layers;
+        seen.layer_bytes = asked_layer_bytes;
+    } else if (asked_layers == seen.layers) {
+        seen.layer_bytes = std::max(seen.layer_bytes, asked_layer_bytes);
+    }
+    if (seen.layers > info.resources.layers && seen.layers > 1) {
+        auto padded = info;
+        padded.resources.layers = seen.layers;
+        padded.UpdateSize();
+        const u64 layer_bytes = info.guest_size / std::max(info.resources.layers, 1u);
+        if (mode == 2 || padded.guest_size <= seen.bytes ||
+            layer_bytes <= 2 * seen.layer_bytes) {
+            info = padded;
+        }
     }
 }
 
@@ -288,13 +349,25 @@ ImageId TextureCache::ResolveDepthOverlap(const ImageInfo& requested_info, Bindi
         auto new_info = requested_info;
         new_info.resources = std::max(requested_info.resources, cache_image.info.resources);
         new_info.UpdateSize();
-        PadDepthLayers(new_info);
+        PadDepthLayers(new_info, &requested_info);
+        // bbport: the copy below overwrites all of an image of the same size and resources, so it
+        // may take the Vulkan image of one freed here before (UniqueImage::Recycle).
+        std::optional<UniqueImage::ReuseScope> reuse;
+        if (new_info.size == cache_image.info.size &&
+            new_info.resources == cache_image.info.resources) {
+            reuse.emplace();
+        }
         const auto new_image_id = slot_images.insert(instance, runtime, slot_image_views, new_info);
+        reuse.reset();
         RegisterImage(new_image_id);
+
+        // insert() may have grown slot_images and moved every image: `cache_image` would then
+        // point at freed storage, so look it up again.
+        auto& old_image = slot_images[cache_image_id];
 
         // Inherit image usage
         auto& new_image = slot_images[new_image_id];
-        new_image.usage = cache_image.usage;
+        new_image.usage = old_image.usage;
         new_image.flags &= ~ImageFlagBits::Dirty;
         // When creating a depth buffer through overlap resolution don't clear it on first use.
         new_image.info.meta_info.htile_clear_mask = 0;
@@ -304,18 +377,19 @@ ImageId TextureCache::ResolveDepthOverlap(const ImageInfo& requested_info, Bindi
         // light shadow array a layer at a time (512x512 x 48 above 1080p), so the cubes in layers
         // 12 and up kept a depth of 0 and shadowed everything (the hand torch lit a trapezoid).
         // (Mevlock 397eefb.)
-        const VAddr old_htile = cache_image.info.meta_info.htile_addr;
+        const VAddr old_htile = old_image.info.meta_info.htile_addr;
         if (old_htile && (!new_image.info.meta_info.htile_addr ||
                           new_image.info.meta_info.htile_addr == old_htile)) {
             new_image.info.meta_info.htile_addr = old_htile;
-            cache_image.info.meta_info.htile_addr = 0;
+            old_image.info.meta_info.htile_addr = 0;
             if (const auto it = surface_metas.find(old_htile); it != surface_metas.end()) {
                 it.value().owner = new_image_id;
             }
         }
-        runtime.CopyColorAndDepth(&cache_image, &new_image);
+        runtime.CopyColorAndDepth(&old_image, &new_image);
 
         // Free the cache image.
+        old_image.recycle_on_delete = true;
         FreeImage(cache_image_id);
         return new_image_id;
     }
@@ -656,17 +730,36 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_fmt) {
     int view_mip{-1};
     int view_slice{-1};
     if (!image_id) {
+        // bbport (after zorde23's port, UC_OVERLAP_KEEP_VIEW, 28e1280c): a later image in the
+        // region that only overlaps by chance (it gives back the image already found, or none)
+        // no longer drops the mip/slice found for that image. A target at the address of a mip
+        // (U3 bloom mips 1 and 2) resolved to mip 0 of its image whenever an unrelated image (a
+        // 512x512 table) shared the region after it: the mip was drawn into the corner of mip 0
+        // and the real mip kept an old frame (bloom blotches, depending on the render size).
+        // BB_OVERLAP_KEEP_VIEW=0: off.
+        static const bool keep_view = [] {
+            const char* env = std::getenv("BB_OVERLAP_KEEP_VIEW");
+            return !(env && env[0] == '0');
+        }();
         for (const auto& cache_id : image_ids) {
+            const ImageId found_id = image_id;
+            const int found_mip = view_mip, found_slice = view_slice;
             view_mip = -1;
             view_slice = -1;
 
-            const auto& merged_info = image_id ? slot_images[image_id].info : info;
+            // bbport: a copy, not a reference into slot_images: ResolveOverlap can insert an
+            // image (ExpandImage, ResolveDepthOverlap) and that moves every image when it grows.
+            const ImageInfo merged_info = image_id ? slot_images[image_id].info : info;
             auto [overlap_image_id, overlap_view_mip, overlap_view_slice] =
                 ResolveOverlap(merged_info, desc.type, cache_id, image_id);
             if (overlap_image_id) {
                 image_id = overlap_image_id;
                 view_mip = overlap_view_mip;
                 view_slice = overlap_view_slice;
+            }
+            if (keep_view && found_id && image_id == found_id && view_mip < 0 && view_slice < 0) {
+                view_mip = found_mip;
+                view_slice = found_slice;
             }
         }
     }
@@ -676,7 +769,7 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_fmt) {
         if (exact_fmt && info.pixel_format != image_resolved.info.pixel_format) {
             // Cannot reuse this image as we need the exact requested format.
             image_id = {};
-        } else if (image_resolved.info.resources < info.resources) {
+        } else if (!image_resolved.info.resources.CanContain(info.resources)) {
             // The image was clearly picked up wrong.
             FreeImage(image_id);
             image_id = {};
@@ -835,12 +928,16 @@ ImageView& TextureCache::FindDepthTarget(ImageId image_id, const ImageDesc& desc
     // If there is a stencil attachment, link depth and stencil.
     if (desc.info.stencil_addr != 0) {
         ImageId stencil_id{};
-        ForEachImageInRegion(desc.info.stencil_addr, desc.info.stencil_size,
-                             [&](ImageId image_id, Image& image) {
-                                 if (image.info.guest_address == desc.info.stencil_addr) {
-                                     stencil_id = image_id;
-                                 }
-                             });
+        ForEachImageInRegion(
+            desc.info.stencil_addr, desc.info.stencil_size, [&](ImageId image_id, Image& image) {
+                if (image.info.guest_address != desc.info.stencil_addr) {
+                    return;
+                }
+                if (image.info.pixel_format == vk::Format::eUndefined ||
+                    Vulkan::LiverpoolToVK::IsFormatStencilCompatible(image.info.pixel_format)) {
+                    stencil_id = image_id;
+                }
+            });
         if (!stencil_id) {
             ImageInfo info{};
             info.guest_address = desc.info.stencil_addr;
@@ -851,10 +948,12 @@ ImageView& TextureCache::FindDepthTarget(ImageId image_id, const ImageDesc& desc
         }
         Image& stencil_image = slot_images[stencil_id];
         TouchImage(stencil_image);
-        stencil_image.AssociateDepth(image_id, image.image_uid);
+        // insert() above may have grown slot_images and moved every image, leaving `image`
+        // pointing at freed storage: look the depth image up again.
+        stencil_image.AssociateDepth(image_id, slot_images[image_id].image_uid);
     }
 
-    return image.FindView(desc.view_info, false);
+    return slot_images[image_id].FindView(desc.view_info, false);
 }
 
 namespace {
@@ -881,6 +980,9 @@ void ReplaceButtonPrompts(Vulkan::Runtime& runtime, Image& image) {
     case vk::Format::eBc1RgbSrgbBlock:
         format = ButtonPrompts::Format::Bc1;
         break;
+    case vk::Format::eBc4UnormBlock:
+        format = ButtonPrompts::Format::Bc4;
+        break;
     default:
         return;
     }
@@ -891,7 +993,8 @@ void ReplaceButtonPrompts(Vulkan::Runtime& runtime, Image& image) {
     }
     const u8* guest = std::bit_cast<const u8*>(info.guest_address) + mip.offset;
     const auto* patches = ButtonPrompts::Find(XXH3_64bits(guest, mip.size), info.size.width,
-                                              info.size.height, info.resources.levels, format);
+                                              info.size.height, info.resources.levels, format,
+                                              guest, mip.size);
     if (!patches) {
         return;
     }
@@ -1205,8 +1308,21 @@ void TextureCache::UntrackImageTail(ImageId image_id) {
     tracker.UpdatePageWatchers<false>(addr, size);
 }
 
+static bool LiveMarksOnBigCards() {
+    // BB_VRAM_LEGACY=1 turns these off too, so that one switch gives the old behaviour. (Only
+    // the explicit switch: unset, Vram::Legacy() is true on every card above 8.5 GB, where these
+    // marks are meant to run.)
+    static const bool enabled = [] {
+        const char* env = std::getenv("BB_GC_LIVE_MARKS");
+        const char* legacy = std::getenv("BB_VRAM_LEGACY");
+        return !(env && env[0] == '0') && !(legacy && legacy[0] == '1');
+    }();
+    return enabled;
+}
+
 void TextureCache::GarbageCollectImages() {
     bool urgent_pass = false;
+    UniqueImage::ReleaseRecycledIfDisabled();
     vmaSetCurrentFrameIndex(instance.GetAllocator(), static_cast<u32>(gc_tick));
     if (Vulkan::Vram::Log()) {
         static auto last = std::chrono::steady_clock::now();
@@ -1219,6 +1335,11 @@ void TextureCache::GarbageCollectImages() {
     if (instance.CanReportMemoryUsage()) {
         u64 budget_now = 0;
         instance.QueryMemory(total_used_memory, budget_now);
+        // An allocation went over the budget since the last pass (image.cpp). Taken here on every
+        // pass, so a flag no branch below uses (say the budget moved across 8 GB) does not fire
+        // a stale aggressive pass later.
+        const bool over_budget_alloc =
+            Vulkan::Vram::urgent.exchange(false, std::memory_order_relaxed);
         // A card (or what other programs leave of it) under 8 GB works from its live budget.
         tight_budget = !Vulkan::Vram::Legacy() && !instance.IsIntegrated() && budget_now != 0 &&
                        budget_now < 8_GB;
@@ -1241,10 +1362,36 @@ void TextureCache::GarbageCollectImages() {
             trigger_gc_memory = others + room / 100 * 70;
             pressure_gc_memory = others + room / 100 * 85;
             critical_gc_memory = others + room;
-            if (Vulkan::Vram::urgent.exchange(false, std::memory_order_relaxed)) {
-                // An allocation just went over the budget: this pass is a critical one.
-                urgent_pass = true;
-            }
+            // An allocation just went over the budget: this pass is a critical one.
+            urgent_pass = over_budget_alloc;
+        } else if (!instance.IsIntegrated() && budget_now >= 8_GB && LiveMarksOnBigCards()) {
+            // bbport: cards of 8 GB and up. The startup marks keep 60% of up to 8 GB free and
+            // compare with everything the process holds, and buffers backing guest memory alone
+            // passed them (a 12 GB card: pressure at 5.3 GB, 5.3 GB used with 0.5 GB of images).
+            // Past the pressure mark images unused for 80 submissions (well under a second) went,
+            // thousands at a time, and came back as uploads: 60 -> 10 FPS drops in U3's London
+            // Underground (fork #6). The marks now never give images less room than the small-card
+            // rule does under the live budget; the startup marks stay the floor.
+            // BB_GC_LIVE_MARKS=0: the startup marks only (A/B).
+            const u64 budget = budget_now;
+            const u64 live_images = Vulkan::Vram::image_bytes.load(std::memory_order_relaxed);
+            const u64 images = std::min(live_images, total_used_memory);
+            const u64 others = total_used_memory - images;
+            const u64 limit = budget / 100 * 90;
+            u64 room = limit > others ? limit - others : 0;
+            room = std::max<u64>(room, std::max<u64>(512_MB, budget / 5));
+            // With others past ~80% of the budget, others + room passes the budget itself and
+            // the driver pages VRAM out before the collector reaches critical: no mark above 95%
+            // of the budget (the startup marks still the floor).
+            const u64 cap = budget / 100 * 95;
+            trigger_gc_memory = std::max<u64>(base_trigger_gc_memory,
+                                              std::min<u64>(others + room / 100 * 70, cap));
+            pressure_gc_memory = std::max<u64>(base_pressure_gc_memory,
+                                               std::min<u64>(others + room / 100 * 85, cap));
+            critical_gc_memory = std::max<u64>(base_critical_gc_memory,
+                                               std::min<u64>(others + room, cap));
+            // An over-budget allocation: an aggressive pass, as on small cards.
+            urgent_pass = over_budget_alloc;
         }
         // bbport: on integrated GPUs (Steam Deck) the usage covers system-memory heaps holding
         // much more than images (buffers backing guest memory), and the startup budget left
@@ -1278,6 +1425,7 @@ void TextureCache::GarbageCollectImages() {
         gc_tick_at_second[second % gc_tick_at_second.size()] = gc_tick;
     }
     if (total_used_memory < trigger_gc_memory && !urgent_pass) {
+        UniqueImage::SetMemoryPressure(false);
         return;
     }
     static const u64 idle_seconds = [] {
@@ -1297,6 +1445,11 @@ void TextureCache::GarbageCollectImages() {
     const auto configure = [&](bool allow_aggressive) {
         pressured = total_used_memory >= pressure_gc_memory;
         aggresive = allow_aggressive && total_used_memory >= critical_gc_memory;
+        if (urgent_pass && !tight_budget) {
+            // Big card with live marks, an allocation went over the budget: aggressive at once.
+            pressured = true;
+            aggresive = true;
+        }
         // bbport: critical used 160 ticks, longer than pressure's 80, so the aggressive pass
         // never freed more than the first one (#256).
         ticks_to_destroy = aggresive ? 40 : pressured ? 80 : 16;
@@ -1367,6 +1520,13 @@ void TextureCache::GarbageCollectImages() {
 
     // Try to remove anything old enough and not high priority.
     configure(false);
+    // bbport: the Vulkan images kept for reuse go first under pressure (still counted as image
+    // memory, owned by no image the collector could free), and none are kept meanwhile.
+    const bool under_pressure = pressured || aggresive || urgent_pass;
+    UniqueImage::SetMemoryPressure(under_pressure);
+    if (under_pressure) {
+        UniqueImage::ReleaseRecycled();
+    }
     gc_kept = gc_kept_bytes = 0;
     lru_cache.ForEachItemBelow(below_tick, clean_up);
 
@@ -1495,6 +1655,9 @@ void TextureCache::DeleteImage(ImageId image_id) {
         for (auto& backing : image.backing_images) {
             for (const ImageViewId image_view_id : backing.image_view_ids) {
                 slot_image_views.erase(image_view_id);
+            }
+            if (image.recycle_on_delete) {
+                backing.image.Recycle();
             }
         }
         slot_images.erase(image_id);

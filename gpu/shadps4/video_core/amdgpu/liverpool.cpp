@@ -681,8 +681,12 @@ void SignalFlip(Vulkan::Rasterizer& rasterizer, const u8*) {
         rasterizer.OnGuestFlip();
         rasterizer.GetBufferCache().CheckStableBindings();
         rasterizer.CheckConstants();
+        // On the landing thread, never inline on the recording or a copy thread: an EOP flip's
+        // interrupt handler prepares the frame and waits for the recording thread
+        // (Scheduler::SyncRecording), which would wait for itself (Uncharted 1, cutscenes).
         rasterizer.SignalAfterHostCopies(
-            [] { Platform::IrqC::Instance()->Signal(Platform::InterruptId::GfxFlip); }, landing_seq);
+            [] { Platform::IrqC::Instance()->Signal(Platform::InterruptId::GfxFlip); }, landing_seq,
+            true);
         return;
     }
     rasterizer.WaitDeferredSignals();
@@ -715,12 +719,22 @@ void RunEventWriteEos(Vulkan::Rasterizer& rasterizer, const u8* data) {
     // Raycaster copies deferred before this packet land before its label shows (landing_gate.h).
     const u64 landing_seq = VideoCore::LandingGate::Pending();
     // Copies deferred to the recording thread precede writes the guest sees.
-    const bool chained = VideoCore::LandingGate::Active() &&
+    // bbport: the label goes behind them like the end-of-pipe fence's (RunEventWriteEop), not
+    // only while raycaster copies are pending. Waiting here for the Vulkan recording thread to
+    // signal the fences before it was ~16% of the draw recording thread in U2's Borneo jungle
+    // (compute shader done events after the skinning dispatches). BB_EOS_CHAIN=0 or toggle2
+    // ChainedEosLabels: wait here unless the landing gate is active, as before.
+    static const bool chain_always = [] {
+        const char* env = std::getenv("BB_EOS_CHAIN");
+        return !(env && env[0] == '0');
+    }();
+    const bool chained = ((chain_always && !BbToggle::Disabled2(BbToggle::ChainedEosLabels)) ||
+                          VideoCore::LandingGate::Active()) &&
                          event_eos.command != PM4CmdEventWriteEos::Command::GdsStore &&
                          Vulkan::DrawPipe::OnStageB() &&
                          !BbToggle::Disabled(BbToggle::RecorderFences);
-    rasterizer.WaitHostCopies();
     if (!chained) {
+        rasterizer.WaitHostCopies();
         rasterizer.WaitDeferredSignals();
     }
     rasterizer.ProcessDownloadImages();
@@ -855,8 +869,8 @@ Liverpool::Task Liverpool::ProcessCeUpdate(std::span<const u32> ccb) {
         }
         case PM4ItOpcode::WaitOnDeCounterDiff: {
             const auto diff = it_body[0];
-            while (cblock.de_count >= cblock.ce_count &&
-                   (cblock.de_count - cblock.ce_count) >= diff) {
+            while (cblock.ce_count >= cblock.de_count &&
+                   (cblock.ce_count - cblock.de_count) >= diff) {
                 YIELD_CE();
             }
             break;
@@ -1673,6 +1687,14 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                 const u64* wait_addr = wait_reg_mem->Address<u64*>();
                 if (vo_port->IsVoLabel(wait_addr) &&
                     num_submits == mapped_queues[GfxQueueId].submits.size()) {
+                    // bbport: a display buffer the presenter has released already needs no
+                    // drain: the recording thread goes on with the previous frame while this one
+                    // is decoded. The presenter writes the label on its own, so an unmet wait
+                    // drains and sleeps as before. Toggle2 VoLabelNoDrain: always drain.
+                    if (!BbToggle::Disabled2(BbToggle::VoLabelNoDrain) &&
+                        wait_reg_mem->Test(regs.reg_array)) {
+                        break;
+                    }
                     if (rasterizer) {
                         rasterizer->DrainDrawPipe(static_cast<u32>(opcode));
                     }

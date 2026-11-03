@@ -19,6 +19,10 @@ enum Preset : int { NativeAA = 0, Quality, Balanced, Performance, UltraPerforman
 /// Frame generation (vk_frame_generation.h): frames generated between two of the game's.
 enum FrameGen : int { FrameGenOff = 0, FrameGenFsr3 = 1, FrameGenDlss = 2, FrameGenCount };
 enum DebugView : int { DebugNone = 0, DebugReactive = 1, DebugMotion = 2, DebugViewCount };
+/// Window mode of the SDL window (window.cpp): the in-game menu switches it live and keeps it in
+/// bbport.ini; the launchers' BB_FULLSCREEN (1/0) picks fullscreen or windowed at start (Load()).
+enum DisplayMode : int { DisplayWindowed = 0, DisplayBorderless = 1, DisplayExclusive = 2,
+                         DisplayModeCount };
 
 /// Game effects switched by the community patches at start (patches.py EFFECTS): ini key,
 /// menu label, default (the game's own behaviour).
@@ -69,10 +73,18 @@ struct Values {
     std::atomic<float> reactive_max{0.9f};
     std::atomic<int> debug_view{DebugNone};
     std::atomic<bool> show_fps{false};
+    /// Raw mouse aiming (runtime_pad.c through bbgpu_gyro_aim, key gyro_aim): popping out keeps the aim, the mouse
+    /// (also Steam's gyro as a mouse) turns the aiming and cover cameras directly, 1:1. Off: the mouse is a
+    /// right stick value there (the game's stick curve and top speed).
+    std::atomic<bool> gyro_aim{true};
+    std::atomic<int> display_mode{DisplayWindowed}; ///< window.cpp reads it when the window opens
     // FSR 4 checks (menu): the provider's auto exposure, the jitter sign it is given.
     std::atomic<bool> fsr4_auto_exposure{true};
     std::atomic<bool> fsr4_invert_jitter{false};
     std::atomic<int> active_render_width{1920}, active_render_height{1080};
+    /// The scene renders at the game's own size (Uncharted, velocity mode): the upscaler runs
+    /// as Native AA there, the preset and output resolution do not apply. Set by the renderer.
+    std::atomic<bool> game_size_render{false};
     /// Applied at start (patches.py); the menu shows when a restart is needed.
     std::atomic<bool> effects[EffectCount]{};
     std::atomic<int> model_lod{0}; ///< -2 highest .. 2 lowest, 0 the game's
@@ -111,7 +123,9 @@ Values& Get();
 /// Reads the file, then the environment overrides. Called once at start.
 void Load();
 /// Checks the loaded choice before the first frame; unsupported FSR 4 uses FSR 3.1.
-void ConfigureUpscalerSupport(bool fsr4, bool fsr411);
+/// fsr4_assets: the FSR 4 v07 assets are installed; without them FSR 4 is not
+/// offered (it would only fall back to FSR 3.1 mid-game).
+void ConfigureUpscalerSupport(bool fsr4, bool fsr411, bool fsr4_assets = true);
 /// After device creation: DLSS availability; a DLSS setting falls back to FSR 3.1 without it.
 void ConfigureDlssSupport(bool available, const char* problem);
 /// Same for Intel XeSS (libxess.dll).
@@ -128,6 +142,7 @@ float PresetScale(int preset);
 const char* PresetName(int preset);
 const char* UpscalerName(int upscaler);
 const char* FrameGenName(int frame_gen);
+const char* DisplayModeName(int mode);
 
 /// Whether FSR 3.1 has been seen rendering correctly on this driver (a VkDriverId value).
 /// Nothing is on the list yet, so every driver gets the warning: on RADV PHOENIX (Mesa

@@ -13,6 +13,7 @@ The in-game "Apply and restart" runs this script again through BB_RESTART_COMMAN
 `--after PID` waits for the previous game process to end first (its GPU device and memory).
 """
 import ctypes
+import json
 import os
 import struct
 from pathlib import Path
@@ -24,6 +25,7 @@ sys.path.insert(0, str(PORT / 'scripts'))
 import cheats
 EXECUTABLES = {'u1': 'eboot.bin', 'u2': 'big2-ps4_Shipping.elf', 'u3': 'big3-ps4_Shipping.elf'}
 LOADEXEC_EXIT = 101  # runtime_services.c: the game asked for another executable
+PREPARE_CACHE_VERSION = 1
 
 
 def fail(message):
@@ -34,9 +36,30 @@ def fail(message):
 def wait_for(pid):
     kernel32 = ctypes.windll.kernel32
     SYNCHRONIZE = 0x00100000
+    ERROR_INVALID_PARAMETER = 87
+    WAIT_OBJECT_0 = 0
+    WAIT_TIMEOUT = 258
+    WAIT_FAILED = 0xffffffff
     handle = kernel32.OpenProcess(SYNCHRONIZE, False, pid)
-    if handle:
-        kernel32.WaitForSingleObject(handle, 30000)
+    if not handle:
+        error = kernel32.GetLastError()
+        if error == ERROR_INVALID_PARAMETER:  # The process already exited.
+            return
+        fail(f'Cannot wait for previous game process {pid}: OpenProcess failed '
+             f'(Windows error {error}).')
+    try:
+        result = kernel32.WaitForSingleObject(handle, 30000) & 0xFFFFFFFF  # unsigned: WAIT_FAILED is 0xFFFFFFFF
+        if result == WAIT_OBJECT_0:
+            return
+        if result == WAIT_TIMEOUT:
+            fail(f'Previous game process {pid} did not exit within 30 seconds; '
+                 'not starting another instance.')
+        if result == WAIT_FAILED:
+            fail(f'Cannot wait for previous game process {pid}: WaitForSingleObject failed '
+                 f'(Windows error {kernel32.GetLastError()}).')
+        fail(f'Cannot wait for previous game process {pid}: WaitForSingleObject returned '
+             f'unexpected status {result}.')
+    finally:
         kernel32.CloseHandle(handle)
 
 
@@ -128,23 +151,31 @@ def game_cheats(enabled, exe):
     return ','.join(c.split(':', 1)[1] for c in enabled.split(',') if key and c.startswith(f'{key}:'))
 
 
+def prepared_cache_valid(linked, manifest, source, sources):
+    try:
+        metadata = json.loads(manifest.read_text(encoding='utf-8'))
+        return (metadata == {'version': PREPARE_CACHE_VERSION, 'source': source,
+                             'linked_size': linked.stat().st_size}
+                and all(linked.stat().st_mtime >= path.stat().st_mtime for path in sources))
+    except (OSError, ValueError, TypeError):
+        return False
+
+
 def prepare(game, exe, out):
     """boot-linked.bin for one executable, kept until the executable or the scripts change."""
     out.mkdir(parents=True, exist_ok=True)
     linked = out / 'boot-linked.bin'
-    # Which executable the files in out/ were made from: another folder (a per-game one) needs a new run.
-    stamp, source = out / 'source.txt', str(game / exe)
+    manifest, source = out / 'prepared.json', str(game / exe)
     sources = [game / exe, *(PORT / 'scripts').glob('*.py'), *(PORT / 'patches').glob('redzone.json'),
                *(game / 'sce_module').glob('*.prx')]
-    if linked.is_file() and all(linked.stat().st_mtime >= s.stat().st_mtime for s in sources):
-        if not stamp.is_file():
-            stamp.write_text(source, encoding='utf-8')
-        if stamp.read_text(encoding='utf-8', errors='replace') == source:
-            return
+    if prepared_cache_valid(linked, manifest, source, sources):
+        return
     print(f'Preparing {exe} ...')
     run_script('prepare.py', game, '--out', out, '--exe', exe)
     run_script('link_modules.py', game, '--out', out, '--exe', exe)
-    stamp.write_text(source, encoding='utf-8')
+    metadata = {'version': PREPARE_CACHE_VERSION, 'source': source,
+                'linked_size': linked.stat().st_size}
+    manifest.write_text(json.dumps(metadata, indent=2) + '\n', encoding='utf-8')
 
 
 def isa_rewrite_args(probe, out):
@@ -245,9 +276,9 @@ def main():
     env.setdefault('BB_VELOCITY_PS', 'f4b18264')
     env.setdefault('BB_UPSCALE_BEFORE_CS', 'aec539f0')
     env.setdefault('BB_HUDLESS_PS', '484cdbf5')
-    # Full-screen passes that rebuild positions from the jittered scene depth get the upscaler's
-    # jitter too: the sun shadow pass (without it its shadows flickered under FSR and TAA).
-    env.setdefault('BB_JITTER_PS', 'f614041e')
+    # These passes need the scene's jitter too: sun shadow reconstruction, U1 boat details,
+    # and U3 London bar surfaces drawn against secondary scene depth (otherwise they flicker).
+    env.setdefault('BB_JITTER_PS', 'f614041e,b2a42acf,1a08df2d')
     if not env.get('BB_FSR411_DIR') and not (PORT / 'fsr4_411').is_dir() and (data / 'fsr4_411').is_dir():
         env['BB_FSR411_DIR'] = str(data / 'fsr4_411')
 
@@ -275,11 +306,15 @@ def main():
     # Uncharted 2 reads the results of GPU work (grenade explosions, vehicle damage, the convoy
     # of chapter 21) from memory it also writes: merging leaves them on the GPU, so it runs with
     # accurate GPU memory (BB_GPU_MERGE=0) unless the player chose otherwise.
-    # Its aim and turret blur reads tiny render results back (BB_TINY_READBACK, ~13% elsewhere).
+    # Aim and turret blur: the game reads a tiny render result (focus depth) on the CPU, so it is read back
+    # (BB_TINY_READBACK). On for U2 and U3: no measurable cost in U3 (square and chateau fight). U1 unchanged.
     player_merge = env.get('BB_GPU_MERGE')
     player_tiny = env.get('BB_TINY_READBACK')
+    player_walk = env.get('BB_WALK_MIN')
     player_small = env.get('BB_READBACK_SMALL_BUFFERS')
+    player_gate = env.get('BB_READBACK_SMALL_GATE')
     player_copy = env.get('BB_SCALAR_COPY64_SYNC')
+    player_copy_eop = env.get('BB_COPY64_EOP_READBACK')
     all_cheats = env.setdefault('BB_CHEATS_ALL', env.get('BB_CHEATS', ''))
     while True:
         if player_merge is None:
@@ -287,17 +322,46 @@ def main():
                 env['BB_GPU_MERGE'] = '0'
             else:
                 env.pop('BB_GPU_MERGE', None)
+        # PS4 thread priorities: off for all three games by the runtime default since 0.3.11 (the job wait
+        # fixes the 4-core crash they were for; U1 also stopped on job asserts with them on: #620, #594).
+        # Walk key: Uncharted 1 ignores stick bytes within about 43 of the centre on each axis, so a walk
+        # below 55% (or its diagonals) did not move Nathan (fork #13).
+        if player_walk is None:
+            if exe == EXECUTABLES['u1']:
+                env['BB_WALK_MIN'] = '55'
+            else:
+                env.pop('BB_WALK_MIN', None)
         if player_tiny is None:
-            env['BB_TINY_READBACK'] = '1' if exe == EXECUTABLES['u2'] else '0'
-        # Its weapons need the small results the GPU writes (a few bytes the CPU reads back) to reach
-        # guest memory: without it guns draw black and untextured. Off elsewhere (it halves U3's
-        # frame rate in Cartagena square).
+            env['BB_TINY_READBACK'] = '1' if exe in (EXECUTABLES['u2'], EXECUTABLES['u3']) else '0'
+        # Weapons need the small results the GPU writes (a few bytes the CPU reads back) to reach
+        # guest memory: without it guns draw black and untextured (and, reported for U3, characters
+        # sink into the ground: #601, #590). On for U2 and U3: the bytes land on the landing thread
+        # once the GPU is done with them, so nothing waits (U3 Cartagena square: 60 FPS with and without).
+        # Sinking characters: in U3 the selective gate (Automatic) still let characters sink for players
+        # (fork #4, #622, #692); the full gate fixes it there. U2 keeps the selective gate.
+        if player_gate is None and exe == EXECUTABLES['u3']:
+            env['BB_READBACK_SMALL_GATE'] = '1'
         if player_small is None:
-            env['BB_READBACK_SMALL_BUFFERS'] = '1' if exe == EXECUTABLES['u2'] else '0'
-        # Its mesh raycaster copies land in guest memory too (iSubMesh after checkpoints).
+            env['BB_READBACK_SMALL_BUFFERS'] = '1' if exe in (EXECUTABLES['u2'], EXECUTABLES['u3']) else '0'
+        # The mesh raycaster copies land in guest memory too (iSubMesh after checkpoints; U1 crashes
+        # in the Customs House and cutscenes without it). On for U1 and U2: -9 to -16% at 110-130 FPS
+        # in U1, so none at 60. Off in U3: it cost 94 -> 54 FPS in Cartagena square.
         if player_copy is None:
-            env['BB_SCALAR_COPY64_SYNC'] = '2' if exe == EXECUTABLES['u2'] else '0'
-            env['BB_SCALAR_COPY64_DEFER'] = '1' if exe == EXECUTABLES['u2'] else '0'
+            copy_on = exe in (EXECUTABLES['u1'], EXECUTABLES['u2'])
+            env['BB_SCALAR_COPY64_SYNC'] = '2' if copy_on else '0'
+            env['BB_SCALAR_COPY64_DEFER'] = '1' if copy_on else '0'
+        # U3 runs the 64-dword raycaster copy on the GPU (BB_SCALAR_COPY64_SYNC off), so without this the
+        # CPU reads stale ground-hit records and characters sink: its small outputs are read back at the
+        # end-of-pipe fence (fork #25/#4, #692, #751).
+        if player_copy_eop is None:
+            if exe == EXECUTABLES['u3']:
+                env['BB_COPY64_EOP_READBACK'] = '1'
+            else:
+                env.pop('BB_COPY64_EOP_READBACK', None)
+        # Chained end-of-shader labels (toggle2 4) and met display-label waits without a drain
+        # (toggle2 8) were measured in U2 only: off for U1 and U3 until they are.
+        if exe in (EXECUTABLES['u1'], EXECUTABLES['u3']):
+            env.setdefault('BB_TOGGLE2', '12')
         game, file = locate(env, exe)
         if not game:
             fail('Set BB_GAME_DIR to the game folder (the one with eboot.bin).')

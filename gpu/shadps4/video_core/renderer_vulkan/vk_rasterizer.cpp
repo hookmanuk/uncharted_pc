@@ -1,6 +1,8 @@
 // SPDX-FileCopyrightText: Copyright 2024-2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <algorithm>
+#include <set>
 #include <array>
 #include <atomic>
 #include <chrono>
@@ -30,6 +32,8 @@
 #include "video_core/renderer_vulkan/vk_runtime.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
 #include "video_core/renderer_vulkan/vk_shader_hle.h"
+#include "video_core/renderer_vulkan/vk_shader_util.h"
+#include "video_core/host_shaders/indirect_split_comp.h"
 #include "video_core/texture_cache/image_view.h"
 #include "video_core/texture_cache/texture_cache.h"
 #include "video_core/renderer_vulkan/vr/vr_dev.h" // VR
@@ -81,6 +85,8 @@ struct CheckpointRecord {
     u64 hashes[2];
     u32 counts[3];
     VAddr args;
+    u64 tick;     // the scheduler tick this command is submitted with
+    u64 gpu_tick; // the GPU's last confirmed tick when the command was recorded
     struct Range {
         VAddr address;
         u32 size;
@@ -95,14 +101,15 @@ constexpr u64 CheckpointRingSize = 1u << 16;
 std::unique_ptr<CheckpointRecord[]> checkpoint_ring;
 std::atomic<u64> checkpoint_seq{0};
 
-const void* NoteCheckpoint(const char* kind, u64 hash0, u64 hash1, u32 a, u32 b, u32 c,
-                           VAddr args) {
+const void* NoteCheckpoint(Scheduler& scheduler, const char* kind, u64 hash0, u64 hash1,
+                           u32 a, u32 b, u32 c, VAddr args) {
     if (!g_gpu_checkpoints) {
         return nullptr;
     }
     const u64 seq = checkpoint_seq.fetch_add(1, std::memory_order_relaxed) + 1;
     auto& record = checkpoint_ring[seq % CheckpointRingSize];
-    record = {seq, kind, {hash0, hash1}, {a, b, c}, args};
+    record = {seq, kind, {hash0, hash1}, {a, b, c}, args, scheduler.CurrentTick(),
+              scheduler.GetWorkSemaphore()->KnownGpuTick()};
     record.num_buffers = num_checkpoint_buffers;
     std::copy_n(checkpoint_buffers, num_checkpoint_buffers, record.buffers);
     return reinterpret_cast<const void*>(static_cast<uintptr_t>(seq));
@@ -160,6 +167,55 @@ void ReportCheckpoints() {
     }
 }
 } // namespace
+
+// bbport: the commands the CPU recorded most recently, for the loader's fault handler — a driver
+// that crashes while resetting after a GPU hang leaves no Vulkan call to report the loss. Only
+// host memory is read (vkGetQueueCheckpointDataNV is not safe in that state). The tick stored with
+// each record is the submission it went into; the GPU's last confirmed tick separates the commands
+// it had finished from the ones that were in flight when it stopped.
+void ReportRecentCheckpoints(u32 max_records) {
+    if (!checkpoint_ring) {
+        // Checkpoints off (BB_GPU_CHECKPOINTS unset): say nothing, or every CPU crash reads as a
+        // GPU crash in players' logs.
+        return;
+    }
+    const u64 latest = checkpoint_seq.load(std::memory_order_acquire);
+    if (latest == 0) {
+        std::printf("GPU crash: no command recorded yet\n");
+        return;
+    }
+    const u64 gpu = checkpoint_ring[latest % CheckpointRingSize].gpu_tick;
+    // Walk back to the oldest command the GPU had not confirmed when the newest one was recorded.
+    u64 in_flight = 0;
+    while (in_flight < latest && in_flight < CheckpointRingSize) {
+        const auto& record = checkpoint_ring[(latest - in_flight) % CheckpointRingSize];
+        if (record.seq != latest - in_flight || record.tick <= gpu) {
+            break;
+        }
+        ++in_flight;
+    }
+    std::printf("GPU crash: the CPU recorded command #%llu; the GPU last confirmed tick %llu; "
+                "%llu command(s) in flight\n",
+                static_cast<unsigned long long>(latest), static_cast<unsigned long long>(gpu),
+                static_cast<unsigned long long>(in_flight));
+    // Nothing in flight (a CPU-side crash): the last commands are still worth seeing. Otherwise
+    // the first ones in flight: the GPU stopped in the oldest of them.
+    u64 seq = in_flight ? latest - in_flight + 1 : (latest > 8 ? latest - 7 : 1);
+    u64 shown = in_flight ? in_flight : latest - seq + 1;
+    if (shown > max_records) {
+        std::printf("GPU crash: showing the first %u of them\n", max_records);
+        shown = max_records;
+    }
+    for (u64 n = 0; n < shown; ++n, ++seq) {
+        const auto& record = checkpoint_ring[seq % CheckpointRingSize];
+        std::printf("GPU crash:   #%llu %s %016llx %016llx counts %u %u %u t%llu\n",
+                    static_cast<unsigned long long>(record.seq), record.kind,
+                    static_cast<unsigned long long>(record.hashes[0]),
+                    static_cast<unsigned long long>(record.hashes[1]), record.counts[0],
+                    record.counts[1], record.counts[2],
+                    static_cast<unsigned long long>(record.tick));
+    }
+}
 
 static Shader::PushData MakeUserData(const AmdGpu::Regs& regs) {
     // TODO(roamic): Add support for multiple viewports and geometry shaders when ViewportIndex
@@ -596,6 +652,10 @@ void Rasterizer::DrainDrawPipe(u32 reason, u32 line, const char* function) {
     if (const u64 waited = draw_pipe->drain_cycles - before) {
         drain_sites[function][line] += waited;
     }
+}
+
+bool Rasterizer::OnDrawRecThread() const {
+    return DrawPipe::OnStageB();
 }
 
 bool Rasterizer::IsGpuSideThread() const {
@@ -1739,8 +1799,26 @@ void Rasterizer::DrawRecord(const GraphicsPipeline* pipeline, const PreparedDraw
     // bbport: jitter geometry drawn with the scene depth, not full-screen passes (a shifted
     // full-screen quad leaves an edge column unwritten).
     draw_jitter = {};
+    // bbport (Mevlock): a draw of up to 6 indices is usually a full-screen quad (not jittered), but
+    // a quad that writes depth or tests it for equality is scene geometry: U3's chateau wall panels
+    // are single quads. Left unjittered, they sat a fraction of a pixel off their jittered
+    // neighbours and the seams opened into pinholes showing the scene colour's clear (0, 0, 1, 0):
+    // rows of bright blue dots, only with an upscaler on. BB_JITTER_SMALL=0: off.
+    static const bool jitter_small = [] {
+        const char* env = std::getenv("BB_JITTER_SMALL");
+        return !(env && env[0] == '0');
+    }();
+    const auto small_scene_geometry = [&] {
+        if (!jitter_small || !regs.depth_control.depth_enable) {
+            return false;
+        }
+        // Full-screen depth copies and resolves write depth with an always-passing test: not these.
+        const auto func = LiverpoolToVK::CompareOp(regs.depth_control.depth_func);
+        return func != vk::CompareOp::eAlways &&
+               (bool(regs.depth_control.depth_write_enable) || func == vk::CompareOp::eEqual);
+    };
     if (upscaler->Enabled() && db_desc.first && db_desc.first == camera_motion->Depth() &&
-        (regs.num_indices > 6 || regs.num_instances.NumInstances() > 1)) {
+        (regs.num_indices > 6 || regs.num_instances.NumInstances() > 1 || small_scene_geometry())) {
         draw_jitter = upscaler->Jitter();
     } else if (const auto* ps = pipeline->GetStages()[u32(Shader::SwStage::Fragment)];
                ps && upscaler->Enabled() && JitterFullScreenPass(ps->pgm_hash)) {
@@ -1765,8 +1843,8 @@ void Rasterizer::DrawRecord(const GraphicsPipeline* pipeline, const PreparedDraw
     const void* checkpoint = nullptr;
     if (g_gpu_checkpoints) {
         const auto* ps = pipeline->GetStages()[u32(Shader::SwStage::Fragment)];
-        checkpoint = NoteCheckpoint("draw", vs_info.pgm_hash, ps ? ps->pgm_hash : 0, num_indices,
-                                    num_instances, 0, 0);
+        checkpoint = NoteCheckpoint(scheduler, "draw", vs_info.pgm_hash, ps ? ps->pgm_hash : 0,
+                                    num_indices, num_instances, 0, 0);
     }
     scheduler.Record([=](vk::CommandBuffer cmdbuf) {
         if (checkpoint) {
@@ -1929,7 +2007,8 @@ void Rasterizer::DrawIndirectRecord(const GraphicsPipeline* pipeline, bool is_in
     const void* checkpoint = nullptr;
     if (g_gpu_checkpoints) {
         const auto* ps = pipeline->GetStages()[u32(Shader::SwStage::Fragment)];
-        checkpoint = NoteCheckpoint(is_indexed ? "indexed indirect draw" : "indirect draw",
+        checkpoint = NoteCheckpoint(scheduler,
+                                    is_indexed ? "indexed indirect draw" : "indirect draw",
                                     pipeline->GetStage(Shader::SwStage::Vertex).pgm_hash,
                                     ps ? ps->pgm_hash : 0, max_count, stride,
                                     count_address != 0, indirect.args);
@@ -1958,15 +2037,17 @@ void Rasterizer::DrawIndirectRecord(const GraphicsPipeline* pipeline, bool is_in
     scheduler.KickRecording();
 }
 
-void Rasterizer::NoteSmallWrittenBuffers(const Shader::Info& stage) {
+bool Rasterizer::NoteSmallWrittenBuffers(const Shader::Info& stage) {
     static const bool enabled = [] {
         // Off by default: in U3's Cartagena square it halved the frame rate (94 -> 46 FPS).
         const char* env = std::getenv("BB_READBACK_SMALL_BUFFERS");
         return env && env[0] == '1';
     }();
     if (!enabled) {
-        return;
+        return false;
     }
+    bool wrote_small = false;
+    u32 dropped = 0;
     for (const auto& desc : stage.buffers) {
         if (desc.IsSpecial() || !desc.is_written) {
             continue;
@@ -1977,19 +2058,241 @@ void Rasterizer::NoteSmallWrittenBuffers(const Shader::Info& stage) {
             continue;
         }
         std::scoped_lock lk{small_written_mutex};
-        const std::pair<VAddr, u32> range{sharp.base_address, size};
-        if (small_written_buffers.size() < 16 &&
-            std::ranges::find(small_written_buffers, range) == small_written_buffers.end()) {
-            small_written_buffers.push_back(range);
+        // BB_SC_LOG: which shaders write the small buffers, and where (first 40 distinct).
+        static const bool sc_log = std::getenv("BB_SC_LOG") != nullptr;
+        if (sc_log) {
+            static std::set<std::pair<u64, u64>> seen;
+            if (seen.size() < 40 && seen.emplace(stage.pgm_hash, sharp.base_address).second) {
+                std::printf("SMALLBUF: shader %016llx writes %u bytes at %#llx\n",
+                            static_cast<unsigned long long>(stage.pgm_hash), size,
+                            static_cast<unsigned long long>(sharp.base_address));
+            }
+        }
+        const auto it = std::ranges::find_if(small_written_buffers, [&](const SmallWritten& w) {
+            return w.address == sharp.base_address && w.size == size;
+        });
+        if (it != small_written_buffers.end()) {
+            it->writer = stage.pgm_hash; // the last writer's result is what lands
+            wrote_small = true;
+        } else if (small_written_buffers.size() < 16) {
+            small_written_buffers.push_back({sharp.base_address, size, stage.pgm_hash});
+            wrote_small = true;
+        } else {
+            ++dropped;
         }
     }
+    if (dropped != 0) {
+        // Past 16 ranges a written range is not read back: said once per run.
+        static std::atomic<bool> told{false};
+        if (!told.exchange(true, std::memory_order_relaxed)) {
+            std::printf("SMALLBUF: 16 written ranges already recorded, %u more dropped by shader "
+                        "%016llx (not read back; later drops are not reported)\n",
+                        dropped, static_cast<unsigned long long>(stage.pgm_hash));
+        }
+    }
+    return wrote_small && SmallWriterGated(stage.pgm_hash);
+}
+
+namespace {
+/// BB_COPY64_EOP_READBACK=1 (off by default): based on BilalReloaded's GOW3_COPY64_EOP_READBACK
+/// (bc160201983/Uncharted-The-Nathan-Drake-Collection-PC-port bd3a22f). The 64-dword copy shader
+/// 6a6422a9 (the scalar copy HLE, vk_shader_hle.cpp) moves the mesh raycaster results into the
+/// record arrays the game's CPU code reads. Where its source holds GPU-written bytes it runs on
+/// the GPU only unless BB_SCALAR_COPY64_SYNC asks for a guest copy (off in U3: 94 -> 54 FPS), so
+/// the guest reads stale records (U3 characters sinking, NPCs floating). With this on, only the
+/// dwords such a dispatch writes (i < min(groups * 64, user data 6, records)) are read back, and
+/// only copies of 64 KiB or less (the game reads values in 0.5-1 KiB blocks; its two large copies
+/// a frame, ~0.2 and ~2.4 MB, are never read): they land on the landing thread and the next
+/// end-of-pipe label waits for them, whatever BB_READBACK_SMALL_GATE says.
+constexpr u64 Copy64ShaderHash = 0x6a6422a9;
+constexpr u64 Copy64ReadbackMax = 64_KB;
+constexpr size_t Copy64ReadbackRanges = 256; ///< per end-of-pipe event
+
+bool Copy64EopReadback() {
+    static const bool on = [] {
+        const char* env = std::getenv("BB_COPY64_EOP_READBACK");
+        const bool enabled = env && env[0] == '1';
+        if (enabled) {
+            std::printf("COPY64EOP: on (BB_COPY64_EOP_READBACK=1): what copy shader 6a6422a9 "
+                        "writes, up to 64 KiB a dispatch, lands before the next end-of-pipe "
+                        "label\n");
+            std::fflush(stdout);
+        }
+        return enabled;
+    }();
+    return on;
+}
+
+/// Counts for the BB_SC_LOG line, printed at most every 10 s (Copy64Stats::Note).
+struct Copy64Stats {
+    std::atomic<u64> noted{}, too_large{}, dropped{}, landed{}, dwords{}, waited{}, not_gpu{};
+    std::atomic<s64> window{};
+    std::atomic<bool> first{true};
+
+    void Note() {
+        static const bool on = std::getenv("BB_SC_LOG") != nullptr;
+        if (!on) {
+            return;
+        }
+        const s64 now = std::chrono::duration_cast<std::chrono::milliseconds>(
+                            std::chrono::steady_clock::now().time_since_epoch())
+                            .count();
+        s64 last = window.load(std::memory_order_relaxed);
+        if (last == 0) {
+            window.compare_exchange_strong(last, now);
+            return;
+        }
+        if (now - last < 10000 || !window.compare_exchange_strong(last, now)) {
+            return;
+        }
+        auto take = [](std::atomic<u64>& v) {
+            return static_cast<unsigned long long>(v.exchange(0, std::memory_order_relaxed));
+        };
+        const double secs = (now - last) / 1000.0;
+        const auto n_landed = take(landed);
+        const auto n_dwords = take(dwords);
+        const auto n_waited = take(waited);
+        std::printf("COPY64EOP 10s: %llu copies noted, %.1f/s read back (%llu landed, %llu read "
+                    "with a wait), %.0f dwords/s (%.1f KiB/s); skipped: %llu over 64 KiB, %llu "
+                    "with no GPU-written bytes, %llu past %zu ranges an event\n",
+                    take(noted), (n_landed + n_waited) / secs, n_landed, n_waited,
+                    n_dwords / secs, n_dwords * 4 / 1024.0 / secs, take(too_large),
+                    take(not_gpu), take(dropped), Copy64ReadbackRanges);
+        std::fflush(stdout);
+    }
+};
+Copy64Stats copy64_stats;
+} // namespace
+
+bool Rasterizer::NoteCopy64Readback(const Shader::Info& stage) {
+    if (stage.pgm_hash != Copy64ShaderHash || !Copy64EopReadback() || stage.buffers.size() != 2) {
+        return false;
+    }
+    const auto ud = stage.UserData();
+    if (ud.size() <= 6) {
+        return false;
+    }
+    // dst[i] = src[i] for i < min(groups * 64, ud[6]); writes past dst's records are dropped.
+    const auto dst = stage.buffers[1].GetSharp(stage);
+    if (dst.GetStride() != 4 || !dst.base_address) {
+        return false;
+    }
+    const u64 count =
+        std::min<u64>({u64(CsRegs().dim_x) * 64, u64(ud[6]), u64(dst.num_records)});
+    const u64 size = count * 4;
+    if (size == 0) {
+        return false;
+    }
+    copy64_stats.noted.fetch_add(1, std::memory_order_relaxed);
+    if (size > Copy64ReadbackMax) {
+        copy64_stats.too_large.fetch_add(1, std::memory_order_relaxed);
+        return false;
+    }
+    std::scoped_lock lk{small_written_mutex};
+    const auto it = std::ranges::find_if(copy64_readbacks, [&](const SmallWritten& w) {
+        return w.address == dst.base_address && w.size == size;
+    });
+    if (it != copy64_readbacks.end()) {
+        return true;
+    }
+    if (copy64_readbacks.size() >= Copy64ReadbackRanges) {
+        copy64_stats.dropped.fetch_add(1, std::memory_order_relaxed);
+        return false;
+    }
+    copy64_readbacks.push_back({dst.base_address, static_cast<u32>(size), stage.pgm_hash});
+    return true;
+}
+
+namespace {
+/// BB_READBACK_SMALL_GATE: which small GPU results hold back the end-of-pipe label until they
+/// have landed (see ReadBackSmallWrittenBuffers).
+enum class SmallGate {
+    Never, ///< 0: none (the labels never wait; the old default)
+    All,   ///< 1: all of them (U3 pub 46 of 60 FPS)
+    Auto,  ///< default: the listed shaders and the ones learned in this run
+};
+
+SmallGate SmallGateMode() {
+    static const SmallGate mode = [] {
+        const char* env = std::getenv("BB_READBACK_SMALL_GATE");
+        if (env && env[0] == '0') {
+            return SmallGate::Never;
+        }
+        if (env && env[0] == '1') {
+            return SmallGate::All;
+        }
+        return SmallGate::Auto;
+    }();
+    return mode;
+}
+
+/// Comma-separated compute shader hashes (hex, as SMALLBUF and SMALLGATE print them; 8 digits
+/// match the low 32 bits).
+std::vector<u64> ParseShaderList(const char* name) {
+    std::vector<u64> list;
+    const char* env = std::getenv(name);
+    while (env && *env) {
+        char* end;
+        const u64 value = std::strtoull(env, &end, 16);
+        if (end == env) {
+            ++env;
+            continue;
+        }
+        list.push_back(value);
+        env = end;
+    }
+    return list;
+}
+
+bool InShaderList(const std::vector<u64>& list, u64 hash) {
+    return std::ranges::any_of(list, [hash](u64 v) {
+        return v == hash || (v <= 0xffffffffull && v == (hash & 0xffffffffull));
+    });
+}
+
+/// Shaders whose small results are known to be read by the guest right after the label, gated
+/// in the default mode from the first frame (the learning finds them after a few frames).
+/// Fill in from SMALLGATE "learned shader" lines of U2/U3 runs.
+constexpr std::array<u64, 0> KnownGatedSmallWriters{};
+
+bool SmallGateLearning() {
+    static const bool learn = [] {
+        const char* env = std::getenv("BB_READBACK_SMALL_GATE_LEARN");
+        return !(env && env[0] == '0');
+    }();
+    return learn;
+}
+} // namespace
+
+bool Rasterizer::SmallWriterGated(u64 writer, const char** why) const {
+    static const std::vector<u64> listed = ParseShaderList("BB_READBACK_SMALL_GATE_CS");
+    static const std::vector<u64> skipped = ParseShaderList("BB_READBACK_SMALL_GATE_SKIP");
+    if (SmallGateMode() != SmallGate::Auto || InShaderList(skipped, writer)) {
+        return false;
+    }
+    if (InShaderList(listed, writer) ||
+        std::ranges::find(KnownGatedSmallWriters, writer) != KnownGatedSmallWriters.end()) {
+        if (why) {
+            *why = "listed";
+        }
+        return true;
+    }
+    if (SmallGateLearning() && buffer_cache.SmallWriterLearned(writer)) {
+        if (why) {
+            *why = "learned";
+        }
+        return true;
+    }
+    return false;
 }
 
 void Rasterizer::ReadBackSmallWrittenBuffers() {
-    std::vector<std::pair<VAddr, u32>> ranges;
+    std::vector<SmallWritten> ranges;
+    std::vector<SmallWritten> copy64;
     {
         std::scoped_lock lk{small_written_mutex};
         ranges.swap(small_written_buffers);
+        copy64.swap(copy64_readbacks);
     }
     // The read back waits for the whole GPU queue (U3 pub: 27 instead of 46 FPS with the other
     // run of the pair at the same time). The bytes land on the landing thread instead, once the
@@ -2000,24 +2303,64 @@ void Rasterizer::ReadBackSmallWrittenBuffers() {
         const char* env = std::getenv("BB_READBACK_SMALL_DEFER");
         return !(env && env[0] == '0');
     }();
-    // Gated: the end-of-pipe label waits for the landing, i.e. for the GPU to finish that work
-    // (the guest then never reads it early, but loses the overlap with the GPU: U3 pub 46 of 60
-    // FPS). Default: the bytes land when the GPU is done and the label does not wait.
-    // BB_READBACK_SMALL_GATE=1: gated.
-    static const bool gated = [] {
-        const char* env = std::getenv("BB_READBACK_SMALL_GATE");
-        return env && env[0] == '1';
-    }();
-    for (const auto& [address, size] : ranges) {
+    // Gated: the end-of-pipe label waits for the landing, i.e. for the GPU to finish that work.
+    // The guest then never reads it early, but loses the overlap with the GPU when every result
+    // is gated (BB_READBACK_SMALL_GATE=1: U3 pub 46 of 60 FPS). Most results (auto-exposure and
+    // the like) do no harm a frame late; the ones the guest resets or refills between passes and
+    // reads right after the label do (U3 characters sinking, #601, #590). By default only those
+    // are gated: shaders listed in BB_READBACK_SMALL_GATE_CS or KnownGatedSmallWriters, and the
+    // ones the landing thread sees the guest rewriting (BufferCache::SmallWriterLearned;
+    // BB_READBACK_SMALL_GATE_LEARN=0 turns the learning off). BB_READBACK_SMALL_GATE_SKIP lists
+    // shaders never gated in that mode. BB_READBACK_SMALL_GATE=0: none gated, 1: all.
+    static const SmallGate mode = SmallGateMode();
+    static const bool learn = SmallGateLearning();
+    static const bool sc_log = std::getenv("BB_SC_LOG") != nullptr;
+    for (const auto& [address, size, writer] : ranges) {
         if (defer) {
             if (!buffer_cache.IsRangeGpuWritten(address, size)) {
                 continue; // none of these bytes is GPU data, the guest copy is current
             }
-            if (buffer_cache.DeferGuestCopy(address, address, size, false, gated)) {
+            const char* why = "all";
+            const bool gated = mode == SmallGate::All || SmallWriterGated(writer, &why);
+            // BB_SC_LOG: the gated results, first 40 distinct shader and address pairs.
+            if (gated && sc_log) {
+                static std::mutex log_mutex;
+                static std::set<std::pair<u64, VAddr>> logged;
+                std::scoped_lock lk{log_mutex};
+                if (logged.size() < 40 && logged.emplace(writer, address).second) {
+                    std::printf("SMALLGATE: gating shader %016llx result at %#llx (%u bytes, %s)\n",
+                                static_cast<unsigned long long>(writer),
+                                static_cast<unsigned long long>(address), size, why);
+                }
+            }
+            const u64 track = mode == SmallGate::Auto && learn ? writer : 0;
+            if (buffer_cache.DeferGuestCopy(address, address, size, false, gated, track)) {
                 continue;
             }
         }
         buffer_cache.ReadMemory(address, size, false, true);
+    }
+    // BB_COPY64_EOP_READBACK=1 (NoteCopy64Readback): always gated; the label waits for them.
+    for (const auto& [address, size, writer] : copy64) {
+        if (!buffer_cache.IsRangeGpuWritten(address, size)) {
+            copy64_stats.not_gpu.fetch_add(1, std::memory_order_relaxed);
+            continue; // nothing GPU-written there: the guest copy is current
+        }
+        if (copy64_stats.first.exchange(false, std::memory_order_relaxed)) {
+            std::printf("COPY64EOP: first readback: %#llx (%u bytes)\n",
+                        static_cast<unsigned long long>(address), size);
+            std::fflush(stdout);
+        }
+        if (defer && buffer_cache.DeferGuestCopy(address, address, size, false, true, 0)) {
+            copy64_stats.landed.fetch_add(1, std::memory_order_relaxed);
+        } else {
+            buffer_cache.ReadMemory(address, size, false, true);
+            copy64_stats.waited.fetch_add(1, std::memory_order_relaxed);
+        }
+        copy64_stats.dwords.fetch_add(size / 4, std::memory_order_relaxed);
+    }
+    if (Copy64EopReadback()) {
+        copy64_stats.Note();
     }
 }
 
@@ -2033,13 +2376,58 @@ void Rasterizer::DispatchDirect() {
     if (!pipeline) {
         return;
     }
-    if (pipelined &&
-        !IsGuestMemoryShaderHLE(pipeline->GetStage(Shader::SwStage::Compute).pgm_hash)) {
+    const auto& cs = pipeline->GetStage(Shader::SwStage::Compute);
+    if (pipelined && !IsGuestMemoryShaderHLE(cs.pgm_hash)) {
         PostDraw(pipeline, nullptr, false, 0, &CsRegs());
         return;
     }
+    if (pipelined) {
+        if (const auto stage_b = GuestCopyOnStageB(cs)) {
+            PostDraw(pipeline, nullptr, false, 0, &CsRegs());
+            // Constants overlapping the destination are bound on the recording thread, after
+            // it. Noted once the dispatch is queued: the position is the dispatch's own.
+            NotePendingGpuWrite(stage_b->dst, stage_b->size);
+            return;
+        }
+    }
     DrainDrawPipe();
     DispatchRecord(pipeline);
+}
+
+std::optional<Rasterizer::StageBCopy> Rasterizer::GuestCopyOnStageB(const Shader::Info& cs) {
+    // bbport: U2 runs ~10 raycaster copies a frame (a 64-dword copy shader). Done here, each
+    // drained the draw pipe: the GPU command thread waited for the recording thread to run dry
+    // (~30% of it in the Borneo jungle) and the recording thread then idled. A copy of GPU data
+    // (results of raycaster dispatches already recorded) writes guest memory only for the record
+    // arrays the game's CPU code reads, and only through DeferGuestCopy, never the constants the
+    // SRT walkers here read, so it runs in order on the recording thread. Only then, though:
+    // the guest memory copy the HLE makes otherwise (BB_SCALAR_COPY64_SYNC=1, or =2 without
+    // BB_SCALAR_COPY64_DEFER=1, or a source with no GPU-written bytes yet, such as one only a
+    // queued write overlaps) would land after the SRT walkers here read the destination for
+    // the draws behind it (the stale constants of U3's exploded cloth, ExecuteScalarCopyHLE).
+    // Those still drain and copy here. BB_HLE_PIPE=0 or toggle2 PipelinedRaycasterCopies: off.
+    static const bool enabled = [] {
+        const char* env = std::getenv("BB_HLE_PIPE");
+        return !(env && env[0] == '0');
+    }();
+    if (!enabled || BbToggle::Disabled2(BbToggle::PipelinedRaycasterCopies)) {
+        return std::nullopt;
+    }
+    const auto copy = RaycasterCopyRange(cs, CsRegs());
+    if (!copy) {
+        return std::nullopt;
+    }
+    if (copy->size == 0) {
+        return StageBCopy{}; // the HLE takes it and writes nothing
+    }
+    // A source with GPU-written bytes stays so when the copy runs (writes queued meanwhile
+    // only add to them); one that only a queued write overlaps is copied in guest memory.
+    if (!buffer_cache.IsRangeGpuWritten(copy->src, copy->size) ||
+        !RaycasterCopyLeavesGuestMemory(copy->size) ||
+        !buffer_cache.CanDeferGuestCopy(copy->src, copy->dst, copy->size)) {
+        return std::nullopt;
+    }
+    return StageBCopy{copy->dst, copy->size};
 }
 
 void Rasterizer::DispatchRecord(const ComputePipeline* pipeline) {
@@ -2110,7 +2498,8 @@ void Rasterizer::DispatchRecord(const ComputePipeline* pipeline) {
     if (!BindResources(pipeline)) {
         return;
     }
-    NoteSmallWrittenBuffers(cs);
+    // Both are noted (no short-circuit): either one makes the dispatch submit at once.
+    const bool gated_small_result = NoteSmallWrittenBuffers(cs) | NoteCopy64Readback(cs);
     if (StaleCheckEnabled()) {
         VAddr slot = ~VAddr{0};
         u64 slot_size = 0;
@@ -2238,7 +2627,32 @@ void Rasterizer::DispatchRecord(const ComputePipeline* pipeline) {
     pipeline->BindResources(set_writes, push_data);
 
     const vk::Pipeline handle = pipeline->Handle();
-    const u32 dim_x = cs_program.dim_x, dim_y = cs_program.dim_y, dim_z = cs_program.dim_z;
+    // bbport: workgroups compiled as smaller ones (Shader::WorkgroupSplit): that many times the
+    // workgroups in X.
+    const Shader::HwComputeRuntimeInfo hw_cs = {
+        .workgroup_size = {cs_program.num_thread_x.full, cs_program.num_thread_y.full,
+                           cs_program.num_thread_z.full},
+        .indirect = false,
+    };
+    const u32 workgroup_split = Shader::WorkgroupSplit(cs.cs_split_eligible, hw_cs);
+    u32 dim_x = cs_program.dim_x * workgroup_split;
+    const u32 dim_y = cs_program.dim_y, dim_z = cs_program.dim_z;
+    // bbport: BB_CS_SPLIT_1024 (only where WorkgroupSplit left the 1024-thread LocalSize, see
+    // SplitWorkgroup) - the shader's 1024-thread group runs as 1024/target groups of
+    // `target` threads (vk_shader_util.cpp); the extra groups cover the same global indices.
+    if (cs.split_workgroup != 0 && cs_program.num_thread_x.full == 1024) {
+        dim_x *= 1024 / cs.split_workgroup;
+        // bbport: one line per split program, so a log shows every split shader that ran (a
+        // single global flag only ever named the first one).
+        static std::array<u64, 16> printed{};
+        static size_t num_printed = 0;
+        const auto end = printed.begin() + num_printed;
+        if (num_printed < printed.size() && std::find(printed.begin(), end, cs.pgm_hash) == end) {
+            printed[num_printed++] = cs.pgm_hash;
+            std::printf("Compute shader %08x: dispatching %u-thread groups, %ux%ux%u of them\n",
+                        u32(cs.pgm_hash), cs.split_workgroup, dim_x, dim_y, dim_z);
+        }
+    }
     if (FrameCapture::Active()) {
         FrameCapture::Dispatch(cs.pgm_hash, dim_x, dim_y, dim_z);
     }
@@ -2249,7 +2663,8 @@ void Rasterizer::DispatchRecord(const ComputePipeline* pipeline) {
         const char* env = std::getenv("BB_FULL_BARRIER");
         return env ? std::atoi(env) : 0;
     }();
-    const void* checkpoint = NoteCheckpoint("dispatch", cs.pgm_hash, 0, dim_x, dim_y, dim_z, 0);
+    const void* checkpoint =
+        NoteCheckpoint(scheduler, "dispatch", cs.pgm_hash, 0, dim_x, dim_y, dim_z, 0);
     scheduler.Record([=](vk::CommandBuffer cmdbuf) {
         const vk::MemoryBarrier2 barrier = {
             .srcStageMask = vk::PipelineStageFlagBits2::eAllCommands,
@@ -2278,6 +2693,16 @@ void Rasterizer::DispatchRecord(const ComputePipeline* pipeline) {
 
     ResetBindings(true);
     scheduler.KickRecording();
+    // A gated small result (ReadBackSmallWrittenBuffers): submitted now, the landing at the next
+    // end-of-pipe label waits for the GPU to get this far only, not through the work recorded
+    // after it. BB_READBACK_SMALL_GATE_FLUSH=0: left in the open command buffer.
+    static const bool flush_gated = [] {
+        const char* env = std::getenv("BB_READBACK_SMALL_GATE_FLUSH");
+        return !(env && env[0] == '0');
+    }();
+    if (gated_small_result && flush_gated) {
+        scheduler.Flush();
+    }
 }
 
 void Rasterizer::DispatchIndirect(VAddr address, u32 offset, u32 size) {
@@ -2287,7 +2712,7 @@ void Rasterizer::DispatchIndirect(VAddr address, u32 offset, u32 size) {
     if (!pipelined) {
         DrainDrawPipe();
     }
-    const ComputePipeline* pipeline = pipeline_cache.GetComputePipeline();
+    const ComputePipeline* pipeline = pipeline_cache.GetComputePipeline(true);
     if (!pipeline) {
         return;
     }
@@ -2297,6 +2722,88 @@ void Rasterizer::DispatchIndirect(VAddr address, u32 offset, u32 size) {
         return;
     }
     DispatchIndirectRecord(pipeline, address + offset, size);
+}
+
+// bbport: BB_CS_SPLIT_1024 for indirect dispatches. The guest's group count is in its argument
+// buffer (often written by an earlier dispatch), so indirect_split.comp copies it into the stream
+// buffer with x multiplied by the split factor, and the dispatch reads the copy. Recorded before
+// the game pipeline binds its resources (this pipeline uses push descriptors on set 0).
+static void RecordIndirectSplit(const Instance& instance, Scheduler& scheduler,
+                                vk::Buffer args, u64 args_offset, vk::Buffer stream,
+                                u64 stream_offset, u32 factor) {
+    struct Pipeline {
+        vk::UniqueDescriptorSetLayout set_layout;
+        vk::UniquePipelineLayout layout;
+        vk::UniquePipeline pipeline;
+    };
+    static Pipeline pipe = [&] {
+        const auto device = instance.GetDevice();
+        Pipeline p;
+        std::array<vk::DescriptorSetLayoutBinding, 2> bindings{};
+        for (u32 i = 0; i < 2; ++i) {
+            bindings[i] = {.binding = i,
+                           .descriptorType = vk::DescriptorType::eStorageBuffer,
+                           .descriptorCount = 1,
+                           .stageFlags = vk::ShaderStageFlagBits::eCompute};
+        }
+        p.set_layout = Check(device.createDescriptorSetLayoutUnique({
+            .flags = vk::DescriptorSetLayoutCreateFlagBits::ePushDescriptorKHR,
+            .bindingCount = static_cast<u32>(bindings.size()),
+            .pBindings = bindings.data(),
+        }));
+        const vk::PushConstantRange range{.stageFlags = vk::ShaderStageFlagBits::eCompute,
+                                          .offset = 0,
+                                          .size = 2 * sizeof(u32)};
+        p.layout = Check(device.createPipelineLayoutUnique({
+            .setLayoutCount = 1,
+            .pSetLayouts = &*p.set_layout,
+            .pushConstantRangeCount = 1,
+            .pPushConstantRanges = &range,
+        }));
+        const auto module = CompileSPV(INDIRECT_SPLIT_COMP, device);
+        p.pipeline = Check(device.createComputePipelineUnique(
+            {}, vk::ComputePipelineCreateInfo{
+                    .stage = {.stage = vk::ShaderStageFlagBits::eCompute,
+                              .module = module,
+                              .pName = "main"},
+                    .layout = *p.layout,
+                }));
+        device.destroyShaderModule(module);
+        return p;
+    }();
+    // the argument buffer is bound from an aligned offset, the dwords are addressed past it
+    const u64 align = instance.StorageMinAlignment();
+    const u64 src_start = args_offset & ~(align - 1);
+    const std::array<u32, 2> push = {static_cast<u32>((args_offset - src_start) / 4), factor};
+    const u64 src_size = args_offset - src_start + 3 * sizeof(u32);
+    scheduler.Record([args, src_start, src_size, stream, stream_offset, push,
+                      layout = *pipe.layout,
+                      handle = *pipe.pipeline](vk::CommandBuffer cmdbuf) {
+        const std::array<vk::DescriptorBufferInfo, 2> infos{{
+            {args, src_start, src_size},
+            {stream, stream_offset, 3 * sizeof(u32)},
+        }};
+        std::array<vk::WriteDescriptorSet, 2> writes{};
+        for (u32 i = 0; i < 2; ++i) {
+            writes[i] = {.dstBinding = i,
+                         .descriptorCount = 1,
+                         .descriptorType = vk::DescriptorType::eStorageBuffer,
+                         .pBufferInfo = &infos[i]};
+        }
+        cmdbuf.bindPipeline(vk::PipelineBindPoint::eCompute, handle);
+        cmdbuf.pushDescriptorSetKHR(vk::PipelineBindPoint::eCompute, layout, 0, writes);
+        cmdbuf.pushConstants(layout, vk::ShaderStageFlagBits::eCompute, 0,
+                             static_cast<u32>(sizeof(push)), push.data());
+        cmdbuf.dispatch(1, 1, 1);
+        const vk::MemoryBarrier2 barrier = {
+            .srcStageMask = vk::PipelineStageFlagBits2::eComputeShader,
+            .srcAccessMask = vk::AccessFlagBits2::eShaderWrite,
+            .dstStageMask = vk::PipelineStageFlagBits2::eDrawIndirect,
+            .dstAccessMask = vk::AccessFlagBits2::eIndirectCommandRead,
+        };
+        cmdbuf.pipelineBarrier2(vk::DependencyInfo{.memoryBarrierCount = 1,
+                                                   .pMemoryBarriers = &barrier});
+    });
 }
 
 void Rasterizer::DispatchIndirectRecord(const ComputePipeline* pipeline, VAddr address,
@@ -2316,14 +2823,35 @@ void Rasterizer::DispatchIndirectRecord(const ComputePipeline* pipeline, VAddr a
     }
 
     scheduler.EndRendering();
-    pipeline->BindResources(set_writes, push_data);
 
     const vk::Pipeline handle = pipeline->Handle();
-    const vk::Buffer args = buffer->Handle();
-    const u64 args_offset = base;
-    const void* checkpoint =
-        NoteCheckpoint("indirect dispatch", pipeline->GetStage(Shader::SwStage::Compute).pgm_hash,
-                       0, size, 0, 0, address + offset);
+    vk::Buffer args = buffer->Handle();
+    u64 args_offset = base;
+    // bbport: BB_CS_SPLIT_1024 - a split shader needs `factor` times the guest's x group count,
+    // which is in the argument buffer: dispatch from a scaled copy (RecordIndirectSplit).
+    const u32 split = pipeline->GetStage(Shader::SwStage::Compute).split_workgroup;
+    if (split != 0 && 1024 % split == 0) {
+        auto& stream = buffer_cache.GetStreamBuffer();
+        const u32 zero[4] = {};
+        const u64 copy_offset = stream.Copy(zero, sizeof(zero), instance.StorageMinAlignment());
+        RecordIndirectSplit(instance, scheduler, args, args_offset, stream.Handle(), copy_offset,
+                            1024 / split);
+        runtime.AccessBuffer(buffer, base, 3 * sizeof(u32),
+                             vk::PipelineStageFlagBits2::eComputeShader,
+                             vk::AccessFlagBits2::eShaderRead);
+        static bool logged = false;
+        if (!logged) {
+            logged = true;
+            std::printf("Compute shader %08x: indirect dispatch split (x %u groups)\n",
+                        u32(pipeline->GetStage(Shader::SwStage::Compute).pgm_hash), 1024 / split);
+        }
+        args = stream.Handle();
+        args_offset = copy_offset;
+    }
+    pipeline->BindResources(set_writes, push_data);
+    const void* checkpoint = NoteCheckpoint(
+        scheduler, "indirect dispatch", pipeline->GetStage(Shader::SwStage::Compute).pgm_hash, 0,
+        size, 0, 0, address + offset);
     scheduler.Record([=](vk::CommandBuffer cmdbuf) {
         if (checkpoint) {
             cmdbuf.setCheckpointNV(checkpoint);
@@ -2772,7 +3300,9 @@ void Rasterizer::ResolveVertexBuffers(const GraphicsPipeline* pipeline,
         }
         std::tie(range.buffer, range.offset) =
             buffer_cache.ObtainBuffer(range.base_address, size, false);
-        needs_barrier |= runtime.IsBufferAccessed(range.buffer, range.offset, size);
+        if (!IsHostStreamRead(range.buffer)) {
+            needs_barrier |= runtime.IsBufferAccessed(range.buffer, range.offset, size);
+        }
     }
 
     // Bind vertex buffers
@@ -2834,8 +3364,19 @@ void Rasterizer::ResolveIndexBuffer(u32 index_offset) {
     }
     const auto [buffer, offset] =
         buffer_cache.ObtainBuffer(index_address, index_buffer_size, false);
-    needs_barrier |= runtime.IsBufferAccessed(buffer, offset, index_buffer_size);
+    if (!IsHostStreamRead(buffer)) {
+        needs_barrier |= runtime.IsBufferAccessed(buffer, offset, index_buffer_size);
+    }
     index_bind = {buffer->Handle(), offset, index_type};
+}
+
+// bbport: a read of a stream buffer range is a copy the CPU made for this command buffer
+// (ObtainBuffer): nothing the GPU wrote before is in it (a new ring range), and nothing it writes
+// later lands there (the ring keeps the range until the GPU is past it). The barrier tracker need
+// not hear of it: most bindings are such constants (~7% of the draw recording thread in Borneo).
+bool Rasterizer::IsHostStreamRead(const VideoCore::Buffer* buffer) {
+    return buffer == &buffer_cache.GetStreamBuffer() &&
+           !BbToggle::Disabled2(BbToggle::TrackedStreamReads);
 }
 
 void Rasterizer::ResetBindings(bool is_compute) {
@@ -3219,7 +3760,10 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, const PreparedStage* pre
                     }
                     return std::min<u64>(size, u64(stride) * (records - 1) + element);
                 }();
-                bound_buffers.emplace_back(buffer, offset, tracked_size, desc.is_written);
+                const bool host_stream_read = !desc.is_written && IsHostStreamRead(buffer);
+                if (!host_stream_read) {
+                    bound_buffers.emplace_back(buffer, offset, tracked_size, desc.is_written);
+                }
                 Vr::Multiview::NoteBuffer(vsharp.base_address, size, desc.is_written, adjust); // VR
                 if (g_gpu_checkpoints && num_checkpoint_buffers < std::size(checkpoint_buffers)) {
                     checkpoint_buffers[num_checkpoint_buffers++] = {
@@ -3229,8 +3773,10 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, const PreparedStage* pre
                     // Raw storage-buffer writes can also make an aliased cached image stale.
                     texture_cache.InvalidateMemoryFromGPU(vsharp.base_address, size);
                 }
-                needs_barrier |=
-                    runtime.IsBufferAccessed(buffer, offset, tracked_size, desc.is_written);
+                if (!host_stream_read) {
+                    needs_barrier |=
+                        runtime.IsBufferAccessed(buffer, offset, tracked_size, desc.is_written);
+                }
                 if (const VAddr watch = WatchedGpuWrite();
                     watch && desc.is_written && vsharp.base_address < watch + 0x1000 &&
                     watch < vsharp.base_address + size) {

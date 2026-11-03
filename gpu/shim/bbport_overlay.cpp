@@ -12,15 +12,20 @@
 #include <cstdlib>
 #include <mutex>
 #include <vector>
+#include <thread>
 
 #include <SDL3/SDL.h>
 #include "bbport_settings.h"
+#include "../bbgpu.h"
 #include <miniz.h>
 #include "imgui.h"
 #include "imgui_internal.h"
 #include "imgui_impl_vulkan.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
+
+// window.cpp: a display mode change is applied on the thread that owns the SDL window.
+extern "C" void bbgpu_display_mode_request(int mode);
 
 // DejaVu Sans (Cyrillic), embedded (third_party/fonts, Bitstream Vera license).
 #ifdef _WIN32
@@ -48,6 +53,7 @@ extern "C" const unsigned char bb_font_ttf[];
 extern "C" const unsigned char bb_font_ttf_end[];
 
 extern "C" void runtime_restart(void); // bb-probe (probe.c)
+extern "C" int runtime_savedata_wait_idle(unsigned timeout_ms); // bb-probe (runtime_savedata.c)
 
 namespace BbOverlay {
 
@@ -57,6 +63,69 @@ std::mutex imgui_mutex; // the ImGui context: window thread (input) and present 
 bool initialized = false;
 std::atomic<bool> menu_open{false};
 bool l3_down = false, r3_down = false;
+// The keys that open and close the menu (input.ini key.overlay through bbgpu_overlay_key_configure),
+// guarded by imgui_mutex. Insert until the runtime says otherwise.
+struct ToggleKey {
+    int kind = 0; // BBGPU_OVERLAY_KEY_*
+    int code = 0;
+};
+ToggleKey toggle_keys[2] = {{BBGPU_OVERLAY_KEY_SCANCODE, SDL_SCANCODE_INSERT}, {}};
+
+// Whether the key types a character (letters, digits, punctuation, Space, number pad). Bound as the
+// menu key, it is the menu key only while nothing is being typed.
+bool TypesCharacter(const SDL_KeyboardEvent& key) {
+    const SDL_Keycode code = key.key;
+    if (code >= SDLK_SPACE && code <= 0x10FFFF && code != SDLK_DELETE) {
+        return true;
+    }
+    return (key.scancode >= SDL_SCANCODE_KP_DIVIDE && key.scancode <= SDL_SCANCODE_KP_PLUS) ||
+           (key.scancode >= SDL_SCANCODE_KP_1 && key.scancode <= SDL_SCANCODE_KP_PERIOD) ||
+           key.scancode == SDL_SCANCODE_KP_EQUALS;
+}
+
+// `typing`: an ImGui text field wants the keyboard (io.WantTextInput) or the game's text dialog is
+// open (text_entry_active). A character key bound as the menu key then types instead of toggling;
+// the other keys (Insert, F-keys, ...) still do.
+bool IsToggleKey(const SDL_KeyboardEvent& key, bool typing) {
+    if (typing && TypesCharacter(key)) {
+        return false;
+    }
+    for (const ToggleKey& t : toggle_keys) {
+        if ((t.kind == BBGPU_OVERLAY_KEY_SCANCODE && static_cast<int>(key.scancode) == t.code) ||
+            (t.kind == BBGPU_OVERLAY_KEY_KEYCODE && static_cast<int>(key.key) == t.code)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+bool IsToggleButton(u8 button) {
+    for (const ToggleKey& t : toggle_keys) {
+        if (t.kind == BBGPU_OVERLAY_KEY_MOUSE && t.code == button) {
+            return true;
+        }
+    }
+    return false;
+}
+
+// "Insert / L3+R3": the title of the menu.
+std::string ToggleHint() {
+    std::string text;
+    for (const ToggleKey& t : toggle_keys) {
+        std::string name;
+        if (t.kind == BBGPU_OVERLAY_KEY_SCANCODE) {
+            name = SDL_GetScancodeName(static_cast<SDL_Scancode>(t.code));
+        } else if (t.kind == BBGPU_OVERLAY_KEY_KEYCODE) {
+            name = SDL_GetKeyName(static_cast<SDL_Keycode>(t.code));
+        } else if (t.kind == BBGPU_OVERLAY_KEY_MOUSE) {
+            name = t.code == SDL_BUTTON_MIDDLE ? "Mouse Middle" : t.code == SDL_BUTTON_X1 ? "Mouse 4" : "Mouse 5";
+        }
+        if (!name.empty()) {
+            text += name + " / ";
+        }
+    }
+    return text + "L3+R3";
+}
 bool dirty = false; // settings changed while open: saved on close
 // The game's text dialog (SetTextEntry), guarded by imgui_mutex.
 bool text_entry_active = false;
@@ -140,12 +209,47 @@ void Store(std::atomic<T>& target, T value, bool changed) {
 
 void Checkbox(const char* label, std::atomic<bool>& value) {
     bool v = value;
-    Store(value, v, ImGui::Checkbox(label, &v));
+    // The widget runs first: as one argument list, v could be read before it changed.
+    const bool changed = ImGui::Checkbox(label, &v);
+    Store(value, v, changed);
 }
 
 void Slider(const char* label, std::atomic<float>& value, float lo, float hi) {
     float v = value;
-    Store(value, v, ImGui::SliderFloat(label, &v, lo, hi, "%.2f"));
+    const bool changed = ImGui::SliderFloat(label, &v, lo, hi, "%.2f");
+    Store(value, v, changed);
+}
+
+// Quit game: the confirmation's labels.
+struct QuitText {
+    const char *button, *title, *body, *quit, *cancel, *quitting;
+};
+const QuitText& Quitting() {
+    static const QuitText en{"Quit game", "Quit the game?",
+                             "Progress since the last save is lost. A save in progress is "
+                             "finished first.",
+                             "Quit", "Cancel", "Quitting..."};
+    return en;
+}
+std::atomic<bool> quitting{false};
+
+// The same exit as closing the window (SDL_EVENT_QUIT ends the window thread's loop), once a save
+// in progress has finished (at most 5 seconds).
+void Quit() {
+    if (quitting.exchange(true)) {
+        return;
+    }
+    std::thread([] {
+        const int waited = runtime_savedata_wait_idle(5000);
+        std::printf("Quit: from the settings menu, %s\n",
+                    waited == 0 ? "no save in progress"
+                    : waited > 0 ? "after waiting for the save in progress to finish"
+                                 : "a save still in progress after 5 s (quitting anyway)");
+        std::fflush(stdout);
+        SDL_Event event{};
+        event.type = SDL_EVENT_QUIT;
+        SDL_PushEvent(&event);
+    }).detach();
 }
 
 void Hint(const char* text) {
@@ -162,18 +266,47 @@ void Hint(const char* text) {
 void Menu() {
     auto& s = BbSettings::Get();
     const ImGuiViewport* viewport = ImGui::GetMainViewport();
+    // The menu fits whatever window the game has: 620 px wide when there is room, never wider or
+    // taller than the game window (the long option list scrolls inside instead of running off the
+    // screen) and it can still be resized by hand within those limits.
+    const float edge = 20.0f * base_scale;
+    const float max_w = std::max(viewport->WorkSize.x - edge * 2.0f, 320.0f * base_scale);
+    const float max_h = std::max(viewport->WorkSize.y - edge * 2.0f, 200.0f * base_scale);
     ImGui::SetNextWindowPos(ImVec2(viewport->WorkPos.x + 40.0f * base_scale,
                                    viewport->WorkPos.y + 40.0f * base_scale),
                             ImGuiCond_Appearing);
-    ImGui::SetNextWindowSize(ImVec2(620.0f * base_scale, 0.0f), ImGuiCond_Appearing);
+    ImGui::SetNextWindowSize(ImVec2(std::min(620.0f * base_scale, max_w), 0.0f), ImGuiCond_Appearing);
+    ImGui::SetNextWindowSizeConstraints(ImVec2(std::min(300.0f * base_scale, max_w),
+                                               std::min(160.0f * base_scale, max_h)),
+                                        ImVec2(max_w, max_h));
     bool keep_open = true;
-    if (!ImGui::Begin("Uncharted — settings  (Insert / L3+R3)", &keep_open,
-                      ImGuiWindowFlags_NoCollapse)) {
+    // "###": the window keeps its identity whatever the keys are called.
+    const std::string title = "Uncharted — settings  (" + ToggleHint() + ")###bbport_menu";
+    if (!ImGui::Begin(title.c_str(), &keep_open, ImGuiWindowFlags_NoCollapse)) {
         ImGui::End();
         return;
     }
     ImGui::Text("%.0f FPS  (%.1f ms)", frame_ms_avg > 0.0f ? 1000.0f / frame_ms_avg : 0.0f,
                 frame_ms_avg);
+
+    ImGui::SeparatorText("Window");
+    static const char* display_modes[] = {"Windowed", "Borderless (fullscreen)",
+                                         "Exclusive fullscreen"};
+    const int display_mode = s.display_mode;
+    if (ImGui::BeginCombo("Display mode", display_modes[display_mode])) {
+        for (int i = 0; i < BbSettings::DisplayModeCount; ++i) {
+            if (ImGui::Selectable(display_modes[i], i == display_mode)) {
+                Store(s.display_mode, i, true);
+                bbgpu_display_mode_request(i); // the window thread applies it
+            }
+        }
+        ImGui::EndCombo();
+    }
+    Hint("Windowed keeps the game in its own window. Borderless fills the screen with the desktop's "
+         "own mode. Exclusive fullscreen asks the display for a mode of its own at the panel's "
+         "native size and minimizes when another window takes the focus; some Wayland "
+         "compositors refuse and stay borderless. The launcher's Fullscreen switch picks the "
+         "mode at start (on: this choice if it is a fullscreen one, else borderless; off: windowed).");
 
     ImGui::SeparatorText("Temporal upscaler");
     static const char* upscalers[] = {"Off", "FSR 3.1", "FSR 4 (INT8)", "FSR 4.1.1 (INT8)",
@@ -192,7 +325,15 @@ void Menu() {
             ImGui::EndDisabled();
             if (!supported) {
                 ImGui::SameLine();
-                ImGui::TextDisabled("— not supported by this GPU");
+                // FSR 4 on a capable GPU without its assets (fsr4_shaders, BB_FSR4_DIR).
+                const char* fsr4_problem = s.fsr4_problem.load();
+                // (4.1.1 offered means the GPU runs FSR 4: only the files can be missing, also
+                // while a 4.1.1 problem is the message shown.)
+                const bool no_assets = i == BbSettings::UpscalerFsr4 &&
+                                       ((fsr4_problem && std::strncmp(fsr4_problem, "assets", 6) == 0) ||
+                                        s.fsr411_supported.load());
+                ImGui::TextDisabled("%s", no_assets ? "— files not installed"
+                                                    : "— not supported by this GPU");
             }
         }
         ImGui::EndCombo();
@@ -203,7 +344,8 @@ void Menu() {
     if (const char* problem = s.xess_problem.load(); problem && upscaler == BbSettings::UpscalerXess) {
         ImGui::TextColored(ImVec4(1.0f, 0.5f, 0.3f, 1.0f), "XeSS: %s", problem);
     }
-    if (const char* problem = s.fsr4_problem.load()) {
+    // Missing FSR 4 assets are shown next to the disabled entry above, not as a warning here.
+    if (const char* problem = s.fsr4_problem.load(); problem && std::strncmp(problem, "assets", 6) != 0) {
         ImGui::PushTextWrapPos();
         ImGui::TextColored(ImVec4(1.0f, 0.5f, 0.3f, 1.0f), "FSR 4 unavailable: %s", problem);
         if (!BbSettings::IsFsr4(s.upscaler))
@@ -227,9 +369,12 @@ void Menu() {
     }
     const bool upscaler_on = s.upscaler != BbSettings::UpscalerOff;
     const bool taa = s.upscaler == BbSettings::UpscalerTaa;
+    // Uncharted renders the scene at the game's own size (Display page, BB_GAME_RES): the
+    // renderer runs the upscaler as Native AA there and ignores the preset.
+    const bool game_size = s.game_size_render.load();
     ImGui::BeginDisabled(!upscaler_on);
-    ImGui::BeginDisabled(taa);
-    int preset = taa ? BbSettings::NativeAA : s.preset.load();
+    ImGui::BeginDisabled(taa || game_size);
+    int preset = taa || game_size ? BbSettings::NativeAA : s.preset.load();
     char preset_label[64];
     std::snprintf(preset_label, sizeof(preset_label), "%s (x%.1f)", BbSettings::PresetName(preset),
                   BbSettings::PresetScale(preset));
@@ -267,6 +412,9 @@ void Menu() {
             Hint("BB_RENDER_RES fixes the scene size at startup. Remove that variable to change "
                  "resolution and presets without restarting the game.");
         }
+    } else if (game_size) {
+        Hint("This game renders the scene at its own resolution (the launcher's Display page): the "
+             "upscaler works as anti-aliasing at that size (Native AA), the preset does not lower it.");
     } else {
         Hint("Native AA: FSR works as anti-aliasing. The other presets lower the scene's render "
              "resolution relative to the output. The UI is drawn at the output resolution. "
@@ -347,6 +495,7 @@ void Menu() {
     ImGui::SeparatorText("Output resolution");
     static const char* outputs[] = {"1280 x 720", "1920 x 1080", "2560 x 1440", "3840 x 2160"};
     int output = s.output_res;
+    ImGui::BeginDisabled(game_size);
     if (ImGui::BeginCombo("Output resolution", outputs[output])) {
         for (int i = 0; i < BbSettings::OutputCount; ++i) {
             if (ImGui::Selectable(outputs[i], i == output)) {
@@ -355,7 +504,11 @@ void Menu() {
         }
         ImGui::EndCombo();
     }
-    if (BbSettings::FixedRenderSession()) {
+    ImGui::EndDisabled();
+    if (game_size) {
+        Hint("The frame and the UI have the game's own resolution: set it on the launcher's Display "
+             "page (applies after restarting the game).");
+    } else if (BbSettings::FixedRenderSession()) {
         Hint("Size of the finished frame and the UI. The preset sets the scene size relative to "
              "the output: 4K Performance = 1920x1080. Applies after restarting the game.");
     } else {
@@ -365,6 +518,7 @@ void Menu() {
     }
     static const char* live_modes[] = {"Auto (by GPU)", "Off (faster)", "On"};
     int live = s.live_resolution + 1;
+    ImGui::BeginDisabled(game_size);
     if (ImGui::BeginCombo("Live resolution changes", live_modes[live])) {
         for (int i = 0; i < 3; ++i) {
             if (ImGui::Selectable(live_modes[i], i == live)) {
@@ -373,6 +527,7 @@ void Menu() {
         }
         ImGui::EndCombo();
     }
+    ImGui::EndDisabled();
     Hint("On: output resolution and preset change without a restart, but the game's post-processing "
          "stays at 1080p, noticeably slower on the Steam Deck and older GPUs. "
          "Off: everything renders at the preset's size, changes need a restart. Auto turns "
@@ -393,13 +548,46 @@ void Menu() {
 
     ImGui::SeparatorText("Other");
     Checkbox("FPS counter in the corner", s.show_fps);
+    Checkbox("Raw mouse aiming and cover camera", s.gyro_aim);
+    ImGui::SameLine();
+    ImGui::TextDisabled("(Uncharted 1; also for a gyro set up in Steam as a mouse)");
 
     ImGui::Spacing();
     if (ImGui::Button("Close")) {
         keep_open = false;
     }
     ImGui::SameLine();
+    const QuitText& q = Quitting();
+    ImGui::BeginDisabled(quitting);
+    if (ImGui::Button(quitting ? q.quitting : q.button)) {
+        ImGui::OpenPopup("##quit");
+    }
+    ImGui::EndDisabled();
+    ImGui::SameLine();
     ImGui::TextDisabled("Settings are saved to bbport.ini");
+    // The confirmation: mouse, keyboard or controller (D-pad, Cross); Cancel has the focus.
+    if (ImGui::BeginPopupModal("##quit", nullptr,
+                               ImGuiWindowFlags_AlwaysAutoResize | ImGuiWindowFlags_NoTitleBar)) {
+        ImGui::TextUnformatted(q.title);
+        ImGui::PushTextWrapPos(ImGui::GetFontSize() * 24.0f);
+        ImGui::TextDisabled("%s", q.body);
+        ImGui::PopTextWrapPos();
+        ImGui::Spacing();
+        if (ImGui::Button(q.quit)) {
+            if (dirty) {
+                dirty = false;
+                BbSettings::Save();
+            }
+            Quit();
+            ImGui::CloseCurrentPopup();
+        }
+        ImGui::SameLine();
+        if (ImGui::Button(q.cancel)) {
+            ImGui::CloseCurrentPopup();
+        }
+        ImGui::SetItemDefaultFocus();
+        ImGui::EndPopup();
+    }
     ImGui::End();
     if (!keep_open) {
         SetOpen(false);
@@ -707,7 +895,7 @@ void Init(const Vulkan::Instance& instance, vk::Format format, u32 image_count) 
         return;
     }
     initialized = true;
-    std::printf("Overlay: menu ready (Insert or L3+R3)\n");
+    std::printf("Overlay: menu ready (%s)\n", ToggleHint().c_str());
 }
 
 void UpdateTextInput(SDL_Window* window) {
@@ -725,10 +913,23 @@ void UpdateTextInput(SDL_Window* window) {
     }
 }
 
+void ConfigureToggleKey(int slot, int kind, int code) {
+    if (slot < 0 || slot > 1) {
+        return;
+    }
+    std::scoped_lock lock{imgui_mutex};
+    toggle_keys[slot] = {kind, code};
+    if (slot == 1) { // the runtime sets both slots in order: log the result once
+        std::printf("Overlay: menu key %s\n", ToggleHint().c_str());
+    }
+}
+
 bool HandleEvent(const SDL_Event& event) {
     std::scoped_lock lock{imgui_mutex};
     if (!initialized) {
-        return false;
+        // A mouse button bound as the menu key never reaches the game, before the menu exists too.
+        return (event.type == SDL_EVENT_MOUSE_BUTTON_DOWN || event.type == SDL_EVENT_MOUSE_BUTTON_UP) &&
+               IsToggleButton(event.button.button);
     }
     ImGuiIO& io = ImGui::GetIO();
     const bool is_open = menu_open;
@@ -736,10 +937,15 @@ bool HandleEvent(const SDL_Event& event) {
     case SDL_EVENT_KEY_DOWN:
     case SDL_EVENT_KEY_UP: {
         const bool down = event.type == SDL_EVENT_KEY_DOWN;
-        if (down && !event.key.repeat &&
-            (event.key.key == SDLK_INSERT || (is_open && event.key.key == SDLK_ESCAPE))) {
-            SetOpen(event.key.key == SDLK_INSERT ? !is_open : false);
-            return true;
+        if (down && !event.key.repeat) {
+            if (IsToggleKey(event.key, io.WantTextInput || text_entry_active)) {
+                SetOpen(!is_open);
+                return true;
+            }
+            if (is_open && event.key.key == SDLK_ESCAPE) {
+                SetOpen(false);
+                return true;
+            }
         }
         if (!is_open) {
             return false;
@@ -792,6 +998,13 @@ bool HandleEvent(const SDL_Event& event) {
     }
     case SDL_EVENT_MOUSE_BUTTON_DOWN:
     case SDL_EVENT_MOUSE_BUTTON_UP: {
+        if (IsToggleButton(event.button.button)) {
+            // Press and release both stay out of the game, like the menu key on the keyboard.
+            if (event.type == SDL_EVENT_MOUSE_BUTTON_DOWN) {
+                SetOpen(!is_open);
+            }
+            return true;
+        }
         if (!is_open) {
             return false;
         }

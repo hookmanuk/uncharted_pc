@@ -40,9 +40,16 @@
 #include <thread>
 #include <vector>
 #include <vk_mem_alloc.h>
+#include <SDL3/SDL.h>
 #ifdef MemoryBarrier
 #undef MemoryBarrier // bbport: winnt.h macro (through fmt), clashes with vk::MemoryBarrier
 #endif
+
+extern "C" int bbgpu_share_take(void); // window.cpp
+
+namespace Libraries::VideoOut {
+void NoteRenderFrameWait(u64 ns); // driver.cpp, BB_CLOCK_LOG
+}
 
 namespace Vulkan {
 
@@ -172,9 +179,10 @@ Presenter::~Presenter() {
     draw_scheduler.Finish();
     present_scheduler.Finish();
     flip_scheduler.Finish();
-    Check(draw_scheduler.CommandBuffer().reset());
-    Check(present_scheduler.CommandBuffer().reset());
-    Check(flip_scheduler.CommandBuffer().reset());
+    // bbport: a device lost here has already been reported; a destructor must not end the process.
+    CheckTeardown<"reset the draw command buffer">(draw_scheduler.CommandBuffer().reset());
+    CheckTeardown<"reset the present command buffer">(present_scheduler.CommandBuffer().reset());
+    CheckTeardown<"reset the flip command buffer">(flip_scheduler.CommandBuffer().reset());
 
     const vk::Device device = instance.GetDevice();
     for (auto& frame : present_frames) {
@@ -323,11 +331,11 @@ Frame* Presenter::PrepareLastFrame() {
         if (result == vk::Result::eSuccess) {
             break;
         }
-        if (result == vk::Result::eTimeout) {
-            continue;
+        if (result == vk::Result::eErrorDeviceLost) {
+            DeviceLost(instance.GetDevice()); // bbport: GPU crash report, not a bare assert
         }
-        ASSERT_MSG(result != vk::Result::eErrorDeviceLost,
-                   "Device lost during waiting for a frame");
+        ASSERT_MSG(result == vk::Result::eTimeout, "Waiting for a frame failed: {}",
+                   vk::to_string(result));
     }
 
     auto& scheduler = flip_scheduler;
@@ -417,6 +425,80 @@ static void DumpRaw(const Instance& instance, Scheduler& scheduler, vk::CommandB
     });
 }
 
+// bbport: the screenshot key (window.cpp, bbgpu_share_take): the game's display buffer of this frame (its own
+// resolution, HUD included) as a PNG (BMP before SDL 3.4) in <BB_GPU_USER_DIR>/screenshots, written once the
+// GPU is done with the copy.
+static void ShareShot(const Instance& instance, Scheduler& scheduler, vk::CommandBuffer cmdbuf,
+                      vk::Image image, vk::ImageLayout layout, u32 w, u32 h, vk::Format format) {
+    const bool bgra = format == vk::Format::eB8G8R8A8Srgb || format == vk::Format::eB8G8R8A8Unorm;
+    const bool rgba = format == vk::Format::eR8G8B8A8Srgb || format == vk::Format::eR8G8B8A8Unorm;
+    const bool a2r10g10b10 = format == vk::Format::eA2R10G10B10UnormPack32;
+    if (!bgra && !rgba && !a2r10g10b10) {
+        std::printf("Screenshot: display format %u is not supported\n", static_cast<unsigned>(format));
+        return;
+    }
+    const VkBufferCreateInfo buffer_ci{.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
+                                       .size = VkDeviceSize(w) * h * 4,
+                                       .usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT};
+    const VmaAllocationCreateInfo alloc_ci{
+        .flags = VMA_ALLOCATION_CREATE_MAPPED_BIT | VMA_ALLOCATION_CREATE_HOST_ACCESS_RANDOM_BIT,
+        .usage = VMA_MEMORY_USAGE_AUTO_PREFER_HOST};
+    VkBuffer buffer{};
+    VmaAllocation allocation{};
+    VmaAllocationInfo info{};
+    if (vmaCreateBuffer(instance.GetAllocator(), &buffer_ci, &alloc_ci, &buffer, &allocation,
+                        &info) != VK_SUCCESS) {
+        return;
+    }
+    cmdbuf.copyImageToBuffer(image, layout, buffer,
+                             vk::BufferImageCopy{.imageSubresource = {vk::ImageAspectFlagBits::eColor, 0, 0, 1},
+                                                 .imageExtent = {w, h, 1}});
+    const char* dir = std::getenv("BB_GPU_USER_DIR");
+    const std::time_t now = std::time(nullptr);
+    char stamp[32];
+    std::strftime(stamp, sizeof(stamp), "%Y%m%d-%H%M%S", std::localtime(&now));
+    static int shot_index = 0;
+    char name[64];
+    std::snprintf(name, sizeof(name), "/Uncharted-%s-%02d.png", stamp, ++shot_index);
+    const std::string folder = std::string{dir && *dir ? dir : "out"} + "/screenshots";
+    const int kind = bgra ? 0 : rgba ? 1 : 2;
+    scheduler.DeferPriorityOperation([allocator = instance.GetAllocator(), buffer, allocation, info, w, h, kind,
+                                      folder, file = folder + name] {
+        vmaInvalidateAllocation(allocator, allocation, 0, VK_WHOLE_SIZE);
+        std::vector<u8> pixels(static_cast<size_t>(w) * h * 4);
+        const u8* source = static_cast<const u8*>(info.pMappedData);
+        if (kind == 2) { // A2R10G10B10: the top 8 of each 10-bit channel, as RGBA
+            const u32* in = reinterpret_cast<const u32*>(source);
+            for (size_t i = 0; i < static_cast<size_t>(w) * h; ++i) {
+                pixels[i * 4 + 0] = static_cast<u8>((in[i] >> 22) & 0xFF);
+                pixels[i * 4 + 1] = static_cast<u8>((in[i] >> 12) & 0xFF);
+                pixels[i * 4 + 2] = static_cast<u8>((in[i] >> 2) & 0xFF);
+            }
+        } else {
+            std::memcpy(pixels.data(), source, pixels.size());
+        }
+        for (size_t i = 3; i < pixels.size(); i += 4) {
+            pixels[i] = 0xFF; // the display buffer's alpha is not part of the picture
+        }
+        std::error_code error;
+        std::filesystem::create_directories(folder, error);
+        SDL_Surface* surface = SDL_CreateSurfaceFrom(static_cast<int>(w), static_cast<int>(h),
+                                                     kind == 0 ? SDL_PIXELFORMAT_BGRA32 : SDL_PIXELFORMAT_RGBA32,
+                                                     pixels.data(), static_cast<int>(w) * 4);
+        bool saved = false;
+        if (surface) {
+#if SDL_VERSION_ATLEAST(3, 4, 0)
+            saved = SDL_SavePNG(surface, file.c_str());
+#else
+            saved = SDL_SaveBMP(surface, (file + ".bmp").c_str());
+#endif
+            SDL_DestroySurface(surface);
+        }
+        std::printf(saved ? "Screenshot: saved %s\n" : "Screenshot: could not save %s\n", file.c_str());
+        vmaDestroyBuffer(allocator, buffer, allocation);
+    });
+}
+
 Frame* Presenter::PrepareFrame(const Libraries::VideoOut::BufferAttributeGroup& attribute,
                                VAddr cpu_address) {
     // bbport: BB_FRAME_DUMP_TRIGGER=<file>: when the file exists it is removed and this frame's
@@ -425,6 +507,8 @@ Frame* Presenter::PrepareFrame(const Libraries::VideoOut::BufferAttributeGroup& 
     static const char* frame_dump_trigger = std::getenv("BB_FRAME_DUMP_TRIGGER");
     static int frame_dump_index = 0;
     const bool frame_dump = frame_dump_trigger && std::remove(frame_dump_trigger) == 0;
+    // bbport: the screenshot key (bbgpu_share_take): this frame's display buffer is saved as a picture.
+    const bool share_shot = bbgpu_share_take() != 0;
     // bbport: scaled upscaler presets: the output-size display buffer drawn by the port.
     TemporalUpscaler::Display display{};
     const bool upscaled = rasterizer->GetUpscaler().DisplayOverride(cpu_address, display);
@@ -482,6 +566,9 @@ Frame* Presenter::PrepareFrame(const Libraries::VideoOut::BufferAttributeGroup& 
         }));
         draw_scheduler.DeferOperation([device, image_view] { device.destroyImageView(image_view); });
         image_size = vk::Extent2D{display.width, display.height};
+        if (share_shot) {
+            std::printf("Screenshot: not available with the upscaler presets\n");
+        }
         const vk::ImageMemoryBarrier2 to_read{
             .srcStageMask = vk::PipelineStageFlagBits2::eColorAttachmentOutput,
             .srcAccessMask = vk::AccessFlagBits2::eColorAttachmentWrite,
@@ -495,13 +582,20 @@ Frame* Presenter::PrepareFrame(const Libraries::VideoOut::BufferAttributeGroup& 
         cmdbuf.pipelineBarrier2({.imageMemoryBarrierCount = 1, .pImageMemoryBarriers = &to_read});
     } else {
         auto& image = texture_cache.GetImage(image_id);
-        if (frame_dump) {
+        if (frame_dump || share_shot) {
             runtime.Transit(&image, vk::ImageLayout::eTransferSrcOptimal,
                             vk::PipelineStageFlagBits2::eTransfer, vk::AccessFlagBits2::eTransferRead);
             runtime.FlushBarriers();
-            DumpRaw(instance, draw_scheduler, cmdbuf, image.GetImage(),
-                    vk::ImageLayout::eTransferSrcOptimal, image.info.size.width,
-                    image.info.size.height, "display", frame_dump_index);
+            if (frame_dump) {
+                DumpRaw(instance, draw_scheduler, cmdbuf, image.GetImage(),
+                        vk::ImageLayout::eTransferSrcOptimal, image.info.size.width,
+                        image.info.size.height, "display", frame_dump_index);
+            }
+            if (share_shot) {
+                ShareShot(instance, draw_scheduler, cmdbuf, image.GetImage(),
+                          vk::ImageLayout::eTransferSrcOptimal, image.info.size.width,
+                          image.info.size.height, image.info.pixel_format);
+            }
         }
         Vr::Stereo::OnDisplayBuffer(runtime, cmdbuf, image); // VR: the HUD with its alpha
         image_view = *image.FindView(view_info).image_view;
@@ -799,6 +893,9 @@ bool Presenter::PresentImage(Frame* frame, vk::Image image, bool last) {
     // the frame's present fence and future GetRenderFrame() call will hang waiting for this frame.
     if (last) {
         const auto reset_result = instance.GetDevice().resetFences(frame->present_done);
+        if (reset_result == vk::Result::eErrorDeviceLost) {
+            DeviceLost(instance.GetDevice()); // bbport: GPU crash report, not a bare assert
+        }
         ASSERT_MSG(reset_result == vk::Result::eSuccess,
                    "Unexpected error resetting present done fence: {}",
                    vk::to_string(reset_result));
@@ -941,6 +1038,7 @@ bool Presenter::PresentImage(Frame* frame, vk::Image image, bool last) {
 }
 
 Frame* Presenter::GetRenderFrame() {
+    const auto wait_begin = std::chrono::steady_clock::now();
     // Wait for free presentation frames
     Frame* frame;
     {
@@ -963,13 +1061,17 @@ Frame* Presenter::GetRenderFrame() {
 
     // Wait for the presentation to be finished so all frame resources are free
     while (wait() != vk::Result::eSuccess) {
-        ASSERT_MSG(result != vk::Result::eErrorDeviceLost,
-                   "Device lost during waiting for a frame");
-        // Retry if the waiting times out
-        if (result == vk::Result::eTimeout) {
-            continue;
+        if (result == vk::Result::eErrorDeviceLost) {
+            DeviceLost(device); // bbport: GPU crash report, not a bare assert
         }
+        ASSERT_MSG(result == vk::Result::eTimeout, "Waiting for a frame failed: {}",
+                   vk::to_string(result));
     }
+
+    ::Libraries::VideoOut::NoteRenderFrameWait(static_cast<u64>(
+        std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() -
+                                                             wait_begin)
+            .count()));
 
     if (frame->width != expected_frame_width || frame->height != expected_frame_height ||
         frame->is_hdr != swapchain.GetHDR()) {

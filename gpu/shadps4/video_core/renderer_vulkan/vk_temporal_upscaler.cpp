@@ -232,7 +232,8 @@ TemporalUpscaler::TemporalUpscaler(const Instance& instance_, Scheduler& schedul
       runtime{runtime_}, camera_motion{camera_motion_}, scene_targets{scene_targets_} {
     // Reject unsupported shaders before allocating resources or recording a frame.
     BbSettings::ConfigureUpscalerSupport(instance.IsFsr4Int8Supported(),
-                                         instance.IsFsr411Supported());
+                                         instance.IsFsr411Supported(),
+                                         Fsr4Upscaler::AssetsPresent());
     fsr4 = std::make_unique<Fsr4Upscaler>(instance, scheduler);
     {
         const Dlss* dlss = Dlss::Get();
@@ -264,6 +265,15 @@ TemporalUpscaler::TemporalUpscaler(const Instance& instance_, Scheduler& schedul
         if (std::sscanf(res, "%ux%u", &w, &h) == 2 && w && h) {
             target_width = w;
             target_height = h;
+        }
+    }
+    // The games' render size (run.py, src/runtime_display.c: the same bounds, made even).
+    if (const char* res = std::getenv("BB_GAME_RES")) {
+        u32 w = 0, h = 0;
+        if (std::sscanf(res, "%ux%u", &w, &h) == 2 && w >= 640 && h >= 360 && w <= 7680 &&
+            h <= 4320) {
+            game_width = w & ~1u;
+            game_height = h & ~1u;
         }
     }
     // Explicit resolution overrides retain the old compatibility path. Normal presets
@@ -344,6 +354,16 @@ void TemporalUpscaler::OnSceneColor(VideoCore::ImageId color) {
 }
 
 namespace {
+// What fsr4_problem goes back to when FSR 4 has nothing to report: on a GPU that runs FSR 4
+// (4.1.1 is offered) without the v07 assets, the startup note (bbport_settings.cpp), so the
+// disabled FSR 4 entry keeps saying "files not installed" after FSR 4.1.1 has run.
+const char* Fsr4IdleProblem() {
+    const auto& s = BbSettings::Get();
+    return !s.fsr4_supported && s.fsr411_supported
+               ? "assets not installed (fsr4_shaders, tools/fetch_fsr4_assets.sh)"
+               : nullptr;
+}
+
 float Halton(u32 index, u32 base) {
     float f = 1.0f, result = 0.0f;
     for (u32 i = index; i > 0; i /= base) {
@@ -410,7 +430,7 @@ bool TemporalUpscaler::OnFrameStart() {
         // A failed provider keeps a fatal flag internally; a user retry gets a fresh context.
         scheduler.Finish();
         fsr4 = std::make_unique<Fsr4Upscaler>(instance, scheduler);
-        if (BbSettings::IsFsr4(upscaler)) BbSettings::Get().fsr4_problem = nullptr;
+        if (BbSettings::IsFsr4(upscaler)) BbSettings::Get().fsr4_problem = Fsr4IdleProblem();
     }
     if (applied_upscaler != upscaler) fsr4_failed = false; // retry after a menu change
     // Dynamic scene resolution scaling (live preset switching) works on all GPUs.
@@ -427,8 +447,18 @@ bool TemporalUpscaler::OnFrameStart() {
                                   upscaler == BbSettings::UpscalerFsr3);
         }
     }
-    BbSettings::Get().active_render_width = Scaled() ? render_width : scene_targets.Size().width;
-    BbSettings::Get().active_render_height = Scaled() ? render_height : scene_targets.Size().height;
+    BbSettings::Get().game_size_render = camera_motion.VelocityMode();
+    if (camera_motion.VelocityMode()) {
+        // The scene renders at the game's own size whatever the preset: report the size the
+        // upscaler last took it at, or the game's size before that / with the upscaler off.
+        const bool ran = active && run_width != 0;
+        BbSettings::Get().active_render_width = ran ? run_width : game_width;
+        BbSettings::Get().active_render_height = ran ? run_height : game_height;
+    } else {
+        BbSettings::Get().active_render_width = Scaled() ? render_width : scene_targets.Size().width;
+        BbSettings::Get().active_render_height =
+            Scaled() ? render_height : scene_targets.Size().height;
+    }
     if (changed || !dispatched_last_frame) reset = true;
     if (changed) jitter_index = 0;
     applied_preset = preset;
@@ -1152,6 +1182,15 @@ void TemporalUpscaler::Run() {
     if (!EnsureResources(w, h, ow, oh, true)) {
         failed = true;
         return;
+    }
+    if (w != run_width || h != run_height || ow != run_out_width || oh != run_out_height) {
+        run_width = w;
+        run_height = h;
+        run_out_width = ow;
+        run_out_height = oh;
+        std::printf("Upscaler: input %ux%u -> output %ux%u (provider %d, preset %d, %s)\n", w, h,
+                    ow, oh, BbSettings::Get().upscaler.load(), applied_preset,
+                    camera_motion.VelocityMode() ? "game size" : "live preset");
     }
     const auto depth_format = depth.info.pixel_format;
     const auto depth_view =
@@ -2158,7 +2197,7 @@ bool TemporalUpscaler::RecordFsr4(vk::CommandBuffer cmdbuf, Fsr4Upscaler::Image 
     static std::string shown;
     const char* problem = fsr4->Problem();
     if (!problem) {
-        BbSettings::Get().fsr4_problem = nullptr;
+        BbSettings::Get().fsr4_problem = Fsr4IdleProblem();
     } else if (shown != problem) {
         shown = problem;
         static std::array<std::string, 8> kept;

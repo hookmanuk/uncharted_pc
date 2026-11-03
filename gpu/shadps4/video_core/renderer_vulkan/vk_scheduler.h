@@ -760,11 +760,18 @@ public:
             return;
         }
         if (!record_chunk->Push(std::forward<Func>(func))) {
-            full_chunks.push_back(std::move(record_chunk));
-            record_chunk = AcquireChunk();
+            RetireChunk();
             const bool pushed = record_chunk->Push(std::forward<Func>(func));
             ASSERT(pushed);
         }
+    }
+
+    /// bbport: replaces the current chunk with a fresh one. The replacement is taken first, so
+    /// `record_chunk` is never null: code that re-enters the recording side (a guest memory
+    /// fault handled inline on this thread) used to find it null between the two steps.
+    void RetireChunk() {
+        auto next = AcquireChunk();
+        full_chunks.push_back(std::exchange(record_chunk, std::move(next)));
     }
 
     /// True when Record() defers commands (and RecordData() copies into chunks).
@@ -783,8 +790,7 @@ public:
             bytes = 0; // RecordData puts it in the chunk's overflow storage; keep room for the command
         }
         if (RecordChunk::Capacity - record_chunk->Size() < bytes + 1024) {
-            full_chunks.push_back(std::move(record_chunk));
-            record_chunk = AcquireChunk();
+            RetireChunk();
         }
     }
 
@@ -847,7 +853,10 @@ public:
     /// it to the copy threads' completion (BbCopy::AfterCopies).
     /// `landing_seq`: the deferred raycaster copies up to it (landing_gate.h) land before the
     /// signal runs.
-    void SignalAfterHostCopies(std::function<void()> signal, u64 landing_seq = 0);
+    /// `off_recorder`: when deferred, `signal` runs on the landing thread, never on the
+    /// recording thread or a copy thread (LandingGate::Post): for the flip interrupt.
+    void SignalAfterHostCopies(std::function<void()> signal, u64 landing_seq = 0,
+                               bool off_recorder = false);
 
     /// bbport: before a guest-visible write that is not deferred (WriteData, end-of-shader
     /// fences, flip): waits until every signal handed to SignalAfterHostCopies ran, so that

@@ -1,175 +1,91 @@
 # Uncharted: The Nathan Drake Collection for Windows (community build)
 
-Uncharted 1, 2 and 3 from the PS4 collection running natively on Windows, built on
-[SuperMedo's port](https://github.com/Supermedo/uncharted_pc) (0.3.8), with fixes from across the community.
+Community build by [drakolordx7](https://github.com/drakolordx7) of [SuperMedo's Uncharted PC port](https://github.com/Supermedo/uncharted_pc), with fixes from players and other forks. Runs Uncharted 1, 2 and 3 from the PS4 collection on Windows.
 
-The port is SuperMedo's work: the original PS4 game code runs directly on your PC and the
-graphics go through Vulkan. This fork collects the fixes people have written since then, ours and
-other contributors', in one build that you can download and play. Everything we write here is also
-sent upstream as a pull request, so SuperMedo can take any of it at any time.
+[Download the latest build](https://github.com/drakolordx7/uncharted_pc/releases/latest)
 
-[Download the latest community build](https://github.com/drakolordx7/uncharted_pc/releases/latest) ·
-[What's in it](#whats-in-this-build) · [Report a problem](https://github.com/drakolordx7/uncharted_pc/issues/new/choose) ·
-[Credits](CREDITS.md)
-
-> No game files are included. You need your own decrypted dump of the collection
-> (CUSA02343, CUSA02320, ...: the folder with eboot.bin, big2-ps4_Shipping.elf,
-> big3-ps4_Shipping.elf, sce_sys, u1data, u2data and u3data).
-> This project is not affiliated with Sony Interactive Entertainment or Naughty Dog.
-
-## Installing and updating
-
-Unzip the download into a folder and run `Uncharted.exe`. To update, unzip the new build over the
-old folder and keep your `user` folder: it holds your settings, saves and logs. The launcher checks
-this fork's releases for updates, not the official ones.
-
-The builds don't include the DLSS bridge. XeSS and FSR work on any GPU.
-
-## What's in this build
-
-Everything in the official 0.3.8, plus the changes below. Where there is a link, it goes to the pull
-request on the official repository.
-
-### Crashes
-
-- Uncharted 1, 2 and 3 "execute access to 0" (exit code 3) when the constant table fill takes a page fault: its pages are written before the fill starts, on top of 0.3.8's red-zone fix: [#396](https://github.com/Supermedo/uncharted_pc/pull/396)
-
-### Controls and launcher
-
-- `--u1`, `--u2`, `--u3` start a game straight from a shortcut: [#399](https://github.com/Supermedo/uncharted_pc/pull/399)
-
-### Older CPUs
-
-- Runs on Intel Sandy and Ivy Bridge: the instructions they lack (BMI1, MOVBE, LZCNT, F16C) are rewritten at start-up (adapted from FelipePrado0's SpartanPort). Players confirmed it on a real Ivy Bridge. 0.3.8 has its own rewrite for Ivy Bridge; this build uses this one instead, because it also covers Sandy Bridge.
-
-### From other forks
-
-- A display flip that arrives before its label no longer stops the game, a missing CE task no longer crashes the GPU thread, and FSR 3.1 no longer uses protected memory (noise on AMD Phoenix): from iannitram's fork
-- FSR 3 frame generation no longer leaks video memory every frame, and conditional GPU commands test the whole condition: Mevlock
-- Dark title bar for the launcher on Windows: soni424
-- Faster in Uncharted 2 and 3 (U3 Cartagena square 26 → 48 FPS in our tests): compute work no longer waits on the whole draw pipe, compute fences run in order with it, and typed-buffer writes copy only what changed. Also fixes an Uncharted 3 freeze about 15 seconds in: iannitram, Mevlock
-- Uncharted 3 cloth no longer reads past shared memory, and the flashlight and shadow slices no longer drop out: Mevlock
-- A bad GPU command, a failed pipeline or a missing vertex buffer table skips one draw instead of closing the game, and a null shader binding no longer crashes the jungle chapter (1.00 and 1.02): iannitram, soni424
-- Textures are freed again when video memory fills up, so it no longer keeps growing: parsifal295, devilismyfriend
-- Shader fix: GCN-style NaN compares (from shadPS4): iannitram
-- Large compute dispatches are split, and a sparse-capable queue is picked when the GPU needs it: Hugo Borges
-- Saves are written so an interrupted save can't corrupt the file: Mevlock
-- Freeze fixes: the GPU thread could hang on its list of GPU-written memory (an Uncharted 3 chapter 1 freeze, and a likely cause of Uncharted 2 freezes), and flips at deaths, cutscenes and movie changes no longer wait on the thread that raised them: Mevlock
-- Launcher: a frame rate cap: Hugo Borges
-- Frame generation no longer crashes on a resized or undersized frame, closing the window no longer hangs, and Uncharted 3 no longer hangs on a first run with an empty shader cache: Mevlock
-- Less CPU time spent waiting: the draw pipe sleeps instead of spinning, ignored predication no longer drains it, and barrier and register tracking do less work: Umar-Qayyum-dev, Mevlock
-- Uncharted 2 reuses texture sets and skinning data instead of rebuilding them: Umar-Qayyum-dev
-- A shader cache's meta and binary files must come from the same version (caches rebuild once): Mevlock
-- Optional longer job-worker spin before sleeping, which Mevlock found reduces Uncharted 3 lighting flashes but costs FPS (`BB_JOB_SLEEP_SPINS=50000 BB_JOB_SLEEP_MS=1`): based on Mevlock's fork
-
-Each release lists its exact changes in the [release notes](https://github.com/drakolordx7/uncharted_pc/releases).
-
-## Reporting problems
-
-Open an issue [here](https://github.com/drakolordx7/uncharted_pc/issues/new/choose) and attach
-`user\last_run.log` from the run where it went wrong. Copy the log before you start the game again,
-because the next run overwrites it.
-
-Never run a command or a download from an issue or a comment. Issues titled "All Crashes Fix
-Command" and similar are malware. Fixes only ever come as a release on this page.
-
-## Contributing
-
-Pull requests are welcome here. We also bring in good fixes from other forks and from pull requests
-on the official repository, and we keep their authors on the commits and in [CREDITS.md](CREDITS.md).
-If you'd rather your change didn't come in, open an issue and we'll take it out. See
-[CONTRIBUTING.md](CONTRIBUTING.md) for how the branches are laid out.
-
-## Features
-
-- All three games from one launcher: Drake's Fortune, Among Thieves and Drake's Deception.
-- 60 FPS like on PS4, or 120 FPS (higher rates are experimental).
-- Render resolution above 1080p (up to 3200x1800) and ultrawide aspect ratios: the games draw a real larger or wider picture, set in the launcher.
-- Anti-aliasing with TAA, AMD FSR 3.1, AMD FSR 4, NVIDIA DLSS (DLAA) or Intel XeSS (any GPU).
-- Frame generation: AMD FSR 3 (any GPU) or NVIDIA DLSS (RTX 40 2x, RTX 50 up to 4x).
-- Keyboard, mouse and controller together, all remappable. Mouse look in all three games, aiming included (game versions 1.00 and 1.02; in Among Thieves 1.00 only checked up to the opening scene).
-- Valves and wheels that ask you to turn the left stick in circles (the submarine hatches in Drake's Fortune) work from the keyboard: hold R to turn counter-clockwise or T to turn clockwise (both remappable on the Controls page).
-- Button prompts show your keyboard and mouse keys while you play with them, Xbox buttons after
-  input from an Xbox (or other) controller, and the PlayStation buttons after a PlayStation
-  controller. Keys follow your keyboard layout (AZERTY...).
-- Trophies: the games' own trophy lists, a notice in the game when one is earned, and a Trophies page in the launcher.
-- Stereo, 5.1 or 7.1 sound: the games are told the real speaker layout (it follows the Windows setting, or pick it in the launcher).
-- Controller vibration settings, a Cheats page (infinite health and ammo per game), launcher languages, and your own covers and Steam art.
-- A Fixes page for the fixes that cost speed: Automatic turns each one on only where it helps.
-- Add to Steam and desktop shortcuts from the launcher, automatic updates.
+No game files are included; you need your own dump of the collection (CUSA02343, CUSA02344 or CUSA02320, version 1.00 or 1.02). Not affiliated with Sony or Naughty Dog.
 
 ## Requirements
 
-- Windows 10 (1903 or later) or Windows 11, 64-bit.
-- An Intel Core 2nd generation (Sandy Bridge) or newer, an AMD Ryzen, or an AMD FX (the CPU needs AVX).
-- A graphics card with Vulkan 1.3 and a current driver, with 6 GB of video memory or more.
-  4 GB cards (GTX 1650, RX 570) run out of video memory and crash after a while; on those, keep
-  Anti-aliasing and Frame generation off.
-- About 8 GB of free memory (RAM + page file).
+- Windows 10 (1903 or later) or Windows 11, 64-bit
+- CPU with AVX, SSE4.2 and POPCNT: Intel 2nd gen (Sandy Bridge), AMD FX or newer
+- GPU with Vulkan 1.3 and at least 4 GB of video memory (6 GB or more recommended; on 4 GB keep frame generation off)
+- About 8 GB of free memory, RAM plus page file (leave the Windows page file on "System managed size")
 
-## Known problems
+## Usage
 
-- Uncharted 3, Cartagena square (chapter 2): at high frame rates (240 Hz setting, ~80 FPS)
-  the game could freeze and close with "GPU crash: the graphics device was lost". It came from
-  the speed fix for that area and is fixed in 0.3. If it still happens to you, set Frame rate to
-  60 on the Display page and open an issue with your `user\last_run.log`.
-- Uncharted 3: green or black shapes flash for a single frame on some characters (Sully's
-  shirt in Cartagena). It happens in shadPS4 too, so it's a shader translation problem. Not fixed yet.
-- Crash with "ASSERTION: GetRenderFrameParams(frameToFreeInstancesFor)->m_gfxEopTick"
-  (mostly U1 after the first cutscene): the game expected the GPU side to be done with a frame it
-  wanted to reuse, and stopped when it wasn't yet (shaders building on a first run). Fixed in
-  0.3.2 (0.3.4 for the 1.02 versions): the game now waits for it. If you still see it, open an
-  issue with your log.
-- Intel HD / UHD graphics: a black screen on the HD 630 is fixed in 0.3.3. Older Intel chips
-  (HD 520) can still crash inside Intel's own driver.
-- Uncharted 3 London bar crash (fault at `0xd9c59b`, or device lost in the bar fight): fixed in
-  0.3.4.
-- Uncharted 2 loading crashes (`ReadSync file (req/read: ...)`, white textures then
-  `iSubMesh < m_numSubMeshInstances`): file reads could come back cut short. Fixed in 0.3.5.
-- Older CPUs: the games use PS4 CPU instructions (AVX, BMI1, MOVBE, LZCNT, F16C). AMD FX runs since
-  0.3.6. Intel 2nd and 3rd gen (Sandy and Ivy Bridge, Xeon E3/E5 v1 and v2) lack some of them, so the
-  loader rewrites those spots when the game starts and runs them in software, a little slower
-  (#197, #515). Players confirmed it on a real Ivy Bridge; Sandy Bridge is only tested with the rewrite
-  forced on a modern CPU.
-  CPUs without AVX (Nehalem and older, Phenom II) still can't run the games.
-- Random crashes with "execute access to 0" or a fault at `0x63f5d0` (U1): Windows wrote its
-  exception data over values the game keeps just below the stack pointer. Fixed in 0.3.7.
-- Uncharted 2, train wreck: `IsFinite(deltaTransform)` in character-leg-ik.cpp, fixed in 0.3.6
-  for the EU 1.00 version.
-- Frame rates above 120 are experimental.
+1. Unzip the build into a folder and run `Uncharted.exe`.
+2. On the Game page, select your dump folder (the one with `eboot.bin`, `sce_sys`, `u1data`, `u2data` and `u3data`).
+3. Pick a game and press Play.
 
-## Building
+Settings, saves and logs are stored in `user\`. To update, use the launcher's update prompt or unzip a new build over the old one.
 
-MSYS2 CLANG64 on Windows: `bash build.sh` builds `out\bb-probe.exe`, and
-`bash packaging/windows/package.sh` makes `dist\uncharted-windows` and the zip.
+Controls are remapped on the Controls page. At a valve or wheel, hold A or D (R and T also work) and it turns the way it needs to; the prompt on screen shows the keys. Fixes that cost performance are on the Fixes page; Automatic enables each one only where it is expected to help.
+
+Saves are backed up on the Saves page, and automatically before each launch (the last 10 are kept). Its Edit button unlocks all chapters, Crushing and Brutal, and Uncharted 1's rewards; close the game first. Every edit makes a backup first.
+
+## Reporting problems
+
+[Open an issue](https://github.com/drakolordx7/uncharted_pc/issues/new/choose) with `user\last_run.log` from the session where it happened (the four runs before it are kept as `last_run.1.log` to `last_run.4.log`). Releases on this page are the only source of fixes; don't run commands posted in issues.
+
+## Contributing
+
+- `community` is the main branch and what releases are built from. `main` mirrors upstream.
+- Open pull requests against `community`. Mention the game, game version and GPU you tested on.
+- Fixes from other forks are cherry-picked with the original author kept on the commit.
+- Build with MSYS2 (CLANG64 shell): `bash build.sh` produces `out\bb-probe.exe`, and `bash packaging/windows/package.sh` produces the release zip.
 
 ## Credits
 
-The people whose fixes are in this community build are listed in [CREDITS.md](CREDITS.md).
+Community build by [drakolordx7](https://github.com/drakolordx7). Port by [SuperMedo](https://github.com/Supermedo), built on [bbport](https://github.com/deadinside28/bloodborne_pc) (deadinside28) and the [shadPS4](https://github.com/shadps4-emu/shadPS4) renderer. Video decoding from [IFreemz](https://github.com/IFreemz/shadPS4-Bloodborne-DLSS-FSR). Thanks to Mindro for the first shadPS4 Uncharted build.
 
-Built on [bbport](https://github.com/deadinside28/bloodborne_pc), the native Linux port of
-Bloodborne by deadinside28, and on the [shadPS4](https://github.com/shadps4-emu/shadPS4)
-renderer. Video decoding (Videodec2) and the DLSS bridge come from
-[IFreemz/shadPS4-Bloodborne-DLSS-FSR](https://github.com/IFreemz/shadPS4-Bloodborne-DLSS-FSR).
-Thanks to Mindro for the shadPS4 Uncharted build that showed which problems to look for.
+Fixes and features in this build, by contributor. Pull request links go to the official repository; "fork" links go to the contributor's own fork the change came from.
 
-Also used: [FSR-Vulkan](https://github.com/FireBurn/FSR-Vulkan) and the AMD FidelityFX SDK (FSR),
-FSR 4 assets from [FireBurn/Q2RTX](https://github.com/FireBurn/Q2RTX), the
-[NVIDIA DLSS SDK](https://github.com/NVIDIA/DLSS) (`nvngx_dlss.dll` under NVIDIA's license),
-[Intel XeSS SDK](https://github.com/intel/xess) (`libxess.dll` under Intel's license),
-[LibAtrac9](https://github.com/Thealexbarney/LibAtrac9), [SDL3](https://github.com/libsdl-org/SDL),
-[FFmpeg](https://ffmpeg.org), [Dear ImGui](https://github.com/ocornut/imgui),
-[sirit](https://github.com/shadps4-emu/sirit), [magic_enum](https://github.com/Neargye/magic_enum),
-[xbyak](https://github.com/herumi/xbyak),
-[Vulkan Memory Allocator](https://github.com/GPUOpen-LibrariesAndSDKs/VulkanMemoryAllocator),
-[MSYS2](https://www.msys2.org) / [LLVM](https://llvm.org), [PyInstaller](https://pyinstaller.org),
-[Pillow](https://python-pillow.org), the Cinzel font (SIL Open Font License) and the Xbox
-button pictures from [Kenney](https://kenney.nl/assets/input-prompts)'s Input Prompts (CC0).
+- [Mevlock](https://github.com/Mevlock) ([fork](https://github.com/Mevlock/uncharted_pc-dev)): Uncharted 2 and 3 freeze fixes (buffer cache range lock, end-of-pipe flips, precise read-back deadlock), crash-safe save writes, FSR 3 frame generation memory leak, frame generation crash on resized frames, exit hang, Uncharted 3 first-run shader hang, Uncharted 3 cloth (compute shared memory bounds), flashlight and shadow dropout (depth array layers, HTILE), shader cache meta/binary pairing, tight typed-buffer writes, barrier and register tracking speed-ups, ignored-predication drain, COND_EXEC fix, buffer descriptors with an unsupported format, the optional longer job-worker spin, the 4-core job wait fix (a worker with a render context open retries a taken job lock in place before its job suspends, all three games), the optional intro logo skip, and (through SuperMedo's 0.3.11) the Uncharted 1 and 2 "pAction != NULL" move action pool, Uncharted 2 and 3 aim blur at render sizes other than 1080p, upscaler jitter for single-quad scene geometry, texture cache overlaps by chance keeping their mips, PS4 thread priorities off by default, and the last 5 run logs kept; Uncharted 2 convoy: Elena's truck no longer sinks after bumps, Uncharted 1 physics at any frame rate (barrels no longer freeze in mid-air above 60 FPS, bodies settle after the same time), skip the friends' stats notice
+- [BilalReloaded](https://github.com/bc160201983) ([Uncharted port](https://github.com/bc160201983/Uncharted-The-Nathan-Drake-Collection-PC-port), GPL v2): Uncharted 3 cloth solver barriers on 32-lane GPUs (Sully's shirt flashing in Cartagena), guest memory committed as the game allocates it (start failures with error 1450 on PCs with a small page file), Uncharted 3 look-at reset (crash climbing the fort in chapter 8), garbage descriptor guards (Uncharted 2 treasure effects, Uncharted 3 Syria), pipelines the driver refuses are created again without the pipeline cache, samplers without a border color table, resource tables the game is still filling
+- [Umar-Qayyum-dev](https://github.com/Umar-Qayyum-dev): keyboard and mouse button prompts in all three games with automatic switching and keyboard layouts ([#420](https://github.com/Supermedo/uncharted_pc/pull/420)), the "execute access to 0" / red zone crash fix for all three games ([#559](https://github.com/Supermedo/uncharted_pc/pull/559)), Uncharted 2 aim blur ([#528](https://github.com/Supermedo/uncharted_pc/pull/528)), Ivy Bridge support ([#336](https://github.com/Supermedo/uncharted_pc/pull/336)), tiny render result read-back, Uncharted 2 texture set and skinning reuse, draw pipe sleep waits, wave-local shared memory barriers (optional), NVIDIA device lost with compute workgroups above 256 threads (they run as workgroups of 256)
+- [spacepepperoni](https://github.com/spacepepperoni) ([fork](https://github.com/spacepepperoni/uncharted_Linux)): Uncharted 2 turret and aiming blur ([#381](https://github.com/Supermedo/uncharted_pc/pull/381)), accurate GPU memory for Uncharted 2, fixing chapter 21 and other physics problems ([#382](https://github.com/Supermedo/uncharted_pc/pull/382)), NaN guard for black squares in Uncharted 2
+- [ngin](https://github.com/ngin): accurate GPU memory by default with a cheaper read-back, compute fences in order with the draw pipe (+42% in the U2 convoy) and written through backing memory (fixes Uncharted 3 freezing about 15 s in), compute queue drains only where needed, turret blur read-back, PS4 FPU state for guest threads, Linux build fixes
+- João Pedro Valadares ([fork](https://github.com/spacepepperoni/uncharted_Linux)): texture cache images no longer move in memory (crash in the depth target code), GPU recording chunk never null, motion-vector pipelines not preloaded
+- [ilyaqww](https://github.com/ilyaqww) ([fork](https://github.com/ilyaqww/uncharted_pc)): Uncharted 1 display driver reset on GeForce GTX 10 series (1024-thread compute groups run as 2x512, [#634](https://github.com/Supermedo/uncharted_pc/pull/634)), every lost device goes to the GPU crash report instead of an assert, and a crash names the commands the GPU had in flight
+- [DUDUYG](https://github.com/DUDUYG): shader resource walker patched under a lock and for walkers loaded from the pipeline cache ("SrtWalkerSignalHandler" stop, read access to 0 in generated code)
+- Vishwas Parpattegar ([fork](https://github.com/RealDishwash/uncharted_Linux)): shader resource walker generation no longer freezes after a GPU assertion on a draw preparation worker
+- [Pepin208](https://github.com/Pepin208) ([fork](https://github.com/Pepin208/uncharted_pc_linux)): Uncharted 1 blue textures on rocks in the first jungle area (texture cache subresource check and stencil link, from shadPS4 #4818 and #5118), in-game display mode switch (windowed, borderless, exclusive fullscreen) applied while playing, in-game menu kept inside the game window
+- [Tutuzaooo](https://github.com/Tutuzaooo) ([fork](https://github.com/Tutuzaooo/uncharted_Linux)): FSR 4 is only offered when its files are installed
+- [dbcalo](https://github.com/dbcalo) ([fork](https://github.com/dbcalo/uncharted_pc)): in-game menu checkboxes and sliders keep the new value ([#623](https://github.com/Supermedo/uncharted_pc/pull/623)); raw mouse aiming in Uncharted 1 (the mouse turns the aiming camera 1:1, no stick speed cap), the cover camera turning with the mouse, and popping out of cover keeping the aim ([#626](https://github.com/Supermedo/uncharted_pc/pull/626)), built on Umar-Qayyum-dev's raw mouse aiming ([#561](https://github.com/Supermedo/uncharted_pc/pull/561)); no jump when aiming starts (the pop-out turn eases in and aims at the camera as shown); the controller keeps working while another window has the focus ([#748](https://github.com/Supermedo/uncharted_pc/pull/748)), Quit game in the in-game settings menu ([#746](https://github.com/Supermedo/uncharted_pc/pull/746)), game callback thunk memory sized from the table ([#747](https://github.com/Supermedo/uncharted_pc/pull/747))
+- [antikmewzik](https://github.com/antikmewzik) ([fork](https://github.com/antikmewzik/uncharted_pc_controls_qol)): Uncharted 2 (1.02) mouse cameras: the aim, grenade, cover, look-around and chapter 5 truck chase cameras turned by the mouse directly
+- [FelipePrado0](https://github.com/FelipePrado0): the load-time rewrite of BMI1, LZCNT, MOVBE and F16C instructions that runs the games on Sandy and Ivy Bridge, adapted from [SpartanPort](https://github.com/FelipePrado0/SpartanPort)
+- [iannitram](https://github.com/iannitram) ([fork](https://github.com/iannitram/uncharted_pc)): nested indirect buffer leak fix ([#387](https://github.com/Supermedo/uncharted_pc/pull/387)), title number from AppContent ([#353](https://github.com/Supermedo/uncharted_pc/pull/353)), GCN NaN compare semantics (from shadPS4 #5257), missing CE task guard, early flip IRQ, FSR 3.1 protected memory and patch fixes, FSR driver logging, crash guards for bad GPU commands, failed pipelines and null vertex tables, save mount and flexible memory reports (#496, #497), compute queue ring reset, Vulkan device retry without DLSS, unsupported pixel formats, constant-engine wait direction (from shadPS4 #5406), an unsupported audio codec returns an error instead of ending the game
+- [currantsforeyes](https://github.com/currantsforeyes) ([fork](https://github.com/currantsforeyes/uncharted_pc)): Itemzflow plain ELF dumps, save mount limit, flexible mapping split, EU CUSA02344 1.02 red zone tables, window title
+- garyth.hawkins: idle job workers on the retail 1.02 build, EU 1.02 red zone tables, fallback window title, mount table and flexible mapping fixes
+- [G3545](https://github.com/G3545): small compute-written buffers copied back to the game, fixing black weapons and brightness flicker ([#449](https://github.com/Supermedo/uncharted_pc/pull/449)), scalar instructions inside EXEC scopes ([#468](https://github.com/Supermedo/uncharted_pc/pull/468))
+- [kj2223](https://github.com/kj2223): Uncharted 1 upscaler shimmer, jittered full-screen passes, English in-game menu, Uncharted 2 grey screen on launch ([#261](https://github.com/Supermedo/uncharted_pc/pull/261))
+- [d4rksp4rt4n](https://github.com/d4rksp4rt4n): Uncharted 1 crash at 0x63f5d0 on Intel 12th gen and newer ([#403](https://github.com/Supermedo/uncharted_pc/pull/403))
+- [kuraeow](https://github.com/kuraeow): idle job workers sleep, lowering CPU load on smaller CPUs ([#346](https://github.com/Supermedo/uncharted_pc/pull/346))
+- [poncho-ajmv](https://github.com/poncho-ajmv) ([fork](https://github.com/poncho-ajmv/uncharted_pc)): launcher error reporting (crash reason, input settings, shader cache), reliable Stop, controller vibration settings, launcher languages, custom artwork, update package verification ([#607](https://github.com/Supermedo/uncharted_pc/pull/607)), atomic settings writes ([#605](https://github.com/Supermedo/uncharted_pc/pull/605)), prepared executable cache check ([#606](https://github.com/Supermedo/uncharted_pc/pull/606)), previous process wait check ([#604](https://github.com/Supermedo/uncharted_pc/pull/604))
+- [bucanero](https://github.com/bucanero) ([save-decrypters](https://github.com/bucanero/save-decrypters), [Apollo Save Tool patches](https://github.com/bucanero/apollo-patches)), from Red-EyeX32 and aerosoul94's tlou_save_data_decrypter: the save encryption keys and checksum layout the save editor uses; Mevlock and BilalReloaded's "Unlock all chapters" toggle showed which menus Bluepoint's unlock flags control
+- [saulo benigno](https://github.com/saulob): Cheats page with infinite health and ammo ([#116](https://github.com/Supermedo/uncharted_pc/pull/116))
+- [che2281337](https://github.com/che2281337) ([fork](https://github.com/che2281337/uncharted_pc)): performance work on Uncharted 2 draw recording and the Uncharted 3 London pub depth padding; Uncharted 2 lift aim reaching further down ([#22](https://github.com/drakolordx7/uncharted_pc/pull/22))
+- [Jhojan Jiménez](https://github.com/marks-jhojan) ([fork](https://github.com/marks-jhojan/uncharted_pc)): red zone thunk memory reserved before the GPU starts, Windows fault report with thread, caller and stack addresses and a crash dump ([#743](https://github.com/Supermedo/uncharted_pc/pull/743)); cutscene freeze (flip interrupt on the recording thread) and a texture cache use-after-free ([#742](https://github.com/Supermedo/uncharted_pc/pull/742))
+- [mato215](https://github.com/mato215): texture cache pressure mark at 60% on cards under 8 GB ([#753](https://github.com/Supermedo/uncharted_pc/pull/753))
+- Alex ([miroslavdanutalexandru-alt](https://github.com/miroslavdanutalexandru-alt)): Uncharted 1 and 3 surface flicker with temporal jitter ([#17](https://github.com/drakolordx7/uncharted_pc/pull/17))
+- [Hugo Borges](https://github.com/hugouchoasborges) ([fork](https://github.com/hugouchoasborges/uncharted_pc)): compute dispatches above 65535 groups, sparse-capable queue selection, frame rate cap presets
+- [sid1552](https://github.com/sid1552) ([fork](https://github.com/sid1552/uncharted_pc)): MP3 audio decoding, GPU crash report on device loss, buffer cache per 64-byte block, current MSYS2 build
+- [EdouardSence](https://github.com/EdouardSence) ([fork](https://github.com/EdouardSence/uncharted_pc)): large command data no longer stops the game, GPU copies mark textures dirty, overlay cleanup, Linux window icon
+- [soni424](https://github.com/soni424) ([fork](https://github.com/soni424/uncharted_pc)): dark launcher title bar, null shader binding guard
+- [eduardoghi](https://github.com/eduardoghi): numpad bindings ([#473](https://github.com/Supermedo/uncharted_pc/pull/473)), zip that extracts on Linux ([#404](https://github.com/Supermedo/uncharted_pc/pull/404))
+- [Canneli](https://github.com/canneli): design of the save backups (ZIP with a description file, checked paths, a backup before every restore), from their launcher
+- [parsifal295](https://github.com/parsifal295) and [devilismyfriend](https://github.com/devilismyfriend): texture collector frees textures again (video memory growth)
+- Pedro Delfino: more texture eviction under critical memory pressure
+- Rick: prepare.py on CP950 Windows systems
+- [gelibeanz](https://github.com/gelibeanz), [vander-x](https://github.com/vander-x): Linux file reads and build fixes; [lunar-me](https://github.com/lunar-me): documentation fixes
+- [drakolordx7](https://github.com/drakolordx7): maintains this build; render above 1080p and ultrawide ([#391](https://github.com/Supermedo/uncharted_pc/pull/391)), Xbox button prompts ([#469](https://github.com/Supermedo/uncharted_pc/pull/469)), trophies ([#472](https://github.com/Supermedo/uncharted_pc/pull/472)), XeSS ([#476](https://github.com/Supermedo/uncharted_pc/pull/476)), surround sound ([#392](https://github.com/Supermedo/uncharted_pc/pull/392)), per-GPU shader caches ([#412](https://github.com/Supermedo/uncharted_pc/pull/412)), pipeline compiling off the GPU thread ([#389](https://github.com/Supermedo/uncharted_pc/pull/389), [#416](https://github.com/Supermedo/uncharted_pc/pull/416)), 30 FPS option ([#544](https://github.com/Supermedo/uncharted_pc/pull/544)), PS4 thread priorities ([#547](https://github.com/Supermedo/uncharted_pc/pull/547)), direct game shortcuts ([#399](https://github.com/Supermedo/uncharted_pc/pull/399)), mouse hooks for 1.02 ([#348](https://github.com/Supermedo/uncharted_pc/pull/348)), memory leak and several crash fixes, keyboard stick rotation for valves, keyboard prompts showing the bound keys for the Uncharted 2 square QTE and the Uncharted 1 valve, Uncharted 2 and 3 read-back fixes (black guns, aim blur), threaded movie scaling for older CPUs
 
-NVIDIA, GeForce RTX and DLSS are trademarks of NVIDIA Corporation. The default covers and the
-icon are original artwork; no official art is included.
+Testing and research: adrianeira, exyled, fidoboy, kloon15, tDevis, MrBboy95, rayer23, GameBunny77 and everyone who sent logs.
+
+Third-party: AMD FSR, NVIDIA DLSS, Intel XeSS, LibAtrac9, SDL3, FFmpeg, Dear ImGui, sirit, xbyak, Vulkan Memory Allocator, PyInstaller, Pillow, Cinzel font, Kenney Input Prompts, [ambientCG](https://ambientcg.com/a/Paper003) Paper003 texture (CC0). Licenses are in the `licenses` folder of the release.
 
 ## License
 
-GNU GPL v2 or later ([LICENSE](LICENSE)). Third-party components keep their own licenses
-(see `licenses\` in the download).
+GPL v2 or later, see [LICENSE](LICENSE). Third-party components keep their own licenses.

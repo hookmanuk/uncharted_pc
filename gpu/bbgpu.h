@@ -26,6 +26,9 @@ uintptr_t bbgpu_resolve(const char *scoped_nid);
 int bbgpu_handle_fault(void *ucontext, void *address);
 /* BB_WRITE_LOG=1: prints the logged GPU-side writes to guest memory near the fault. */
 void bbgpu_dump_guest_writes(void *ucontext);
+/* Prints the last draws and dispatches the CPU recorded (BB_GPU_CHECKPOINTS=1) and how far the
+ * GPU got: for a fault where no Vulkan call reported a lost device (the driver crashed). */
+void bbgpu_dump_recent_checkpoints(void);
 /* Keyboard text entry through the game window (IME dialog). begin returns 0 when
  * no window exists; poll returns 0 typing, 1 confirmed, 2 cancelled (UTF-8 text). */
 int bbgpu_text_input_begin(const char *initial_utf8, const char *prompt_utf8);
@@ -49,7 +52,21 @@ void bbgpu_vr_aim_input(void);
 void bbgpu_vr_aim_held(int held);
 /* VR head aim: 1 while the follow camera is to face this forward (x, z: the view's heading before an aim that ended). */
 int bbgpu_vr_follow_heading(float *x, float *z);
+/* 1 while the menu's Gyro aiming setting is on (bbport.ini gyro_aim). */
+int bbgpu_gyro_aim(void);
+/* The keys that open and close the in-game menu (input.ini key.overlay, two bindings: slot 0 and 1).
+ * kind: NONE unbound, SCANCODE a physical key (SDL_Scancode), KEYCODE a key by the character it
+ * types in the current layout (SDL_Keycode), MOUSE an SDL mouse button number (not left or right).
+ * Until this is called the menu opens with Insert in slot 0. */
+enum { BBGPU_OVERLAY_KEY_NONE, BBGPU_OVERLAY_KEY_SCANCODE, BBGPU_OVERLAY_KEY_KEYCODE, BBGPU_OVERLAY_KEY_MOUSE };
+void bbgpu_overlay_key_configure(int slot, int kind, int code);
 int bbgpu_mouse_sample(float *dx, float *dy, uint32_t *buttons, int *wheel);
+/* The screenshot key (input.ini key.share, the PS4 Share button; two bindings, same kinds as the menu key):
+ * pressing it saves the next frame the game shows, at the game's own resolution, as a picture in the user
+ * folder (screenshots/). */
+void bbgpu_share_key_configure(int slot, int kind, int code);
+/* GPU thread: 1 once per press of the screenshot key. */
+int bbgpu_share_take(void);
 /* In-game trophy notice (the overlay draws it for a few seconds, one at a time): grade 1 platinum,
  * 2 gold, 3 silver, 4 bronze; png is the trophy's icon (a PNG file) or empty. */
 void bbgpu_trophy_notify(int grade, const char *game, const char *name, const void *png, uint64_t png_size);

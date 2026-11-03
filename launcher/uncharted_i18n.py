@@ -2,7 +2,7 @@
 import locale
 
 from bbport_lang import table as shared_translations
-from uncharted_i18n_extra import EXTRA_TRANSLATIONS
+from uncharted_i18n_extra import EXTRA_TRANSLATIONS, LAUNCHER_TRANSLATIONS, SAVES_TRANSLATIONS
 
 
 LANGUAGES = [
@@ -47,6 +47,10 @@ TRANSLATIONS = {
         'Look around with the mouse': 'Mover la cámara con el ratón',
         'Mouse sensitivity': 'Sensibilidad del ratón',
         'Invert the mouse vertically': 'Invertir verticalmente el ratón',
+        'Aiming': 'Apuntado',
+        'Aim assist': 'Asistencia de apuntado',
+        'On (game default)': 'Activada (predeterminado del juego)',
+        'Off: aiming no longer slows down near enemies or follows them (all three games).': 'Desactivada: el apuntado ya no se frena cerca de los enemigos ni los sigue (los tres juegos).',
         'Keyboard and mouse buttons': 'Teclado y botones del ratón',
         'Controller': 'Control', 'Default keys': 'Teclas predeterminadas',
         'Default controller buttons': 'Botones predeterminados del control',
@@ -161,6 +165,10 @@ TRANSLATIONS = {
         'Look around with the mouse': 'Mover a câmera com o mouse',
         'Mouse sensitivity': 'Sensibilidade do mouse',
         'Invert the mouse vertically': 'Inverter o mouse verticalmente',
+        'Aiming': 'Mira',
+        'Aim assist': 'Assistência de mira',
+        'On (game default)': 'Ativada (padrão do jogo)',
+        'Off: aiming no longer slows down near enemies or follows them (all three games).': 'Desativada: a mira não fica mais lenta perto dos inimigos nem os acompanha (os três jogos).',
         'Keyboard and mouse buttons': 'Teclado e botões do mouse',
         'Controller': 'Controle', 'Default keys': 'Teclas padrão',
         'Default controller buttons': 'Botões padrão do controle',
@@ -275,6 +283,10 @@ TRANSLATIONS = {
         'Look around with the mouse': 'Orienter la caméra avec la souris',
         'Mouse sensitivity': 'Sensibilité de la souris',
         'Invert the mouse vertically': 'Inverser verticalement la souris',
+        'Aiming': 'Visée',
+        'Aim assist': 'Aide à la visée',
+        'On (game default)': 'Activée (par défaut du jeu)',
+        'Off: aiming no longer slows down near enemies or follows them (all three games).': 'Désactivée : la visée ne ralentit plus près des ennemis et ne les suit plus (les trois jeux).',
         'Keyboard and mouse buttons': 'Clavier et boutons de la souris',
         'Controller': 'Manette', 'Default keys': 'Touches par défaut',
         'Default controller buttons': 'Boutons de manette par défaut',
@@ -373,6 +385,10 @@ TRANSLATIONS = {
 
 for _code, _translations in EXTRA_TRANSLATIONS.items():
     TRANSLATIONS[_code] = {**shared_translations(_code), **_translations}
+for _code, _translations in SAVES_TRANSLATIONS.items():
+    TRANSLATIONS.setdefault(_code, {}).update(_translations)
+for _code, _translations in LAUNCHER_TRANSLATIONS.items():
+    TRANSLATIONS.setdefault(_code, {}).update(_translations)
 
 
 def translate(language, text):

@@ -93,11 +93,16 @@ uintptr_t runtime_savedata_resolve(const char *name);
 void runtime_trophy_configure(const char *dir);
 uintptr_t runtime_trophy_resolve(const char *name);
 void runtime_savedata_report(void);
+/* Waits up to timeout_ms for a save in progress: 0 none, 1 it finished, -1 timed out. */
+int runtime_savedata_wait_idle(unsigned timeout_ms);
 int runtime_savedata_pick(int32_t user, const char *title, const char (*names)[32], uint32_t count,
                           int which, const char *focus, char out[32], void *param_out);
 void runtime_thread_attach_host(const char *name);
 uintptr_t runtime_fiber_resolve(const char *name);
 void runtime_fiber_report(void);
+/* For fault reports (no allocation, any thread): the guest thread and fiber running here, or NULL. */
+const char *runtime_thread_name_here(void);
+const char *runtime_fiber_name_here(void);
 /* Host functions the loader runs at the start of matching guest functions (probe.c). The guest
  * code is found by `pattern`, not by a fixed address, so every build of a game is covered that
  * contains it: hex bytes separated by spaces, "??" for a byte that differs between builds
@@ -121,4 +126,10 @@ typedef struct {
     const unsigned char *patch;
 } RuntimeGuestCallback;
 const RuntimeGuestCallback *runtime_guest_callbacks(size_t *count);
+/* Called for each entry of runtime_guest_callbacks() that was installed. */
+void runtime_guest_callback_installed(const RuntimeGuestCallback *callback);
+/* Whether an entry is wanted (offset 0: asked before the search; an entry not wanted is not searched
+ * and not reported missing), and the notice right before it is installed at `offset`. Entries that a
+ * launcher setting switches (aim assist) answer by their setting, all others are wanted. */
+int runtime_guest_callback_wanted(const RuntimeGuestCallback *c, uint64_t offset);
 #endif
