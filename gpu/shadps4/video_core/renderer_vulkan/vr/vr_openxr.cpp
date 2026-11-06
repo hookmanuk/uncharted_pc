@@ -163,6 +163,7 @@ struct State {
     std::atomic<u64> refresh_period_ns{0};
     std::atomic<bool> capped{false};
     std::atomic<bool> flip_token{false}; // set by each headset frame, taken by a capped flip
+    std::atomic<long long> flip_token_at{0}; // (steady clock) when the last headset frame set it
     std::chrono::steady_clock::time_point flips_since{};
     u32 flips = 0;
     u64 shown_serial = 0;       // the headset's thread: the last publication shown
@@ -762,6 +763,23 @@ void Release(XrSwapchain swapchain) {
     g.xr.ReleaseSwapchainImage(swapchain, &release);
 }
 
+// Development (BB_VR_STALL_LOG=<ms>): each step of the headset's loop over that long, as it happens (the VR report only
+// has each step's sum and maximum). `step` 0..4 of the loop, or 5..9 of Show.
+void NoteStall(int step, double ms) {
+    static const double limit = [] {
+        const char* v = std::getenv("BB_VR_STALL_LOG");
+        return v ? std::atof(v) : 0.0;
+    }();
+    if (limit <= 0.0 || ms < limit) {
+        return;
+    }
+    static constexpr const char* names[10] = {"wait frame",     "begin",  "show",   "end frame", "game frame",
+                                              "acquire",        "command buffer", "record", "release", "submit"};
+    Log("stall: %s %.1f ms (game capped %d, display period %.1f ms, shown serial %llu)", names[step], ms,
+        int(g.capped.load(std::memory_order_relaxed)),
+        double(g.display_period_ns.load(std::memory_order_relaxed)) / 1e6, (unsigned long long)g.shown_serial);
+}
+
 // The headset's thread: a new publication into the swapchains. False: nothing shown (the last content stays).
 bool Show(const State::Published& p) {
     if (p.kind == State::Content::Stereo) {
@@ -773,6 +791,7 @@ bool Show(const State::Published& p) {
             const double ms = std::chrono::duration<double, std::milli>(now - since).count();
             g.part_sum[i] += ms;
             g.part_max[i] = std::max(g.part_max[i], ms);
+            NoteStall(5 + i, ms);
             since = now;
         };
         const bool reticle = Stereo::ReticleAiming();
@@ -1041,6 +1060,7 @@ void FrameLoop() {
             const double ms = std::chrono::duration<double, std::milli>(now - since).count();
             g.stage_sum[i] += ms;
             g.stage_max[i] = std::max(g.stage_max[i], ms);
+            NoteStall(i, ms);
             since = now;
         };
         auto since = Clock::now();
@@ -1062,6 +1082,7 @@ void FrameLoop() {
         {
             std::scoped_lock lock{g_flip_token_mutex};
             g.flip_token.store(true, std::memory_order_relaxed); // one game flip per headset frame (while capped)
+            g.flip_token_at.store(std::chrono::steady_clock::now().time_since_epoch().count(), std::memory_order_relaxed);
         }
         g_flip_token_cv.notify_all();
         // VR fork: the head for this frame's display time before the wait, so the game's next frame renders with it.
@@ -1334,7 +1355,14 @@ std::chrono::nanoseconds FramePeriod(std::chrono::nanoseconds limit) {
 }
 
 bool FlipAllowed() {
-    return !g.capped.load(std::memory_order_relaxed) || g.flip_token.load(std::memory_order_relaxed);
+    if (!g.capped.load(std::memory_order_relaxed) || g.flip_token.load(std::memory_order_relaxed)) {
+        return true;
+    }
+    // A headset thread held up in the runtime must not hold up the game: a flip at least every 100 ms (as
+    // WaitForGameFrame's limit the other way round).
+    const auto age = std::chrono::steady_clock::now().time_since_epoch() -
+                     std::chrono::steady_clock::duration(g.flip_token_at.load(std::memory_order_relaxed));
+    return age > std::chrono::milliseconds(100);
 }
 
 bool ImmediateFlips() {
@@ -1350,12 +1378,29 @@ bool WaitFlipAllowed(std::chrono::steady_clock::time_point deadline) {
     return g_flip_token_cv.wait_until(lock, deadline, [] { return FlipAllowed(); });
 }
 
-// The presenter, each game flip in VR: the adaptive cap's flip rate over 2 s windows.
+// The presenter, each game flip in VR. One game frame per xrWaitFrame, as OpenXR expects: the headset's loop hands out
+// each flip, so a game slower than the headset is not held back and a faster one renders nothing that is never shown.
+// The adaptive cap (BB_VR_CAP=adaptive) let the game run free below 1.12 x the refresh rate; on Quest 3 streaming the
+// runtime then halved its rate, the cap's test saw half the refresh rate and released the game again every 2 s (RTX
+// 3070, 1440 per eye: 74 frames a second finished, 28 shown, the headset's copies waiting up to 1.5 s). Movies keep
+// their own timing. BB_VR_CAP=0: no cap.
 void NoteFlip() {
-    static const bool enabled = !(std::getenv("BB_VR_CAP") && std::getenv("BB_VR_CAP")[0] == '0');
+    static const char* const mode = std::getenv("BB_VR_CAP");
+    static const bool adaptive = mode && std::strcmp(mode, "adaptive") == 0;
+    static const bool off = mode && mode[0] == '0';
+    if (off) {
+        return;
+    }
+    if (!adaptive) {
+        g.capped.store(!g.pending.movie, std::memory_order_relaxed);
+        return;
+    }
+    if (g.pending.kind != State::Content::Stereo) {
+        return;
+    }
     const u64 refresh = g.refresh_period_ns.load(std::memory_order_relaxed);
     const u64 period = refresh ? refresh : g.display_period_ns.load(std::memory_order_relaxed);
-    if (!enabled || !period) {
+    if (!period) {
         return;
     }
     const auto now = std::chrono::steady_clock::now();
@@ -1382,12 +1427,12 @@ void NoteFlip() {
 
 void SubmitFrame(VkSemaphore semaphore, u64 tick) {
     if (g.pending.kind == State::Content::Stereo) {
-        NoteFlip();
         ++g.count_publications;
     }
     if (g.pending.kind == State::Content::None) {
         return;
     }
+    NoteFlip();
     std::scoped_lock lock{g.publish_mutex};
     const u64 serial = g.published.serial + 1;
     g.published = g.pending;
