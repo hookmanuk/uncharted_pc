@@ -1269,6 +1269,7 @@ constexpr u32 CoverGrid = 16;
 Readback g_cover[4];
 u32 g_cover_frame = 0;
 std::atomic<float> g_hud_cover{0.f};
+std::atomic<long long> g_hud_cover_at{0}; // (steady clock) frames captured at the flip take no samples
 
 void SampleCover(VkCommandBuffer cmd, VkImage image, u32 w, u32 h) {
     Readback& r = g_cover[g_cover_frame++ % 4];
@@ -1285,6 +1286,7 @@ void SampleCover(VkCommandBuffer cmd, VkImage image, u32 w, u32 h) {
         }
         VKD.vkUnmapMemory(g.device, r.memory);
         g_hud_cover = float(drawn) / float(CoverGrid * CoverGrid);
+        g_hud_cover_at = std::chrono::steady_clock::now().time_since_epoch().count();
     }
     VkBufferImageCopy regions[CoverGrid * CoverGrid]{};
     for (u32 y = 0; y < CoverGrid; ++y) {
@@ -1300,7 +1302,10 @@ void SampleCover(VkCommandBuffer cmd, VkImage image, u32 w, u32 h) {
 }
 
 float HudCover() {
-    return g_hud_cover.load(std::memory_order_relaxed);
+    // A sample older than 0.25 s is the last menu's (U2's play after its menus read 88% and went flat when still).
+    const auto age = std::chrono::steady_clock::now().time_since_epoch() -
+                     std::chrono::steady_clock::duration(g_hud_cover_at.load(std::memory_order_relaxed));
+    return age < std::chrono::milliseconds(250) ? g_hud_cover.load(std::memory_order_relaxed) : 0.f;
 }
 
 Readback g_flog;

@@ -120,6 +120,10 @@ struct Game {
     u32 aim_displaced = 0;
     u32 aim_direction = 0;
     bool aim_object_rdi = false; // the camera object in rdi (U2: the update is a plain method), else rsi
+    // The menus' state (0: none; U2 3 opening, 12 open, 5 closing; the title and main menu 12): the game's own test of
+    // it, "lea rax, [rip + menus]; cmp dword [rax + menu_state], 0" (every match the same object). nullptr: not known.
+    const char* menu = nullptr;
+    u32 menu_state = 0;
 };
 // (tools/vr/sigmake.py makes the patterns from a plaintext ELF.)
 const std::vector<Game> Games = {
@@ -127,13 +131,17 @@ const std::vector<Game> Games = {
      "55 48 89 e5 41 56 53 48 81 ec a0 00 00 00 48 89 fb 4c 8b 35 ?? ?? ?? ?? 49 8b 06 48 89 45 e8 80 bb a4 02 00 00 00",
      14, "c5 f2 5e c0 c5 fa 11 83 c4 02 00 00 4c 89 ff e8 ?? ?? ?? ??", 0x250, 0x290, 0.5f,
      // (1.00: +0xc42c0; the direction at +0x1830 found by turning a copy of each candidate, as RPCS3's was)
-     "55 48 89 e5 41 57 41 56 41 55 41 54 53 48 81 ec 68 02 00 00 49 89 d7 48 89 f3 49 89 fe", 13, 0x1830},
+     "55 48 89 e5 41 57 41 56 41 55 41 54 53 48 81 ec 68 02 00 00 49 89 d7 48 89 f3 49 89 fe", 13, 0x1830, false,
+     // (1.00: the menus at +0xabb148, state +0x794: U2's state machine, the same values written)
+     "48 8d 05 ?? ?? ?? ?? 83 b8 94 07 00 00 00", 0x794},
     {"Uncharted 2",
      "55 48 89 e5 53 48 81 ec 28 01 00 00 48 89 fb 80 bb 82 02 00 00 00 0f 85 ?? ?? ?? ??", 12,
      "49 89 cf 49 89 d4 48 89 f3 49 89 fe 48 89 df e8 ?? ?? ?? ??", 0x210, 0x250, 1.0f,
      // CameraControlZoom (its factory registered with the class name; 1.00 vtable +0xe085e0): slot 29 (+0x18c9a0,
      // this in rdi) turns the aim direction at +0x1f30 by the stick (the helper U1's update calls before its +0x1830)
-     "55 48 89 e5 41 57 41 56 41 55 41 54 53 48 81 ec 38 01 00 00 49 89 f6 49 89 ff", 13, 0x1f30, true},
+     "55 48 89 e5 41 57 41 56 41 55 41 54 53 48 81 ec 38 01 00 00 49 89 f6 49 89 ff", 13, 0x1f30, true,
+     // (1.00: the menus at +0xf2e350, state +0x1014, found by diffing memory between the menus and play)
+     "48 8d 05 ?? ?? ?? ?? 83 b8 14 10 00 00 00", 0x1014},
     // Uncharted 3 (big3-ps4_Shipping.elf): U2's view and builder, the same code.
     {"Uncharted 3",
      "55 48 89 e5 53 48 81 ec 08 01 00 00 48 89 fb 80 bb 6c 02 00 00 00 0f 85 ?? ?? ?? ??", 12,
@@ -145,6 +153,7 @@ const std::vector<Game> Games = {
 const Game* g_game = nullptr;
 std::vector<Site> g_sites; // the hooks of the game found
 u64 g_main_caller = 0;     // the return address of the main camera's call (ProjectionHandler)
+const volatile s32* g_menu_state = nullptr; // the game's menus' state (Game::menu), when found
 
 struct alignas(16) Mat {
     float m[16];
@@ -865,10 +874,12 @@ extern "C" void ProjectionHandler(u64* regs) {
         xscale_game = params[1];
     }
     // A menu: U2's title and menus show a backdrop with the main camera, built for its one view as U3's title is (Matt
-    // 2026-11-03: "That's all corrupted too!"). The camera has not moved for 1.5 s and the game's 2D layer covers more
-    // than 6% of the screen (its panels; play's HUD, hints and subtitles stay under 3%), or it was a menu and the
-    // camera has still not moved (its frames on the flat screen take no HUD samples). Play and cutscenes move the
-    // camera; an idle player or a tutorial's frozen frame has a still one but only a hint drawn.
+    // 2026-11-03: "That's all corrupted too!"). Where the game's menus' state is known (U1, U2) a menu is open while it
+    // is not 0: on the flat screen from the menu's first frame, never in play. Otherwise (U3): the camera has not moved
+    // for 1.5 s and the game's 2D layer covers more than 6% of the screen (its panels; play's HUD, hints and subtitles
+    // stay under 3%), or it was a menu and the camera has still not moved (its frames on the flat screen take no HUD
+    // samples). The guess flipped U2's play to the flat screen whenever the camera was still (Matt 2026-11-03: "The
+    // game shows in 3d and then randomly switched to 2d"), and showed its menus in 3D for 1.5 s.
     const long long now_ms = NowMs();
     static float still_input[16] = {};
     static long long still_since = 0;
@@ -881,10 +892,13 @@ extern "C" void ProjectionHandler(u64* regs) {
         still_since = now_ms;
     }
     const bool was_menu = menu;
-    menu = now_ms - still_since > 1500 && (menu || Stereo::HudCover() > 0.06f) && now_ms - g_aim_update_ms.load() > 1000;
+    const s32 menu_state = g_menu_state ? *g_menu_state : 0;
+    menu = g_menu_state ? menu_state != 0
+                        : now_ms - still_since > 1500 && (menu || Stereo::HudCover() > 0.06f) &&
+                              now_ms - g_aim_update_ms.load() > 1000;
     if (menu != was_menu) {
-        std::printf("VR camera: %s (2D layer %.0f%%)%c", menu ? "a menu: the flat screen" : "3D again",
-                    Stereo::HudCover() * 100.f, 10);
+        std::printf("VR camera: %s (menus' state %d, 2D layer %.0f%%)%c", menu ? "a menu: the flat screen" : "3D again",
+                    int(menu_state), Stereo::HudCover() * 100.f, 10);
         std::fflush(stdout);
     }
     if (menu) {
@@ -1174,6 +1188,27 @@ bool Locate(const u8* code, u64 size, const Game& game) {
             g_sites.push_back(update);
         } else {
             std::printf("VR camera: the aiming camera's update was not found: no head aim%c", 10);
+        }
+    }
+    g_menu_state = nullptr;
+    if (game.menu) {
+        u64 menus = 0;
+        for (u64 i : Find(code, size, Sig{game.menu}, 64)) {
+            int32_t rel;
+            std::memcpy(&rel, code + i + 3, 4);
+            const u64 target = reinterpret_cast<u64>(code) + i + 7 + rel;
+            if (menus && target != menus) {
+                menus = 0;
+                break;
+            }
+            menus = target;
+        }
+        if (menus) {
+            g_menu_state = reinterpret_cast<const volatile s32*>(menus + game.menu_state);
+            std::printf("VR camera: the menus' state at image +%#llx%c",
+                        (unsigned long long)(menus + game.menu_state - reinterpret_cast<u64>(code)), 10);
+        } else {
+            std::printf("VR camera: the menus' state was not found: menus by the camera and the 2D layer%c", 10);
         }
     }
     g_main_caller = caller;
