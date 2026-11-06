@@ -63,6 +63,7 @@ cp patches/redzone.json "$dest/patches/"  # red-zone-safe guest stores (link_mod
 cp scripts/vr_resolution.py "$dest/scripts/" # VR fork
 cp run.py LICENSE "$dest/"
 cp packaging/windows/README-Uncharted.txt "$dest/README.txt"
+cp packaging/windows/uncharted-debug.bat "$dest/" # VR fork: the launcher with test switches
 mkdir -p "$dest/licenses"
 cp packaging/windows/licenses/*.txt "$dest/licenses/" 2>/dev/null || true
 for license in out/pyenv/Lib/site-packages/tkinterdnd2-*.dist-info/licenses/LICENSE; do

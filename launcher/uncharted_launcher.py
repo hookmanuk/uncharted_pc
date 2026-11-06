@@ -44,7 +44,7 @@ NAME = 'Uncharted'
 AUTHOR = 'SuperMedo'
 COMMUNITY_AUTHOR = 'drakolord'
 # This build; GitHub release tags are v<VERSION> (their digits are compared).
-VERSION = '0.3.9-vr0.2'  # VR fork: <base version>-vr<VR version> (base: drakolordx7/uncharted_pc community)
+VERSION = '0.3.9-vr0.3'  # VR fork: <base version>-vr<VR version> (base: drakolordx7/uncharted_pc community)
 # VR fork: updates come from the VR fork's releases, tags v<base>-vr<n> only (a flat release would replace VR).
 RELEASES_API = 'https://api.github.com/repos/hookmanuk/uncharted_pc/releases'
 RELEASES_PAGE = 'https://github.com/hookmanuk/uncharted_pc/releases'
@@ -410,7 +410,9 @@ def vr_report(s, key, log_text):
         sha = '?'
     lines = [line.strip() for line in log_text.splitlines()
              if line.startswith(('VR camera:', 'VR:', 'VR stereo', 'VR runtime'))]
-    return '\n'.join([f'Uncharted launcher {VERSION}: VR does not know this game version.',
+    # (the button copies this for any run: only a run that found no game image has an unknown version)
+    verdict = 'VR does not know this game version.' if 'VR camera: no known game image' in log_text else 'VR report.'
+    return '\n'.join([f'Uncharted launcher {VERSION}: {verdict}',
                       f"Game: {key} ({path.name}), {info.get('id', '?')}, APP_VER {info.get('version', '?')}",
                       f'Executable SHA-256: {sha}', '', 'Log:'] + lines[-40:])
 
